@@ -1,0 +1,18 @@
+[submodule "RTO2024-python"]
+	path = RTO2024-python
+	url = https://github.com/Brunner-neutrino-lab/RTO2024-python.git
+[submodule "keithley6485-python"]
+	path = keithley6485-python
+	url = https://github.com/Brunner-neutrino-lab/keithley6485-python.git
+[submodule "keysight2987b-python"]
+	path = keysight2987b-python
+	url = https://github.com/Brunner-neutrino-lab/keysight2987b-python.git
+[submodule "phidget-stage-python"]
+	path = phidget-stage-python
+	url = https://github.com/Brunner-neutrino-lab/phidget-stage-python.git
+[submodule "pulse-mux-python"]
+	path = pulse-mux-python
+	url = https://github.com/Brunner-neutrino-lab/pulse-mux-python.git
+[submodule "vx2740-python"]
+	path = vx2740-python
+	url = https://github.com/Brunner-neutrino-lab/vx2740-python.git

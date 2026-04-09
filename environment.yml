@@ -1,0 +1,17 @@
+name: ets-daq
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - h5py
+  - pip
+  - pip:
+    - pyvisa
+    - pyvisa-py
+    - pyserial
+    - Phidget22

@@ -1,0 +1,53 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-wheel-metadata/
+
+# ── Virtual environments ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+*.env
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── DAQ run output ────────────────────────────────────────────────────────
+data/
+logs/
+*.h5
+*.hdf5
+run_manifest.json
+run_log.jsonl
+
+# ── Config files with secrets ─────────────────────────────────────────────
+run_config.yaml
+*_config.yaml
+secrets.yaml
+.env.local
+
+# ── OS / editor ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── pytest / coverage ─────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
