@@ -14,8 +14,8 @@ import os
 
 # Ensure sibling packages are importable when running from the repo root.
 _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _pkg in ("b2987b", "phidget-stage", "pulse-mux-python",
-             "keithley6485", "RTO2024-python", "vx2740-python"):
+for _pkg in ("keysight2987b-python", "phidget-stage-python", "pulse-mux-python",
+             "keithley6485-python", "RTO2024-python", "vx2740-python"):
     _path = os.path.join(_repo, _pkg)
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)

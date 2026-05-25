@@ -24,7 +24,7 @@ Usage
 Unit normalisation
 ------------------
 VX2740 amplitudes are in ADC counts.  This module converts them to volts using
-the instrument's full-scale range (2 V full-scale, 14-bit ADC → 1 LSB ≈ 122 µV).
+the instrument's full-scale range (2 V full-scale, 16-bit ADC → 1 LSB ≈ 30.5 µV).
 RTO2024 amplitudes are already in volts.  After normalisation `amplitudes_v`
 is always in volts regardless of backend.
 
@@ -44,9 +44,9 @@ import time
 # ---------------------------------------------------------------------------
 
 VX2740_FULL_SCALE_V   = 2.0      # ± 1 V input range (2 V full-scale)
-VX2740_ADC_BITS       = 14       # 14-bit ADC
-VX2740_ADC_COUNTS     = 2 ** VX2740_ADC_BITS   # 16384
-VX2740_COUNTS_PER_V   = VX2740_ADC_COUNTS / VX2740_FULL_SCALE_V   # 8192 counts/V
+VX2740_ADC_BITS       = 16       # VX2740B is 16-bit (confirmed via /par/adc_nbit)
+VX2740_ADC_COUNTS     = 2 ** VX2740_ADC_BITS   # 65536
+VX2740_COUNTS_PER_V   = VX2740_ADC_COUNTS / VX2740_FULL_SCALE_V   # 32768 counts/V
 
 
 # ---------------------------------------------------------------------------
