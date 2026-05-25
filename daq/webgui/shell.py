@@ -550,6 +550,43 @@ def _build_electrometer_tab():
     # Connections tab are picked up automatically (no need to refresh).
     b2987_build_page(get_controller=lambda: HUB.elec, show_connection=False)
 
+
+def _build_digitizer_tab():
+    """Embed the vx2740 standalone GUI, sharing the DAQ's connected controller."""
+    # Only the VX2740 has a NiceGUI panel today; the RTO2024 path still
+    # uses its old PyQt5 GUI, so guard the import accordingly.
+    cfg_type = (HUB.config.digitizer_type or "").lower()
+    if cfg_type != "vx2740":
+        ui.label(
+            f"This tab embeds the VX2740 control panel. The configured "
+            f"digitizer_type is {cfg_type!r}; switch to 'vx2740' in the "
+            f"Config tab to enable this panel."
+        ).classes("text-gray-400 text-sm")
+        return
+
+    from vx2740.gui import build_page as vx_build_page
+
+    ui.label(
+        "Manual control of the CAEN VX2740 digitizer. The connection is "
+        "shared with the Connections tab — connect there first; this tab "
+        "drives the same controller. Embedded mode uses the controller "
+        "directly, so 'apply config' / 'run acquisition' here are seen by "
+        "Level 2+ runs as well."
+    ).classes("text-gray-400 text-sm")
+
+    # The embedded digitizer needs the *controller*, not the make_digitizer
+    # backend wrapper that the daq.digitizer module wraps it in.  The hub
+    # currently stores the backend (which holds the controller as ._ctrl
+    # via the _VX2740Backend wrapper).  Reach into it for the controller.
+    def get_vx_controller():
+        backend = HUB.dig
+        if backend is None:
+            return None
+        # _VX2740Backend stores the underlying VX2740Controller as ._ctrl
+        return getattr(backend, "_ctrl", None)
+
+    vx_build_page(get_controller=get_vx_controller, show_connection=False)
+
 def _build_level3_tab():
     ui.label("Run an IV sweep or pulse acquisition across the whole tile (all SiPMs). Results saved to HDF5.").classes("text-gray-400 text-sm")
 
@@ -1083,6 +1120,7 @@ def index():
         t_conn  = ui.tab("connections")
         t_cfg   = ui.tab("config")
         t_elec  = ui.tab("electrometer")
+        t_dig   = ui.tab("digitizer")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1095,6 +1133,7 @@ def index():
         with ui.tab_panel(t_conn):  _build_connections_tab(header_pills)
         with ui.tab_panel(t_cfg):   _build_config_tab()
         with ui.tab_panel(t_elec):  _build_electrometer_tab()
+        with ui.tab_panel(t_dig):   _build_digitizer_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()

@@ -114,8 +114,8 @@ class ExperimentConfig:
 
     # --- Instrument connections -------------------------------------------
     b2987b_visa:        str = "TCPIP::172.16.0.11::INSTR"
-    digitizer_type:     str = "rto2024"          # "rto2024" or "vx2740"
-    digitizer_address:  str = "192.168.0.2"
+    digitizer_type:     str = "vx2740"           # "rto2024" or "vx2740"
+    digitizer_address:  str = "172.16.0.51"      # VX2740B S/N 18433
     mux_port:           str = "COM6"
     k6485_port:         str = "COM5"
     # K6485 serial framing — overrideable per instrument.
