@@ -113,7 +113,7 @@ class PositionEntry:
 class ExperimentConfig:
 
     # --- Instrument connections -------------------------------------------
-    b2987b_visa:        str = "USB0::2391::37912::MY54321112::0::INSTR"
+    b2987b_visa:        str = "TCPIP::172.16.0.11::INSTR"
     digitizer_type:     str = "rto2024"          # "rto2024" or "vx2740"
     digitizer_address:  str = "192.168.0.2"
     mux_port:           str = "COM6"
