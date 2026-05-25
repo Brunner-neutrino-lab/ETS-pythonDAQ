@@ -533,8 +533,22 @@ def _build_level2_tab():
 
 
 # ===========================================================================
-# Level 3 — tile sweep (writes to HDF5)
+# Electrometer — embedded b2987 manual-control panel
 # ===========================================================================
+
+def _build_electrometer_tab():
+    """Embed the b2987 standalone GUI, sharing the DAQ's connected controller."""
+    from b2987b.gui import build_page as b2987_build_page
+
+    ui.label(
+        "Manual control of the B2987 electrometer. The connection is shared "
+        "with the Connections tab — connect there first; this tab drives the "
+        "same controller."
+    ).classes("text-gray-400 text-sm")
+
+    # The getter is called on each user action, so reconnects via the
+    # Connections tab are picked up automatically (no need to refresh).
+    b2987_build_page(get_controller=lambda: HUB.elec, show_connection=False)
 
 def _build_level3_tab():
     ui.label("Run an IV sweep or pulse acquisition across the whole tile (all SiPMs). Results saved to HDF5.").classes("text-gray-400 text-sm")
@@ -1068,6 +1082,7 @@ def index():
     with ui.tabs().classes("w-full") as tabs:
         t_conn  = ui.tab("connections")
         t_cfg   = ui.tab("config")
+        t_elec  = ui.tab("electrometer")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1079,6 +1094,7 @@ def index():
     with ui.tab_panels(tabs, value=t_conn).classes("w-full"):
         with ui.tab_panel(t_conn):  _build_connections_tab(header_pills)
         with ui.tab_panel(t_cfg):   _build_config_tab()
+        with ui.tab_panel(t_elec):  _build_electrometer_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()
