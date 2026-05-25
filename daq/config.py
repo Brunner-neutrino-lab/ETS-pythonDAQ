@@ -128,10 +128,10 @@ class ExperimentConfig:
     stage_serial_limit: int = 527475
 
     # --- Slow control (InfluxDB) ------------------------------------------
-    influxdb_url:       str = "http://gl-sft1200.stdusr.yale.internal:2504"
-    influxdb_org:       str = "xbox-server"
+    influxdb_url:       str = "http://172.16.0.76:8086"
+    influxdb_org:       str = "ets"
     influxdb_token:     str = ""     # override with env var DAQ_INFLUX_TOKEN
-    influxdb_bucket:    str = "Cryostat"
+    influxdb_bucket:    str = "slowcontrol"
     influxdb_rtd_field: str = "RTD2_C"   # field name, values in °C
 
     # --- Stage magic numbers ----------------------------------------------
