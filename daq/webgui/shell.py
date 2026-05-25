@@ -587,6 +587,18 @@ def _build_k6485_tab():
     k6485_build_page(get_controller=lambda: HUB.k6485, show_connection=False)
 
 
+def _build_wfg_tab():
+    """Embed the dg1022 standalone GUI, sharing the connected DG1022."""
+    from dg1022.gui import build_page as dg_build_page
+
+    ui.label(
+        "Manual control of the Rigol DG1022 waveform generator. The "
+        "connection is shared with the Connections tab — connect there "
+        "first; this tab drives the same controller."
+    ).classes("text-gray-400 text-sm")
+    dg_build_page(get_controller=lambda: HUB.wfg, show_connection=False)
+
+
 def _build_digitizer_tab():
     """Embed the vx2740 standalone GUI, sharing the DAQ's connected controller."""
     # Only the VX2740 has a NiceGUI panel today; the RTO2024 path still
@@ -1160,6 +1172,7 @@ def index():
         t_mux   = ui.tab("mux")
         t_stage = ui.tab("stage")
         t_k6485 = ui.tab("k6485")
+        t_wfg   = ui.tab("wfg")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1176,6 +1189,7 @@ def index():
         with ui.tab_panel(t_mux):   _build_mux_tab()
         with ui.tab_panel(t_stage): _build_stage_tab()
         with ui.tab_panel(t_k6485): _build_k6485_tab()
+        with ui.tab_panel(t_wfg):   _build_wfg_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()
