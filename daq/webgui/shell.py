@@ -563,6 +563,18 @@ def _build_mux_tab():
     mux_build_page(get_controller=lambda: HUB.mux, show_connection=False)
 
 
+def _build_stage_tab():
+    """Embed the phidget-stage standalone GUI, sharing the connected stage."""
+    from phidget_stage.gui import build_page as stage_build_page
+
+    ui.label(
+        "Manual control of the Phidget XY stage. The connection is shared "
+        "with the Connections tab — connect there first; this tab drives "
+        "the same controller."
+    ).classes("text-gray-400 text-sm")
+    stage_build_page(get_controller=lambda: HUB.stage, show_connection=False)
+
+
 def _build_digitizer_tab():
     """Embed the vx2740 standalone GUI, sharing the DAQ's connected controller."""
     # Only the VX2740 has a NiceGUI panel today; the RTO2024 path still
@@ -1134,6 +1146,7 @@ def index():
         t_elec  = ui.tab("electrometer")
         t_dig   = ui.tab("digitizer")
         t_mux   = ui.tab("mux")
+        t_stage = ui.tab("stage")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1148,6 +1161,7 @@ def index():
         with ui.tab_panel(t_elec):  _build_electrometer_tab()
         with ui.tab_panel(t_dig):   _build_digitizer_tab()
         with ui.tab_panel(t_mux):   _build_mux_tab()
+        with ui.tab_panel(t_stage): _build_stage_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()
