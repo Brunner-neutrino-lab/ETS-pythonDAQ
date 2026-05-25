@@ -117,7 +117,7 @@ class ExperimentConfig:
     digitizer_type:     str = "vx2740"           # "rto2024" or "vx2740"
     digitizer_address:  str = "172.16.0.51"      # VX2740B S/N 18433
     mux_port:           str = "COM6"
-    k6485_port:         str = "COM5"
+    k6485_port:         str = "/dev/ttyUSB0"
     # K6485 serial framing — overrideable per instrument.
     # Lab default: 9600 / CR / CR; driver default: 57600 / CR+LF / LF.
     k6485_baud_rate:        int = 9600
