@@ -73,6 +73,11 @@ class InstrumentHub:
         }
 
     def connect_elec(self):
+        if self.elec is not None:
+            # Already connected — re-clicking Connect would open a second
+            # VXI-11 session that the B2987 refuses. Just refresh the status.
+            self.status["elec"] = f"OK — {self.elec.identify()}"
+            return
         from b2987b import B2987BController
         self.elec = B2987BController(visa=self.config.b2987b_visa, mode="hardware")
         self.elec.connect()
@@ -89,6 +94,9 @@ class InstrumentHub:
         self.status["elec"] = "disconnected"
 
     def connect_dig(self):
+        if self.dig is not None:
+            self.status["dig"] = f"OK — {self.dig.identify()}"
+            return
         from daq.digitizer import make_digitizer
         self.dig = make_digitizer(self.config.digitizer_type,
                                   address=self.config.digitizer_address,
@@ -109,6 +117,9 @@ class InstrumentHub:
         self.status["dig"] = "disconnected"
 
     def connect_mux(self):
+        if self.mux is not None:
+            self.status["mux"] = f"OK — MUX on {self.config.mux_port}"
+            return
         from pulse_mux import MuxController
         self.mux = MuxController(port=self.config.mux_port, mode="hardware")
         self.mux.connect()
@@ -121,6 +132,9 @@ class InstrumentHub:
         self.status["mux"] = "disconnected"
 
     def connect_k6485(self):
+        if self.k6485 is not None:
+            self.status["k6485"] = f"OK — K6485 on {self.config.k6485_port}"
+            return
         from keithley6485 import K6485Driver
         self.k6485 = K6485Driver(
             visa              = self.config.k6485_port,
@@ -142,6 +156,9 @@ class InstrumentHub:
         self.status["k6485"] = "disconnected"
 
     def connect_stage(self):
+        if self.stage is not None:
+            self.status["stage"] = "OK — Stage connected"
+            return
         from phidget_stage import StageController
         self.stage = StageController(
             serial_x       = self.config.stage_serial_x,
@@ -161,6 +178,9 @@ class InstrumentHub:
         self.status["stage"] = "disconnected"
 
     def connect_sc(self):
+        if self.sc is not None:
+            self.status["sc"] = f"OK — {self.sc.temperature_K():.2f} K"
+            return
         from daq.slowcontrol import SlowControl
         self.sc = SlowControl(self.config)
         self.sc.connect()
@@ -174,6 +194,9 @@ class InstrumentHub:
         self.status["sc"] = "disconnected"
 
     def connect_wfg(self):
+        if self.wfg is not None:
+            self.status["wfg"] = f"OK — {self.wfg.identify()}"
+            return
         from dg1022 import DG1022Controller
         self.wfg = DG1022Controller(visa=self.config.wfg_visa, mode="hardware")
         self.wfg.connect()
