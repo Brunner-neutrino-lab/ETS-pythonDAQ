@@ -123,6 +123,9 @@ class ExperimentConfig:
     k6485_baud_rate:        int = 9600
     k6485_read_termination:  str = "\r"
     k6485_write_termination: str = "\r"
+    # Rigol DG1022 waveform generator. On Linux, "/dev/usbtmc0" goes through
+    # the kernel USBTMC driver; on Windows use the USB::INSTR VISA string.
+    wfg_visa:           str = "/dev/usbtmc0"
     stage_serial_x:     int = 523267
     stage_serial_y:     int = 523253
     stage_serial_limit: int = 527475

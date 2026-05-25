@@ -45,6 +45,7 @@ class InstrumentHub:
         self.k6485  = None
         self.stage  = None
         self.sc     = None
+        self.wfg    = None
 
         # Human-readable status for each instrument
         self.status: dict[str, str] = {
@@ -54,6 +55,7 @@ class InstrumentHub:
             "k6485":  "disconnected",
             "stage":  "disconnected",
             "sc":     "disconnected",
+            "wfg":    "disconnected",
         }
 
     @property
@@ -67,6 +69,7 @@ class InstrumentHub:
             "stage":       self.stage,
             "lamp_stage":  None,   # future
             "slowcontrol": self.sc,
+            "wfg":         self.wfg,
         }
 
     def connect_elec(self):
@@ -169,3 +172,15 @@ class InstrumentHub:
             self.sc.disconnect()
             self.sc = None
         self.status["sc"] = "disconnected"
+
+    def connect_wfg(self):
+        from dg1022 import DG1022Controller
+        self.wfg = DG1022Controller(visa=self.config.wfg_visa, mode="hardware")
+        self.wfg.connect()
+        self.status["wfg"] = f"OK — {self.wfg.identify()}"
+
+    def disconnect_wfg(self):
+        if self.wfg:
+            self.wfg.disconnect()
+            self.wfg = None
+        self.status["wfg"] = "disconnected"

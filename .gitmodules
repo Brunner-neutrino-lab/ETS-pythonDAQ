@@ -16,3 +16,7 @@
 [submodule "vx2740-python"]
 	path = vx2740-python
 	url = https://github.com/Brunner-neutrino-lab/vx2740-python.git
+
+[submodule "rigoldg1022-python"]
+	path = rigoldg1022-python
+	url = git@github.com:Brunner-neutrino-lab/rigoldg1022-python.git

@@ -26,7 +26,8 @@ from nicegui import app, ui
 # Make instrument submodules importable when running from the repo root
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for _pkg in ("keysight2987b-python", "keithley6485-python", "phidget-stage-python",
-             "pulse-mux-python", "RTO2024-python", "vx2740-python"):
+             "pulse-mux-python", "RTO2024-python", "vx2740-python",
+             "rigoldg1022-python"):
     _p = os.path.join(_REPO, _pkg)
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
@@ -55,6 +56,8 @@ _INSTRUMENT_SPECS = [
      "addr_label": "port", "connect": "connect_mux",   "disconnect": "disconnect_mux"},
     {"key": "k6485", "name": "k6485",     "addr_attr": "k6485_port",
      "addr_label": "VISA", "connect": "connect_k6485", "disconnect": "disconnect_k6485"},
+    {"key": "wfg",   "name": "wfg (dg1022)", "addr_attr": "wfg_visa",
+     "addr_label": "VISA / device", "connect": "connect_wfg", "disconnect": "disconnect_wfg"},
     {"key": "stage", "name": "stage",     "addr_attr": None,
      "addr_label": "serials","connect": "connect_stage", "disconnect": "disconnect_stage"},
     {"key": "sc",    "name": "slow ctrl", "addr_attr": "influxdb_url",
