@@ -26,9 +26,40 @@ try:
 except ImportError:
     pass
 
-from nicegui import ui
+from nicegui import app, ui
 
 from daq.webgui import shell   # noqa: F401 — registers the @ui.page("/") route
+
+
+def _release_instruments():
+    """
+    Disconnect every instrument the hub has open. Called on webapp shutdown
+    (SIGTERM/SIGINT/normal exit) so VISA sessions are released cleanly.
+
+    Without this, the B2987's VXI-11 service in particular can get stuck
+    holding a session, blocking the next connection attempt until the
+    instrument is power-cycled.
+    """
+    # Print directly so the message is visible even if the logger has
+    # already shut down by the time we reach this handler.
+    import sys as _sys
+    print("[daq.webapp] releasing instrument sessions...", flush=True)
+    released = []
+    for name in ("elec", "dig", "mux", "k6485", "wfg", "stage", "sc"):
+        if getattr(shell.HUB, name, None) is None:
+            continue
+        fn = getattr(shell.HUB, f"disconnect_{name}", None)
+        if fn is None:
+            continue
+        try:
+            fn()
+            released.append(name)
+        except Exception as e:
+            print(f"[daq.webapp] error releasing {name}: {e}", file=_sys.stderr, flush=True)
+    print(f"[daq.webapp] released: {released or '(nothing was connected)'}", flush=True)
+
+
+app.on_shutdown(_release_instruments)
 
 
 def main():
