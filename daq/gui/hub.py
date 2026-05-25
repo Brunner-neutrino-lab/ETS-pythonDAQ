@@ -119,7 +119,13 @@ class InstrumentHub:
 
     def connect_k6485(self):
         from keithley6485 import K6485Driver
-        self.k6485 = K6485Driver(visa=self.config.k6485_port, mode="hardware")
+        self.k6485 = K6485Driver(
+            visa              = self.config.k6485_port,
+            mode              = "hardware",
+            baud_rate         = self.config.k6485_baud_rate,
+            read_termination  = self.config.k6485_read_termination,
+            write_termination = self.config.k6485_write_termination,
+        )
         self.k6485.connect()
         self.k6485.reset()
         self.k6485.zero_check_off()

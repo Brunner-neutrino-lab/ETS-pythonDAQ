@@ -118,6 +118,11 @@ class ExperimentConfig:
     digitizer_address:  str = "192.168.0.2"
     mux_port:           str = "COM6"
     k6485_port:         str = "COM5"
+    # K6485 serial framing — overrideable per instrument.
+    # Lab default: 9600 / CR / CR; driver default: 57600 / CR+LF / LF.
+    k6485_baud_rate:        int = 9600
+    k6485_read_termination:  str = "\r"
+    k6485_write_termination: str = "\r"
     stage_serial_x:     int = 523267
     stage_serial_y:     int = 523253
     stage_serial_limit: int = 527475

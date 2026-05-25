@@ -223,7 +223,13 @@ def _connect_instruments(config) -> dict:
     # K6485 flux monitor
     try:
         from keithley6485 import K6485Driver
-        k = K6485Driver(visa=config.k6485_port, mode="hardware")
+        k = K6485Driver(
+            visa              = config.k6485_port,
+            mode              = "hardware",
+            baud_rate         = config.k6485_baud_rate,
+            read_termination  = config.k6485_read_termination,
+            write_termination = config.k6485_write_termination,
+        )
         k.connect()
         k.reset()
         k.zero_check_off()
