@@ -575,6 +575,18 @@ def _build_stage_tab():
     stage_build_page(get_controller=lambda: HUB.stage, show_connection=False)
 
 
+def _build_k6485_tab():
+    """Embed the keithley6485 standalone GUI, sharing the connected K6485."""
+    from keithley6485.gui import build_page as k6485_build_page
+
+    ui.label(
+        "Manual control of the Keithley 6485 picoammeter. The connection is "
+        "shared with the Connections tab — connect there first; this tab "
+        "drives the same driver instance."
+    ).classes("text-gray-400 text-sm")
+    k6485_build_page(get_controller=lambda: HUB.k6485, show_connection=False)
+
+
 def _build_digitizer_tab():
     """Embed the vx2740 standalone GUI, sharing the DAQ's connected controller."""
     # Only the VX2740 has a NiceGUI panel today; the RTO2024 path still
@@ -1147,6 +1159,7 @@ def index():
         t_dig   = ui.tab("digitizer")
         t_mux   = ui.tab("mux")
         t_stage = ui.tab("stage")
+        t_k6485 = ui.tab("k6485")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1162,6 +1175,7 @@ def index():
         with ui.tab_panel(t_dig):   _build_digitizer_tab()
         with ui.tab_panel(t_mux):   _build_mux_tab()
         with ui.tab_panel(t_stage): _build_stage_tab()
+        with ui.tab_panel(t_k6485): _build_k6485_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()
