@@ -207,11 +207,21 @@ def test_connect_all(cfg: dict, results: StepResult) -> dict:
 
 
 def test_dark_iv(cfg: dict, h5: h5py.File, instr: dict, results: StepResult) -> float | None:
-    """Run the dark IV sweep. Returns an estimated V_BD or None."""
-    e = instr.get("b2987")
+    """Dark IV sweep — B2987 ramps bias, K6485 reads SiPM current at each V.
+
+    NOTE on architecture: the B2987's *built-in* ammeter is on its own input
+    terminal which (in this bench setup) is connected to the XUV photodiode,
+    NOT to the SiPM. So we cannot rely on `B2987Controller.sweep()` to give
+    us the SiPM IV — that returns the photodiode current vs bias voltage,
+    which is essentially constant. Instead, we step the B2987 source manually
+    and average a few K6485 reads at each voltage. The B2987's own current
+    reading is captured in parallel as a diagnostic but is not the IV curve.
+    """
+    e  = instr.get("b2987")
+    k  = instr.get("k6485")
     dg = instr.get("dg1022")
-    if e is None:
-        results.add("dark IV", False, "B2987 not connected"); return None
+    if e is None or k is None:
+        results.add("dark IV", False, "B2987 or K6485 not connected"); return None
 
     v_bd = None
     with step(results, "ensure LED off for dark IV"):
@@ -219,65 +229,82 @@ def test_dark_iv(cfg: dict, h5: h5py.File, instr: dict, results: StepResult) -> 
             dg.output_off(1)
             dg.output_off(2)
 
-    with step(results, "dark IV sweep"):
+    with step(results, "dark IV sweep (K6485 at each bias)"):
         voltages = np.arange(cfg["iv_v_start"],
-                             cfg["iv_v_stop"] + cfg["iv_v_step"] * 0.5,
-                             cfg["iv_v_step"])
-        log.info("  sweeping %s V → %s V in %d steps × %d reps",
-                 voltages[0], voltages[-1], len(voltages), cfg["iv_pts_per_v"])
-        r = e.sweep(voltages.tolist())
-        log.info("  swept %d unique V, |I|_max=%.3e A",
-                 len(r.avg_source_v), float(np.abs(r.avg_current_a).max()))
+                              cfg["iv_v_stop"] + cfg["iv_v_step"] * 0.5,
+                              cfg["iv_v_step"])
+        log.info("  sweeping %s V → %s V (%d steps); K6485 averages %d reads per V",
+                 voltages[0], voltages[-1], len(voltages),
+                 cfg["iv_pts_per_v"])
 
-        # Estimate V_BD from |dI/dV| max in the upper half of the sweep.
-        # Keysight returns 9.91e+37 when a measurement is over-range / invalid;
-        # mask those out before any derivative work.
-        v_raw = np.asarray(r.avg_source_v)
-        i_raw = np.asarray(r.avg_current_a)
-        valid = np.abs(i_raw) < 1e-3   # 1 mA is more than any sane SiPM dark IV
-        v = v_raw[valid]; i = i_raw[valid]
-        n_overrange = int((~valid).sum())
-        if n_overrange:
-            log.warning("  %d of %d sweep points overrange (9.91e+37); "
-                        "auto-range may not have followed the runaway. "
-                        "Estimating V_BD from valid points only.", n_overrange, len(v_raw))
-        absi = np.abs(i)
-        if len(v) > 5 and absi.max() > 1e-9:
+        sipm_i_mean = np.zeros(len(voltages), dtype=np.float64)
+        sipm_i_std  = np.zeros(len(voltages), dtype=np.float64)
+        pd_i        = np.zeros(len(voltages), dtype=np.float64)
+        # raw K6485 samples — useful for diagnosing noise
+        raw_k_i  = []
+        raw_k_v  = []
+        # Track timing
+        t_start = time.time()
+        for ix, v in enumerate(voltages):
+            e.set_bias(float(v), settle_s=cfg["iv_delay_s"])
+            # K6485 average for the SiPM
+            arr, _ts = k.read_n(int(cfg["iv_pts_per_v"]),
+                                 float(cfg["iv_delay_s"]))
+            sipm_i_mean[ix] = float(np.mean(arr))
+            sipm_i_std[ix]  = (float(np.std(arr, ddof=1))
+                                if len(arr) > 1 else 0.0)
+            raw_k_i.extend(arr.tolist())
+            raw_k_v.extend([float(v)] * len(arr))
+            # B2987 photodiode reading — single point per V is enough
+            try:
+                pd_i[ix] = float(e.measure_current())
+            except Exception as exc:
+                log.debug("  pd reading at %.2f V failed: %s", v, exc)
+                pd_i[ix] = float("nan")
+            if ix % max(1, len(voltages) // 10) == 0:
+                log.info("    %5.2f V  I_sipm = %+.3e A  (pd = %+.3e A)",
+                         v, sipm_i_mean[ix], pd_i[ix])
+        log.info("  sweep done in %.1f s.  I_sipm range = %+.3e … %+.3e A",
+                 time.time() - t_start, sipm_i_mean.min(), sipm_i_mean.max())
+
+        # V_BD from steepest rise in log|I_sipm|/dV
+        absi = np.abs(sipm_i_mean)
+        if absi.max() > 1e-9:
             log_i = np.log10(np.clip(absi, 1e-15, None))
             dlogi = np.diff(log_i)
-            v_mid = 0.5 * (v[:-1] + v[1:])
-            # Avoid the low-bias leakage region; V_BD is the steepest rise.
+            v_mid = 0.5 * (voltages[:-1] + voltages[1:])
             mask = v_mid > 30.0
             if mask.any():
                 idx = int(np.argmax(dlogi[mask]))
                 v_bd = float(v_mid[mask][idx])
-                log.info("  estimated V_BD ≈ %.1f V (max d log|I|/dV)", v_bd)
+                log.info("  estimated V_BD ≈ %.2f V (max d log|I_SiPM|/dV)", v_bd)
             else:
-                log.warning("  no valid points above 30V; cannot estimate V_BD")
+                log.warning("  no points above 30 V; cannot estimate V_BD")
         else:
-            log.warning("  current never exceeded 1 nA; sweep too low or detector disconnected")
+            log.warning("  SiPM current never exceeded 1 nA; bias range too low "
+                        "or SiPM disconnected from K6485 path")
 
-        # Save to HDF5
+        # Save to HDF5 — use the same dataset names as before so plotting
+        # works without changes.  The "current_a" key is now the K6485 SiPM
+        # current, which IS the proper IV curve.
         g = h5.create_group("iv")
-        g.create_dataset("source_v",     data=np.asarray(r.avg_source_v,    dtype=np.float64), compression="gzip")
-        g.create_dataset("current_a",    data=np.asarray(r.avg_current_a,   dtype=np.float64), compression="gzip")
-        g.create_dataset("err_current",  data=np.asarray(r.err_current_a,   dtype=np.float64), compression="gzip")
-        g.create_dataset("raw_source_v", data=np.asarray(r.source_v,        dtype=np.float64), compression="gzip")
-        g.create_dataset("raw_current_a",data=np.asarray(r.current_a,       dtype=np.float64), compression="gzip")
-        g.attrs["v_start"]       = float(cfg["iv_v_start"])
-        g.attrs["v_stop"]        = float(cfg["iv_v_stop"])
-        g.attrs["v_step"]        = float(cfg["iv_v_step"])
-        g.attrs["pts_per_v"]     = int(cfg["iv_pts_per_v"])
-        g.attrs["current_range_auto"]    = bool(cfg["iv_current_range_auto"])
-        g.attrs["current_range_lower_a"] = float(cfg["iv_current_range_lower_a"])
-        g.attrs["current_range_upper_a"] = float(cfg["iv_current_range_upper_a"])
-        g.attrs["current_aperture_s"]    = float(cfg["iv_current_aperture"])
-        g.attrs["n_overrange_points"]    = int(n_overrange)
+        g.create_dataset("source_v",     data=voltages,    compression="gzip")
+        g.create_dataset("current_a",    data=sipm_i_mean, compression="gzip")
+        g.create_dataset("err_current",  data=sipm_i_std,  compression="gzip")
+        g.create_dataset("photodiode_current_a", data=pd_i, compression="gzip")
+        g.create_dataset("raw_source_v", data=np.asarray(raw_k_v, dtype=np.float64), compression="gzip")
+        g.create_dataset("raw_current_a",data=np.asarray(raw_k_i, dtype=np.float64), compression="gzip")
+        g.attrs["v_start"]    = float(cfg["iv_v_start"])
+        g.attrs["v_stop"]     = float(cfg["iv_v_stop"])
+        g.attrs["v_step"]     = float(cfg["iv_v_step"])
+        g.attrs["pts_per_v"]  = int(cfg["iv_pts_per_v"])
+        g.attrs["iv_delay_s"] = float(cfg["iv_delay_s"])
+        g.attrs["current_source"] = "k6485"   # documents which instrument's I goes into /current_a
+        g.attrs["photodiode_source"] = "b2987_ammeter"
         if v_bd is not None:
             g.attrs["v_bd_estimate"] = float(v_bd)
-        g.attrs["timestamp"]     = time.time()
+        g.attrs["timestamp"]  = time.time()
 
-    # Leave the B2987 with bias off after the sweep
     with step(results, "bias off post-IV"):
         e.bias_off()
 
