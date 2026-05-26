@@ -20,3 +20,6 @@
 [submodule "rigoldg1022-python"]
 	path = rigoldg1022-python
 	url = git@github.com:Brunner-neutrino-lab/rigoldg1022-python.git
+[submodule "r-snge100-python"]
+	path = r-snge100-python
+	url = git@github.com:Brunner-neutrino-lab/r-snge100-python.git
