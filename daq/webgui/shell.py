@@ -27,7 +27,7 @@ from nicegui import app, ui
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for _pkg in ("keysight2987b-python", "keithley6485-python", "phidget-stage-python",
              "pulse-mux-python", "RTO2024-python", "vx2740-python",
-             "rigoldg1022-python"):
+             "rigoldg1022-python", "r-snge100-python"):
     _p = os.path.join(_REPO, _pkg)
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
@@ -58,6 +58,8 @@ _INSTRUMENT_SPECS = [
      "addr_label": "VISA", "connect": "connect_k6485", "disconnect": "disconnect_k6485"},
     {"key": "wfg",   "name": "wfg (dg1022)", "addr_attr": "wfg_visa",
      "addr_label": "VISA / device", "connect": "connect_wfg", "disconnect": "disconnect_wfg"},
+    {"key": "nge100","name": "nge100 (mux PSU)", "addr_attr": "nge100_resource",
+     "addr_label": "VISA / device", "connect": "connect_nge100", "disconnect": "disconnect_nge100"},
     {"key": "stage", "name": "stage",     "addr_attr": None,
      "addr_label": "serials","connect": "connect_stage", "disconnect": "disconnect_stage"},
     {"key": "sc",    "name": "slow ctrl", "addr_attr": "influxdb_url",
@@ -597,6 +599,138 @@ def _build_wfg_tab():
         "first; this tab drives the same controller."
     ).classes("text-gray-400 text-sm")
     dg_build_page(get_controller=lambda: HUB.wfg, show_connection=False)
+
+
+def _build_nge_tab():
+    """Embed the nge100 standalone GUI, sharing the connected PSU."""
+    from nge100.gui import build_page as nge_build_page
+
+    ui.label(
+        "Manual control of the R&S NGE103 power supply (MUX rail). "
+        "Connect on the Connections tab first; this tab drives the "
+        "same controller."
+    ).classes("text-gray-400 text-sm")
+    nge_build_page(get_controller=lambda: HUB.nge100, show_connection=False)
+
+
+def _build_plots_tab():
+    """Render saved bench HDF5 files using daq.plotting.
+
+    Two source modes:
+      - "live": newest data/bench_*.h5 (the most recent run)
+      - "pick": choose an explicit file path from a dropdown of data/*.h5
+    Plus optional second file for overlay across runs (multi-SiPM comparison).
+    """
+    from pathlib import Path
+    from daq import plotting as P
+
+    ui.label(
+        "Pick a plot type and a source file. Toggle 'live' to plot the most "
+        "recent bench_*.h5 in ./data. Add a second file (and labels) to "
+        "overlay two runs for comparison."
+    ).classes("text-gray-400 text-sm")
+
+    def _list_files():
+        d = Path(__file__).resolve().parents[2] / "data"
+        if not d.is_dir(): return []
+        return [str(p) for p in sorted(d.glob("bench_*.h5"),
+                                        key=lambda p: p.stat().st_mtime,
+                                        reverse=True)]
+
+    files_now = _list_files()
+    plot_choices = list(P.PLOTS.keys())
+
+    with ui.card().classes("daq-card w-full"):
+        ui.html("<h2>plot selection</h2>")
+        with ui.row().classes("items-center gap-3 flex-wrap"):
+            plot_type = ui.select(plot_choices, value=plot_choices[0],
+                                  label="plot type").classes("w-48")
+            live      = ui.switch("live (newest file)", value=True)
+            file_a    = ui.select(files_now, value=(files_now[0] if files_now else None),
+                                  label="file A").classes("w-96")
+            label_a   = ui.input(label="label A", value="").classes("w-40")
+            file_b    = ui.select([""] + files_now, value="",
+                                  label="file B (overlay, optional)").classes("w-96")
+            label_b   = ui.input(label="label B", value="").classes("w-40")
+        file_a.bind_visibility_from(live, "value", lambda v: not v)
+        file_b.bind_visibility_from(live, "value", lambda v: not v)
+
+    with ui.card().classes("daq-card w-full"):
+        ui.html("<h2>plot knobs</h2>")
+        with ui.row().classes("items-center gap-3 flex-wrap"):
+            channel = ui.number(label="channel", value=0, step=1).classes("w-24 num")
+            index   = ui.number(label="waveform #", value=0, step=1).classes("w-32 num")
+            bins    = ui.number(label="bins", value=80, step=10).classes("w-24 num")
+            bias_g  = ui.select(["above_vbd", "below_vbd"], value="above_vbd",
+                                label="bias group").classes("w-40")
+            log_y   = ui.switch("log Y", value=False)
+            base_sub= ui.switch("baseline subtract", value=True)
+
+    msg_log = ui.log(max_lines=10).classes("h-24 w-full")
+    def log_msg(s: str):
+        msg_log.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+
+    # Matplotlib canvas — the plot library draws into this Axes
+    plot = ui.matplotlib(figsize=(9, 4.0)).classes("w-full")
+    ax   = plot.figure.add_subplot(111)
+    P.apply_dark_style(plot.figure, ax)
+
+    def refresh_files():
+        # Re-scan data/ in case new HDF5s appeared
+        files = _list_files()
+        file_a.options = files
+        file_b.options = [""] + files
+        if not file_a.value and files:
+            file_a.value = files[0]
+        file_a.update()
+        file_b.update()
+        log_msg(f"found {len(files)} bench HDF5 file(s)")
+
+    def render():
+        try:
+            fn = P.PLOTS[str(plot_type.value)]["fn"]
+        except KeyError:
+            log_msg(f"unknown plot type {plot_type.value!r}"); return
+
+        sources: list[tuple[str, str]] = []
+        if live.value:
+            latest = P.find_latest()
+            if latest is None:
+                log_msg("no bench_*.h5 in ./data"); return
+            sources.append((label_a.value or latest.stem, str(latest)))
+        else:
+            if not file_a.value:
+                log_msg("no file A selected"); return
+            sources.append((label_a.value or Path(file_a.value).stem, file_a.value))
+            if file_b.value:
+                sources.append((label_b.value or Path(file_b.value).stem, file_b.value))
+
+        opts = dict(
+            channel=int(channel.value),
+            index=int(index.value),
+            bins=int(bins.value),
+            bias_group=str(bias_g.value),
+            log_y=bool(log_y.value),
+            baseline_subtract=bool(base_sub.value),
+        )
+
+        ax.clear()
+        P.apply_dark_style(plot.figure, ax)
+        try:
+            if len(sources) == 1:
+                lbl, src = sources[0]
+                fn(src, ax=ax, label=lbl, **opts)
+            else:
+                P.overlay_plots(fn, sources, ax=ax, **opts)
+            plot.figure.tight_layout()
+            plot.update()
+            log_msg(f"rendered {plot_type.value} ({len(sources)} source(s))")
+        except Exception as e:
+            log_msg(f"plot FAIL: {type(e).__name__}: {e}")
+
+    with ui.row().classes("gap-2 mt-2"):
+        ui.button("render", on_click=render).props("color=primary")
+        ui.button("refresh file list", on_click=refresh_files)
 
 
 def _build_digitizer_tab():
@@ -1173,6 +1307,8 @@ def index():
         t_stage = ui.tab("stage")
         t_k6485 = ui.tab("k6485")
         t_wfg   = ui.tab("wfg")
+        t_nge   = ui.tab("nge100")
+        t_plots = ui.tab("plots")
         t_l1    = ui.tab("L1 — primitives")
         t_l2    = ui.tab("L2 — single SiPM")
         t_l3    = ui.tab("L3 — tile sweep")
@@ -1190,6 +1326,8 @@ def index():
         with ui.tab_panel(t_stage): _build_stage_tab()
         with ui.tab_panel(t_k6485): _build_k6485_tab()
         with ui.tab_panel(t_wfg):   _build_wfg_tab()
+        with ui.tab_panel(t_nge):   _build_nge_tab()
+        with ui.tab_panel(t_plots): _build_plots_tab()
         with ui.tab_panel(t_l1):    _build_level1_tab()
         with ui.tab_panel(t_l2):    _build_level2_tab()
         with ui.tab_panel(t_l3):    _build_level3_tab()

@@ -46,6 +46,7 @@ class InstrumentHub:
         self.stage  = None
         self.sc     = None
         self.wfg    = None
+        self.nge100 = None
 
         # Human-readable status for each instrument
         self.status: dict[str, str] = {
@@ -56,6 +57,7 @@ class InstrumentHub:
             "stage":  "disconnected",
             "sc":     "disconnected",
             "wfg":    "disconnected",
+            "nge100": "disconnected",
         }
 
     @property
@@ -70,6 +72,7 @@ class InstrumentHub:
             "lamp_stage":  None,   # future
             "slowcontrol": self.sc,
             "wfg":         self.wfg,
+            "nge100":      self.nge100,
         }
 
     def connect_elec(self):
@@ -207,3 +210,21 @@ class InstrumentHub:
             self.wfg.disconnect()
             self.wfg = None
         self.status["wfg"] = "disconnected"
+
+    def connect_nge100(self):
+        if self.nge100 is not None:
+            try:    self.status["nge100"] = f"OK — {self.nge100.idn() or self.nge100.identify()}"
+            except: self.status["nge100"] = "OK"
+            return
+        from nge100 import NGE100Controller
+        self.nge100 = NGE100Controller(resource=self.config.nge100_resource,
+                                        mode="hardware")
+        self.nge100.connect()
+        try:    self.status["nge100"] = f"OK — {self.nge100.idn() or self.nge100.identify()}"
+        except: self.status["nge100"] = "OK"
+
+    def disconnect_nge100(self):
+        if self.nge100:
+            self.nge100.disconnect()
+            self.nge100 = None
+        self.status["nge100"] = "disconnected"

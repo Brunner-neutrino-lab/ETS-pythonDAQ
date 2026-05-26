@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _pkg in ("keysight2987b-python", "keithley6485-python", "phidget-stage-python",
              "pulse-mux-python", "RTO2024-python", "vx2740-python",
-             "rigoldg1022-python"):
+             "rigoldg1022-python", "r-snge100-python"):
     _p = os.path.join(_ROOT, _pkg)
     if _p not in sys.path:
         sys.path.insert(0, _p)
