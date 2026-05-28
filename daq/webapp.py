@@ -28,7 +28,56 @@ except ImportError:
 
 from nicegui import app, ui
 
-from daq.webgui import shell   # noqa: F401 — registers the @ui.page("/") route
+from daq.webgui import shell   # noqa: F401 — registers the @ui.page("/") + /login routes
+# Import webcam at startup so its FastAPI routes (/webcam.mjpeg, /webcam.jpg)
+# are registered even when no user has visited the webcam tab yet.  These
+# routes are gated by the same login check as the rest of the app.
+from daq.webgui import webcam as _webcam   # noqa: F401 — registers /webcam.* routes
+from daq import connection_state
+from daq import labbook
+
+# Pre-fill instrument addresses with whatever was last successfully used.
+# The Connections tab inputs read from HUB.config — populating it before
+# the page is built means "Connect all" can just press connect on each.
+_applied = connection_state.load_into_config(shell.HUB.config)
+if _applied:
+    logging.getLogger("daq.webapp").info(
+        "loaded last-known addresses: %s", _applied
+    )
+
+# Serve the plots/ directory so the status page can render thumbnails.
+# Files written by daq.plotting land in <repo>/plots/*.png.
+_PLOTS_DIR = os.path.join(os.path.dirname(__file__), "..", "plots")
+if os.path.isdir(_PLOTS_DIR):
+    app.add_static_files("/plots-img", _PLOTS_DIR)
+
+# Lab-book attachment images.
+app.add_static_files("/labbook-img", labbook.attachments_dir())
+
+
+# Endpoint for clipboard-pasted images. A JS paste listener installed by
+# _build_labbook_tab() POSTs image blobs here; the lab book tab's poll
+# timer picks them up from labbook._paste_queue and adds them to the
+# pending attachments for the next "post entry".
+from fastapi import UploadFile, File, HTTPException  # noqa: E402 (local import keeps it adjacent to use)
+
+@app.post("/labbook-paste")
+async def labbook_paste(file: UploadFile = File(...)):
+    # Auth — same cookie/session as the @ui.page('/') login flow writes.
+    # An unauthenticated paste would let anyone with the URL silently
+    # upload images into the lab book, so block at the route level.
+    try:
+        if not app.storage.user.get("authenticated", False):
+            raise HTTPException(status_code=401, detail="login required")
+    except HTTPException:
+        raise
+    except Exception:
+        # No request context — refuse rather than risk a free-for-all.
+        raise HTTPException(status_code=401, detail="login required")
+    content = await file.read()
+    fname = labbook.save_attachment(file.filename or "pasted.png", content)
+    labbook.queue_pasted(fname)
+    return {"filename": fname}
 
 
 def _release_instruments():
@@ -84,8 +133,21 @@ def main():
     log.info("Web DAQ starting at http://%s:%d/  (also http://localhost:%d/)",
              host_for_url, args.port, args.port)
 
+    # storage_secret enables app.storage.user (server-side, cookie-keyed),
+    # which the session/who's-connected tracker in daq/webgui/sessions.py uses
+    # to remember each user's self-declared display name. Override with
+    # DAQ_STORAGE_SECRET in .env if you want it stable across deploys.
+    storage_secret = os.environ.get("DAQ_STORAGE_SECRET", "ets-daq-lab-default")
+
+    # Custom favicon: a 4x4 SiPM array with one cell glowing UV-violet
+    # under a diagonal VUV excimer photon beam.
+    favicon_path = os.path.join(os.path.dirname(__file__),
+                                "webgui", "static", "favicon.svg")
+
     ui.run(host=args.host, port=args.port, reload=args.reload,
-           title="nEXO SiPM DAQ", show=False)
+           title="nEXO SiPM DAQ", show=False,
+           favicon=favicon_path,
+           storage_secret=storage_secret)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
