@@ -12,7 +12,7 @@ Functions
 Both functions:
   - Accept a `manifest` and `run_file` for resume and data storage.
   - Skip already-completed steps when manifest is provided.
-  - Insert a flux_reading() every `flux_interval` devices.
+  - Insert a current_measure() (K6485 at zero bias) every `flux_interval` devices.
   - Call an optional `on_progress(done, total, sipm_id)` callback.
 """
 
@@ -275,7 +275,8 @@ def _do_flux_check(last_sipm_id, temperature_K, instruments, config,
         return
 
     log.info("Flux check after sipm=%d  T=%.1f K", last_sipm_id, temperature_K)
-    flux_a = M.flux_reading(instruments, config)
+    result = M.current_measure(last_sipm_id, instruments, config, meter="k6485")
+    flux_a = float(result.avg_current_a[0])
 
     if run_file is not None:
         flux_attrs = {

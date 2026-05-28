@@ -128,7 +128,7 @@ def measure_current(elec) -> float:
 def iv_sweep(elec, voltages, n_per_voltage: int = 5,
              delay_s: float = 0.1):
     """
-    Run a full IV sweep.
+    Run a full IV sweep using the electrometer's own ammeter.
 
     Parameters
     ----------
@@ -145,6 +145,89 @@ def iv_sweep(elec, voltages, n_per_voltage: int = 5,
     log.info("iv_sweep: %d voltages, %d pts/V, delay=%.2f s",
              len(list(voltages)), n_per_voltage, delay_s)
     return elec.sweep(list(voltages), n_per_voltage=n_per_voltage, delay_s=delay_s)
+
+
+def iv_sweep_external_meter(elec, meter, voltages,
+                            n_per_voltage: int = 5,
+                            delay_s: float = 0.1,
+                            first_point_settle_s: float = 0.5):
+    """
+    Run an IV sweep where `elec` sources voltage and `meter` measures current.
+
+    Used when the bias source and the current meter are physically distinct
+    instruments (e.g. B2987B sourcing bias, K6485 picoammeter on the SiPM
+    low side). The B2987's internal list-sweep mode cannot be used here
+    because it reads its own ammeter, not the external meter.
+
+    Parameters
+    ----------
+    elec                 : B2987BController (voltage source)
+    meter                : Object exposing .read_n(n, delay_s) -> (currents, timestamps).
+    voltages             : Iterable of voltage set-points (V).
+    n_per_voltage        : Number of meter readings averaged at each voltage.
+    delay_s              : Settle time after set_bias and between meter samples (s).
+    first_point_settle_s : Extra settle on the first voltage. Useful when the
+                           previous bias state was avalanche current; the
+                           discharge transient otherwise inflates the first
+                           reading.
+
+    Returns
+    -------
+    SweepResult (b2987b.controller.SweepResult). avg_voltage_v / voltage_v
+    are NaN because the external meter does not measure voltage.
+    """
+    from b2987b import SweepResult
+
+    voltages = list(voltages)
+    log.info("iv_sweep_external_meter: %d voltages, %d pts/V, delay=%.2f s",
+             len(voltages), n_per_voltage, delay_s)
+
+    raw_s, raw_i, raw_t = [], [], []
+    run_ts = time.time()
+
+    for ix, v in enumerate(voltages):
+        settle = first_point_settle_s if ix == 0 else delay_s
+        elec.set_bias(float(v), settle_s=settle)
+        if ix == 0 and first_point_settle_s > delay_s:
+            try:
+                meter.read_n(1, 0.0)
+            except Exception:
+                pass
+        currents, timestamps = meter.read_n(n_per_voltage, delay_s=delay_s)
+        raw_s.extend([float(v)] * len(currents))
+        raw_i.extend(np.asarray(currents, dtype=np.float64).tolist())
+        raw_t.extend(np.asarray(timestamps, dtype=np.float64).tolist())
+
+    source_v  = np.asarray(raw_s, dtype=np.float64)
+    current_a = np.asarray(raw_i, dtype=np.float64)
+    timestamp = np.asarray(raw_t, dtype=np.float64)
+    voltage_v = np.full_like(source_v, np.nan)
+
+    uniq_v = np.array(voltages, dtype=np.float64)
+    avg_i = np.zeros_like(uniq_v)
+    err_i = np.zeros_like(uniq_v)
+    for k, v in enumerate(uniq_v):
+        sel = source_v == v
+        samp = current_a[sel]
+        avg_i[k] = float(np.mean(samp))
+        err_i[k] = (float(np.std(samp, ddof=1) / np.sqrt(samp.size))
+                    if samp.size > 1 else 0.0)
+    avg_v = np.full_like(uniq_v, np.nan)
+    err_v = np.full_like(uniq_v, np.nan)
+
+    return SweepResult(
+        source_v      = source_v,
+        current_a     = current_a,
+        voltage_v     = voltage_v,
+        timestamp_s   = timestamp,
+        avg_source_v  = uniq_v,
+        avg_current_a = avg_i,
+        avg_voltage_v = avg_v,
+        err_current_a = err_i,
+        err_voltage_v = err_v,
+        n_per_voltage = n_per_voltage,
+        run_timestamp = run_ts,
+    )
 
 
 # ===========================================================================

@@ -22,8 +22,9 @@ One HDF5 file per run (opened once, kept open throughout).
     │       │   │   ├── err_current  float64 (n_points,)
     │       │   │   └── attrs: timestamp, bias_v, mux_channel, x_mm, y_mm
     │       │   └── pulse/
-    │       │       ├── amplitudes_v float32 (n_pulses,)
-    │       │       ├── timestamps   float64 (n_pulses,)
+    │       │       ├── ch{N}/
+    │       │       │   ├── amplitudes_v float32 (n_pulses,)
+    │       │       │   └── timestamps_s float64 (n_pulses,)
     │       │       └── attrs: n_waveforms, bias_v, source, timestamp, ...
     │       └── illuminated/
     │           ├── iv/     (same layout)
@@ -50,12 +51,14 @@ Usage
 
 import json
 import logging
-import os
 import time
 from datetime import datetime
 from typing import Optional
 
 import numpy as np
+
+from daq import h5io
+from daq.h5io import run_filename  # re-export for existing callers
 
 log = logging.getLogger(__name__)
 
@@ -69,13 +72,6 @@ except ImportError:
 def _require_h5py():
     if not _H5PY_AVAILABLE:
         raise ImportError("pip install h5py")
-
-
-def run_filename(data_dir: str, run_id: Optional[str] = None) -> str:
-    """Return a timestamped HDF5 filename in data_dir."""
-    run_id = run_id or datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, f"{run_id}.h5")
 
 
 class RunFile:
@@ -138,20 +134,18 @@ class RunFile:
         attrs         : Extra attributes (bias_v, mux_channel, x_mm, y_mm, ...).
         """
         grp = self._iv_group(sipm_id, temperature_K, illuminated)
-
-        grp.create_dataset("source_v",   data=np.asarray(source_v,   dtype=np.float64), compression="gzip")
-        grp.create_dataset("current_a",  data=np.asarray(current_a,  dtype=np.float64), compression="gzip")
-        if err_current is not None:
-            grp.create_dataset("err_current", data=np.asarray(err_current, dtype=np.float64), compression="gzip")
-
-        grp.attrs["timestamp"]     = time.time()
-        grp.attrs["temperature_K"] = temperature_K
-        grp.attrs["illuminated"]   = int(illuminated)
-        grp.attrs["sipm_id"]       = sipm_id
+        merged = {
+            "temperature_K": float(temperature_K),
+            "illuminated":   int(illuminated),
+            "sipm_id":       int(sipm_id),
+        }
         if attrs:
-            for k, v in attrs.items():
-                grp.attrs[k] = v
-
+            merged.update(attrs)
+        h5io.write_iv(grp,
+                      source_v    = source_v,
+                      current_a   = current_a,
+                      err_current = err_current,
+                      attrs       = merged)
         self._file.flush()
         log.debug("IV written: sipm=%d  T=%.1f K  illum=%s  n=%d",
                   sipm_id, temperature_K, illuminated, len(source_v))
@@ -180,24 +174,28 @@ class RunFile:
         attrs         : Extra attributes.
         """
         grp = self._pulse_group(sipm_id, temperature_K, illuminated)
-
-        channels = [channel] if channel is not None else list(result.amplitudes_v.keys())
-        for ch in channels:
-            amps = result.amplitudes_v.get(ch, np.array([], dtype=np.float32))
-            ts   = result.timestamps.get(ch,   np.array([], dtype=np.float64))
-            cgrp = grp.require_group(f"ch{ch}")
-            cgrp.create_dataset("amplitudes_v", data=np.asarray(amps, dtype=np.float32), compression="gzip")
-            cgrp.create_dataset("timestamps",   data=np.asarray(ts,   dtype=np.float64), compression="gzip")
-
-        grp.attrs["timestamp"]     = time.time()
-        grp.attrs["temperature_K"] = temperature_K
-        grp.attrs["illuminated"]   = int(illuminated)
-        grp.attrs["sipm_id"]       = sipm_id
-        grp.attrs["n_waveforms"]   = result.n_waveforms
-        grp.attrs["source"]        = result.source
+        merged = {
+            "temperature_K": float(temperature_K),
+            "illuminated":   int(illuminated),
+            "sipm_id":       int(sipm_id),
+        }
         if attrs:
-            for k, v in attrs.items():
+            merged.update(attrs)
+
+        if channel is not None:
+            amps = result.amplitudes_v.get(channel)
+            ts   = result.timestamps.get(channel)
+            h5io.write_pulse(grp,
+                             amplitudes_v = amps,
+                             timestamps_s = ts,
+                             channel      = channel)
+            grp.attrs["timestamp"]   = time.time()
+            grp.attrs["n_waveforms"] = int(result.n_waveforms)
+            grp.attrs["source"]      = str(result.source)
+            for k, v in merged.items():
                 grp.attrs[k] = v
+        else:
+            h5io.write_pulse_multichannel(grp, result, attrs=merged)
 
         self._file.flush()
         log.debug("Pulse written: sipm=%d  T=%.1f K  illum=%s  n_waveforms=%d",
@@ -261,6 +259,7 @@ class RunFile:
     # ------------------------------------------------------------------
 
     def _write_meta(self):
+        h5io.write_top_attrs(self._file, measurement_type="run")
         meta = self._file.require_group("meta")
         if self._config is not None:
             try:
