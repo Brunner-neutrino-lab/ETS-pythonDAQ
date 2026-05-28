@@ -51,3 +51,26 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# ── Runtime / webapp state ────────────────────────────────────────────────
+# Cookie store + per-instrument last-seen address cache — written by the
+# webapp at runtime, populated from defaults if absent.
+.last_connections.json
+# NiceGUI's transient cache (uploads, etc.) — never source.
+.nicegui/
+
+# ── Generated plots ───────────────────────────────────────────────────────
+# `daq.plotting` writes PNGs into plots/ after every bench run; each is
+# reproducible from the HDF5 with `scripts/plot_bench.py`, so don't track.
+plots/
+
+# ── Lab book runtime data ────────────────────────────────────────────────
+# Per-machine accumulating data, not source.  The `daq.labbook` module
+# owns these on disk.
+labbook_attachments/
+labbook_entries.jsonl
+
+# ── Legacy archive ────────────────────────────────────────────────────────
+# Local-only snapshot of the previous xsphere-slow-control codebase.
+# Kept on disk for reference; not part of this repo's history.
+_legacy/

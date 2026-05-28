@@ -23,3 +23,6 @@
 [submodule "r-snge100-python"]
 	path = r-snge100-python
 	url = git@github.com:Brunner-neutrino-lab/r-snge100-python.git
+[submodule "keysight33500b-python"]
+	path = keysight33500b-python
+	url = https://github.com/Brunner-neutrino-lab/keysight33500b-python.git
