@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Dark background, rounded square; matches the DAQ shell theme. -->
+  <rect width="64" height="64" rx="9" fill="#11151c"/>
+
+  <!-- 4x4 SiPM array. Inactive cells: faint panel-color squares with a
+       thin grid border, evoking a silicon detector tile. -->
+  <g fill="#1b2230" stroke="#2d3648" stroke-width="1">
+    <rect x="6"  y="6"  width="11" height="11" rx="1"/>
+    <rect x="19" y="6"  width="11" height="11" rx="1"/>
+    <rect x="32" y="6"  width="11" height="11" rx="1"/>
+    <rect x="45" y="6"  width="11" height="11" rx="1"/>
+    <rect x="6"  y="19" width="11" height="11" rx="1"/>
+    <rect x="19" y="19" width="11" height="11" rx="1"/>
+    <rect x="32" y="19" width="11" height="11" rx="1"/>
+    <rect x="45" y="19" width="11" height="11" rx="1"/>
+    <rect x="6"  y="32" width="11" height="11" rx="1"/>
+    <rect x="19" y="32" width="11" height="11" rx="1"/>
+    <rect x="32" y="32" width="11" height="11" rx="1"/>
+    <rect x="45" y="32" width="11" height="11" rx="1"/>
+    <rect x="6"  y="45" width="11" height="11" rx="1"/>
+    <rect x="19" y="45" width="11" height="11" rx="1"/>
+    <rect x="32" y="45" width="11" height="11" rx="1"/>
+    <rect x="45" y="45" width="11" height="11" rx="1"/>
+  </g>
+
+  <!-- Currently illuminated SiPM (the automated scanner has just landed
+       here). Bright UV-violet fill with a soft outer glow halo. -->
+  <rect x="30.5" y="17.5" width="14" height="14" rx="1.5"
+        fill="none" stroke="#a78bfa" stroke-width="0.6" opacity="0.55"/>
+  <rect x="32" y="19" width="11" height="11" rx="1"
+        fill="#a78bfa" stroke="#c4b5fd" stroke-width="1"/>
+
+  <!-- VUV excimer beam — diagonal photon path striking the active cell.
+       Bright source point in the upper-right corner. -->
+  <line x1="60" y1="4" x2="38" y2="22"
+        stroke="#c084fc" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+  <circle cx="60" cy="4" r="3" fill="#e9d5ff"/>
+  <circle cx="60" cy="4" r="5.5" fill="none" stroke="#e9d5ff" stroke-width="0.6" opacity="0.5"/>
+</svg>
