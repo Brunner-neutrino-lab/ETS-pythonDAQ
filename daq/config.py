@@ -113,10 +113,16 @@ class PositionEntry:
 class ExperimentConfig:
 
     # --- Instrument connections -------------------------------------------
-    b2987b_visa:        str = "TCPIP::172.16.0.11::INSTR"
+    # SOCKET on raw TCP port 5025 (not ::INSTR / VXI-11). VXI-11 leaks
+    # session slots on every abnormal exit and eventually requires a B2987
+    # power-cycle to recover. SOCKET is stateless on the instrument side.
+    b2987b_visa:        str = "TCPIP::172.16.0.11::5025::SOCKET"
     digitizer_type:     str = "vx2740"           # "rto2024" or "vx2740"
     digitizer_address:  str = "172.16.0.51"      # VX2740B S/N 18433
-    mux_port:           str = "COM6"
+    # Stable by-id path embeds the CP2102N's serial number, so it survives
+    # USB-port changes and reboots.  Plain /dev/ttyUSB1 is fragile because
+    # numbering depends on enumeration order.
+    mux_port:           str = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_ec8db4c99972ef11ae387a4f8fcc3fa0-if00-port0"
     k6485_port:         str = "/dev/ttyUSB0"
     # K6485 serial framing — overrideable per instrument.
     # Lab default: 9600 / CR / CR; driver default: 57600 / CR+LF / LF.
@@ -126,6 +132,14 @@ class ExperimentConfig:
     # Rigol DG1022 waveform generator. On Linux, "/dev/usbtmc0" goes through
     # the kernel USBTMC driver; on Windows use the USB::INSTR VISA string.
     wfg_visa:           str = "/dev/usbtmc0"
+    # Keysight 33510B at 172.16.0.46 on the lab subnet (Agilent 33510B,
+    # S/N MY57200344, firmware 3.05-1.19-2.00-52-00).
+    # Using raw-SOCKET (port 5025) instead of VXI-11 (::INSTR) — same
+    # rationale as the B2987: SOCKET is stateless on the instrument side,
+    # so no session slots can leak after an abnormal exit.  The driver
+    # sets \\n terminations and wraps device_clear in try/except, so
+    # SOCKET is supported out of the box.
+    ks33500b_visa:      str = "TCPIP0::172.16.0.46::5025::SOCKET"
     # R&S NGE103 power supply for MUX rail (and other lab gear).
     nge100_resource:    str = "TCPIP0::172.16.0.19::INSTR"
     stage_serial_x:     int = 523267
@@ -137,7 +151,14 @@ class ExperimentConfig:
     influxdb_org:       str = "ets"
     influxdb_token:     str = ""     # override with env var DAQ_INFLUX_TOKEN
     influxdb_bucket:    str = "slowcontrol"
-    influxdb_rtd_field: str = "RTD2_C"   # field name, values in °C
+    # RTD location: _measurement == "<rtd_measurement>" AND
+    # _field == "<rtd_field>" AND tag channel == "<rtd_channel>".
+    influxdb_rtd_measurement: str = "rtd"
+    influxdb_rtd_field:       str = "value"
+    influxdb_rtd_channel:     str = "A"
+    # True: stored values are already in Kelvin. False: stored in Celsius,
+    # add 273.15 on read.
+    influxdb_rtd_in_kelvin:   bool = True
 
     # --- Stage magic numbers ----------------------------------------------
     stage_steps_per_mm_x: float = 800.0

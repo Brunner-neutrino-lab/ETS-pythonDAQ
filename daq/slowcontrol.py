@@ -8,7 +8,8 @@ Reads RTD temperatures from the Raspberry Pi InfluxDB instance
   - Check the current temperature
   - Wait until a target temperature is stable before starting a measurement block
 
-Temperature fields are in Celsius in the DB; all values returned here are
+Stored RTD values may be in Celsius or Kelvin depending on the driver;
+controlled by config.influxdb_rtd_in_kelvin. All values returned here are
 in Kelvin.
 
 Usage
@@ -109,58 +110,72 @@ class SlowControl:
     # Single temperature query
     # ------------------------------------------------------------------
 
+    def _to_kelvin(self, value: float) -> float:
+        if self._cfg.influxdb_rtd_in_kelvin:
+            return float(value)
+        return float(value) + _CELSIUS_TO_KELVIN
+
     def temperature_K(self) -> float:
         """
         Return the most recent RTD reading in Kelvin.
 
-        Queries the last 30 seconds of data and returns the newest value.
-        Raises RuntimeError if no data is returned.
+        Queries the last 30 seconds for the configured measurement / field /
+        channel and returns the newest value. Raises RuntimeError if no data
+        is returned.
         """
-        field  = self._cfg.influxdb_rtd_field
-        bucket = self._cfg.influxdb_bucket
-        org    = self._cfg.influxdb_org
+        bucket      = self._cfg.influxdb_bucket
+        org         = self._cfg.influxdb_org
+        measurement = self._cfg.influxdb_rtd_measurement
+        field       = self._cfg.influxdb_rtd_field
+        channel     = self._cfg.influxdb_rtd_channel
 
         flux = f"""
 from(bucket: "{bucket}")
   |> range(start: -30s)
+  |> filter(fn: (r) => r["_measurement"] == "{measurement}")
   |> filter(fn: (r) => r["_field"] == "{field}")
+  |> filter(fn: (r) => r["channel"] == "{channel}")
   |> last()
 """
         tables = self._api.query(flux, org=org)
         for table in tables:
             for record in table.records:
-                val_c = record.get_value()
-                if val_c is not None:
-                    return float(val_c) + _CELSIUS_TO_KELVIN
+                val = record.get_value()
+                if val is not None:
+                    return self._to_kelvin(val)
 
         raise RuntimeError(
-            f"No temperature data returned for field '{field}' "
-            f"in bucket '{bucket}' (last 30 s). "
-            f"Check InfluxDB connection and field name."
+            f"No temperature data returned for "
+            f"_measurement='{measurement}', _field='{field}', "
+            f"channel='{channel}' in bucket '{bucket}' (last 30 s). "
+            f"Check InfluxDB connection and the influxdb_rtd_* config fields."
         )
 
     def all_rtds_K(self) -> dict[str, float]:
         """
-        Return the most recent value for all RTD fields (RTD1_C – RTD4_C)
-        as a dict of field_name → temperature_K.
+        Return the most recent value for every channel of the configured RTD
+        measurement, as a dict of channel-tag → temperature_K.
         """
-        bucket = self._cfg.influxdb_bucket
-        org    = self._cfg.influxdb_org
+        bucket      = self._cfg.influxdb_bucket
+        org         = self._cfg.influxdb_org
+        measurement = self._cfg.influxdb_rtd_measurement
+        field       = self._cfg.influxdb_rtd_field
 
         flux = f"""
 from(bucket: "{bucket}")
   |> range(start: -30s)
-  |> filter(fn: (r) => r["_measurement"] == "RTD")
+  |> filter(fn: (r) => r["_measurement"] == "{measurement}")
+  |> filter(fn: (r) => r["_field"] == "{field}")
   |> last()
 """
-        result = {}
+        result: dict[str, float] = {}
         tables = self._api.query(flux, org=org)
         for table in tables:
             for record in table.records:
-                fname = record.get_field()
-                val   = record.get_value()
-                if val is not None:
-                    result[fname] = float(val) + _CELSIUS_TO_KELVIN
+                ch  = record.values.get("channel")
+                val = record.get_value()
+                if ch is not None and val is not None:
+                    result[str(ch)] = self._to_kelvin(val)
         return result
 
     # ------------------------------------------------------------------
