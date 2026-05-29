@@ -233,8 +233,9 @@ front panel.
 
 ### Open threads
 
-- Confirm fix on real hardware (sine amplitude change + a pulse Apply,
-  since pulse handling changed).
+- ~~Confirm fix on real hardware~~ — CONFIRMED working on the bench
+  (Lucas, 2026-05-29): amplitude changes apply with no front-panel
+  error.
 - Submodule changes were committed on the submodule's `main`; not
   pushed to its remote. Push when convenient so the pointer bumps
   resolve for other clones.
