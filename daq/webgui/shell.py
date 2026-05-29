@@ -3399,7 +3399,7 @@ def _build_level2_tab():
                 )
             except Exception as e:
                 log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
-                    return False
+                return False
             return True
 
         # ==============================================================
