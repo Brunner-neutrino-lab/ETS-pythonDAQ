@@ -3320,12 +3320,20 @@ def _build_level2_tab():
                 "center_y_mm": float(cy_in.value) if loc_use.value  else None,
             }
 
-        async def _prep_position() -> bool:
-            """Apply the entered identifiers: select MUX channel (if
-            enabled) and move stage to (cx, cy) (if enabled).  Returns
-            True if everything that was requested succeeded; True also
-            when nothing was requested.  Logs and returns False on any
-            failure."""
+        async def _prep_position(bright: bool = False) -> bool:
+            """Apply the entered identifiers ahead of a measurement.
+
+            MUX:  selected whenever the MUX switch is on (wiring,
+                  independent of light state).
+            Stage: only moves when BOTH the Location switch is on AND
+                  the measurement is bright — the stage carries the
+                  light source, so for dark measurements the location
+                  is irrelevant.
+
+            Returns True if everything that was requested succeeded;
+            True also when nothing was requested.  Logs + returns
+            False on any failure.
+            """
             if mux_use.value:
                 if HUB.mux is None:
                     log_msg("MUX enabled but mux not connected — abort")
@@ -3336,9 +3344,10 @@ def _build_level2_tab():
                 except Exception as e:
                     log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
                     return False
-            if loc_use.value:
+            if loc_use.value and bright:
                 if HUB.stage is None:
-                    log_msg("Location enabled but stage not connected — abort")
+                    log_msg("Location enabled (bright) but stage not "
+                            "connected — abort")
                     return False
                 try:
                     await _run_in_thread(
@@ -3385,7 +3394,7 @@ def _build_level2_tab():
                 if bright and HUB.ks33500b is None:
                     log_msg("Keysight 33500B not connected — bright needs AWG")
                     return
-                if not await _prep_position(): return
+                if not await _prep_position(bright=bright): return
 
                 import numpy as np
                 voltages = np.arange(
@@ -3496,7 +3505,7 @@ def _build_level2_tab():
                 if bright and HUB.ks33500b is None:
                     log_msg("Keysight 33500B not connected — bright needs AWG")
                     return
-                if not await _prep_position(): return
+                if not await _prep_position(bright=bright): return
 
                 ch  = max(0, min(63, int(pc_ch.value)))
                 thr = int(pc_thr.value)
