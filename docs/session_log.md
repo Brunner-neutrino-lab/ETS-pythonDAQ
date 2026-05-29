@@ -111,27 +111,44 @@ front panel.
   and the instrument discarded the *whole* command, so amplitude never
   updated. Every GUI Apply hits this path (`apply_sine` etc.).
 - Fix (in submodule `keysight33500b-python`): `APPLy` now sends only
-  freq/amp/offset; phase is written separately via `:SOURce<n>:PHASe`
-  (skipped for NOIS/DC). ARB folded into the same branch — its APPLy
-  syntax is identical (no phase).
-- Verified the emitted SCPI against a fake instrument under the
-  `ets-daq` conda env. NOT yet confirmed against the real 33500B —
-  Lucas to hit Apply post-restart and confirm amplitude changes with
-  no front-panel error.
-- Committed in submodule (`4fae808`) + parent pointer bump (`4ee7540`),
-  webapp restarted.
+  freq/amp/offset; phase is written separately via `:SOURce<n>:PHASe`.
+- Verified against the vendored user's guide
+  (`keysight33500b-python/9018-03290.pdf`, Agilent 33500 Series User's
+  Guide, converted with `pdftotext -layout`). The guide repeatedly
+  documents APPLy as setting "function, frequency, amplitude, and
+  offset" — never phase — and confirms `VOLTage {<amplitude>}` is the
+  amplitude command (matches `set_amplitude`). Cross-checked every
+  SCPI command the module emits against the guide; all names check out
+  (DATA:VOLatile:CATalog is the only one not in this guide — it's a
+  query covered by the separate Programmer's Reference).
+- **Refinement after reading the guide:** the guide lists a phase
+  reference only for sine/square/ramp/arb ("0 degrees is the point at
+  which the waveform crosses zero..."). Pulse/noise/DC have none. So
+  the separate `:PHASe` write is restricted to SIN/SQU/RAMP/ARB —
+  otherwise pulse would have traded the old -108 for a settings error.
+- Commits: submodule `4fae808` (drop phase from APPLy) + `95abfe4`
+  (restrict :PHASe); parent pointer bumps `4ee7540` + `e16804a`.
+  Webapp restarted.
 
 ### Lessons / tribal knowledge
 
 - The 33500 `APPLy:<func>` is freq/amp/offset only. Phase, duty,
   symmetry are all separate commands. Don't append phase to APPLy.
+- The continuous-phase `:PHASe` command only applies to sine/square/
+  ramp/arb. Pulse/noise/DC have no phase reference.
+- The 33500 user's guide is vendored at
+  `keysight33500b-python/9018-03290.pdf`; `pdftotext -layout` gives a
+  readable dump. It's the *User's Guide*, not the *Programmer's
+  Reference* — exact SCPI bracket syntax (memory/DATA commands etc.)
+  lives in the latter, which is not vendored.
 
 ### Open threads
 
-- Confirm fix on real hardware.
+- Confirm fix on real hardware (sine amplitude change + a pulse Apply,
+  since pulse handling changed).
 - Submodule changes were committed on the submodule's `main`; not
-  pushed to its remote. Push when convenient so the pointer bump
-  resolves for other clones.
+  pushed to its remote. Push when convenient so the pointer bumps
+  resolve for other clones.
 
 ---
 
