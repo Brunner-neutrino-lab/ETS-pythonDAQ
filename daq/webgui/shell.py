@@ -1564,6 +1564,15 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
 .daq-card h2 { font-size:.92rem; margin:.05rem 0 .45rem; color:var(--acc);
   font-weight:600; letter-spacing:.3px; }
 
+/* Data explorer file list — one clickable row per .h5 file */
+.data-file-row { padding:.3rem .5rem; border:1px solid var(--line);
+  border-radius:6px; background:var(--panel2); cursor:pointer;
+  transition:border-color .12s ease, background .12s ease; }
+.data-file-row:hover { border-color:var(--acc); background:var(--panel); }
+.data-file-row .df-name { font-size:.8rem; color:var(--fg);
+  word-break:break-all; }
+.data-file-row .df-meta { font-size:.7rem; color:var(--mut, #9aa); }
+
 /* Inputs & buttons */
 .q-field__control, .q-field--filled .q-field__control { background:var(--panel2) !important;
   border:1px solid var(--line) !important; border-radius:6px !important; min-height:32px !important;
@@ -3159,6 +3168,248 @@ def _build_level1_tab():
 # Level 2 — single SiPM
 # ===========================================================================
 
+def _build_l2_plots(PLOTS: dict, dirty: dict) -> None:
+    """Build the L2 right-hand live-plot column and register streaming
+    callbacks in PLOTS.
+
+    Four stacked echart views:
+      iv      — current vs bias, dark + bright overlaid (live, per-point)
+      scan    — current vs stage position, X + Y overlaid (live, per-point)
+      charge  — amplitude histogram (baseline-subtracted, from the
+                digitizer), dark + bright overlaid (per pulse run)
+      wave    — a single stored waveform with prev/next scroll
+
+    Overlay rule is "replace same slot, keep the other": a new dark IV
+    run overwrites the dark trace but leaves bright untouched (and
+    symmetrically for scan X/Y and charge dark/bright).  Each view has a
+    clear button that wipes both slots.
+
+    Registered callbacks (all best-effort, called via the run handlers'
+    `_plot(...)` wrapper):
+      iv_begin(label)            reset the dark|bright IV slot
+      iv_point(label, v, i)      append a point (worker-thread safe)
+      iv_redraw()                force redraw (b2987 batch path)
+      scan_begin(axis)           reset the x|y scan slot
+      scan_point(axis, pos, i)   append a point (main thread)
+      charge_set(label, result, ch)   set the dark|bright histogram
+      wave_set(result, ch, label, pre_us)   load waveforms for scrolling
+    """
+    import numpy as _np
+
+    _SAMPLES_PER_US = 125.0       # VX2740 runs at 125 MS/s
+    _DARK_COLOR   = "#3b82f6"
+    _BRIGHT_COLOR = "#f59e0b"
+    _X_COLOR      = "#3b82f6"
+    _Y_COLOR      = "#22c55e"
+
+    def _axis(name, gap):
+        return {
+            "type": "value", "name": name,
+            "nameLocation": "middle", "nameGap": gap, "scale": True,
+            "axisLine":  {"lineStyle": {"color": "#5c6775"}},
+            "axisLabel": {"color": "#8a93a6", "fontSize": 10},
+            "splitLine": {"lineStyle": {"color": "#1d2733"}},
+        }
+
+    def _base(xname, yname, ygap=56):
+        return {
+            "tooltip": {"trigger": "axis"},
+            "legend": {"textStyle": {"color": "#dde3ee"}, "top": 2,
+                       "right": 8, "data": []},
+            "grid": {"left": 66, "right": 16, "top": 30, "bottom": 36},
+            "backgroundColor": "transparent",
+            "textStyle": {"color": "#dde3ee"},
+            "xAxis": _axis(xname, 22),
+            "yAxis": _axis(yname, ygap),
+            "series": [],
+        }
+
+    def _plotbox(opts):
+        with ui.element("div").style(
+                "position:relative;width:100%;height:200px;"
+                "border:1px solid var(--line);border-radius:8px;"
+                "background:var(--panel2)"):
+            return ui.echart(opts).classes("w-full").style("height:100%")
+
+    def _two_trace(opts, names, colors, kind="line"):
+        opts["legend"]["data"] = list(names)
+        for nm, col in zip(names, colors):
+            s = {"name": nm, "type": kind, "showSymbol": False, "data": [],
+                 "lineStyle": {"width": 1.6, "color": col},
+                 "itemStyle": {"color": col}}
+            opts["series"].append(s)
+
+    # ----------------------------- IV --------------------------------
+    with ui.card().classes("daq-card w-full"):
+        with ui.row().classes("w-full items-center"):
+            ui.html("<h2>iv — current vs bias</h2>")
+            ui.element("div").style("flex:1")
+            ui.button("clear", on_click=lambda: iv_clear()).props("flat dense")
+        iv_opts = _base("bias (V)", "current (A)")
+        _two_trace(iv_opts, ["dark", "bright"], [_DARK_COLOR, _BRIGHT_COLOR])
+        iv_chart = _plotbox(iv_opts)
+        iv_store = {"dark": [], "bright": []}
+
+        def _iv_redraw():
+            iv_chart.options["series"][0]["data"] = list(iv_store["dark"])
+            iv_chart.options["series"][1]["data"] = list(iv_store["bright"])
+            iv_chart.update()
+
+        def iv_begin(label):
+            iv_store[label] = []
+            dirty["iv"] = True
+
+        def iv_point(label, v, i):
+            iv_store[label].append([float(v), float(i)])
+            dirty["iv"] = True       # pumped onto the UI by the timer below
+
+        def iv_clear():
+            iv_store["dark"] = []; iv_store["bright"] = []
+            _iv_redraw()
+
+        PLOTS.update(iv_begin=iv_begin, iv_point=iv_point,
+                     iv_redraw=_iv_redraw)
+
+    # ---------------------------- scan -------------------------------
+    with ui.card().classes("daq-card w-full"):
+        with ui.row().classes("w-full items-center"):
+            ui.html("<h2>scan — current vs position</h2>")
+            ui.element("div").style("flex:1")
+            ui.button("clear", on_click=lambda: scan_clear()).props("flat dense")
+        scan_opts = _base("position (mm)", "current (A)")
+        _two_trace(scan_opts, ["X", "Y"], [_X_COLOR, _Y_COLOR])
+        scan_chart = _plotbox(scan_opts)
+        scan_store = {"x": [], "y": []}
+
+        def _scan_redraw():
+            scan_chart.options["series"][0]["data"] = list(scan_store["x"])
+            scan_chart.options["series"][1]["data"] = list(scan_store["y"])
+            scan_chart.update()
+
+        def scan_begin(axis):
+            scan_store[axis] = []
+            _scan_redraw()
+
+        def scan_point(axis, pos, i):
+            scan_store[axis].append([float(pos), float(i)])
+            _scan_redraw()           # run_scan loop is on the main thread
+
+        def scan_clear():
+            scan_store["x"] = []; scan_store["y"] = []
+            _scan_redraw()
+
+        PLOTS.update(scan_begin=scan_begin, scan_point=scan_point)
+
+    # --------------------------- charge ------------------------------
+    with ui.card().classes("daq-card w-full"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.html("<h2>charge spectrum</h2>")
+            ui.element("div").style("flex:1")
+            chg_bins = ui.number(label="bins", value=100, min=10, step=10) \
+                .classes("w-24 num").props("dense")
+            ui.button("clear", on_click=lambda: charge_clear()).props("flat dense")
+        chg_opts = _base("amplitude (ADC, baseline-sub)", "counts", ygap=46)
+        _two_trace(chg_opts, ["dark", "bright"], [_DARK_COLOR, _BRIGHT_COLOR])
+        for s in chg_opts["series"]:
+            s["step"] = "middle"     # step lines overlay more legibly
+        chg_chart = _plotbox(chg_opts)
+        chg_store = {"dark": None, "bright": None}   # raw amplitude arrays
+
+        def _chg_redraw():
+            bins = max(10, int(chg_bins.value or 100))
+            for idx, label in enumerate(("dark", "bright")):
+                amps = chg_store[label]
+                if amps is None or len(amps) == 0:
+                    chg_chart.options["series"][idx]["data"] = []
+                    continue
+                arr = _np.asarray(amps, dtype=float)
+                hist, edges = _np.histogram(arr, bins=bins)
+                chg_chart.options["series"][idx]["data"] = [
+                    [float((edges[i] + edges[i + 1]) / 2), int(h)]
+                    for i, h in enumerate(hist)]
+            chg_chart.update()
+
+        def charge_set(label, result, ch):
+            try:
+                amps = result.amplitudes.get(ch)
+            except Exception:
+                amps = None
+            chg_store[label] = list(amps) if amps is not None else []
+            _chg_redraw()
+
+        def charge_clear():
+            chg_store["dark"] = None; chg_store["bright"] = None
+            _chg_redraw()
+
+        chg_bins.on_value_change(lambda _e: _chg_redraw())
+        PLOTS.update(charge_set=charge_set)
+
+    # -------------------------- waveform -----------------------------
+    with ui.card().classes("daq-card w-full"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.html("<h2>waveform</h2>")
+            ui.element("div").style("flex:1")
+            wv_prev = ui.button("◀").props("flat dense")
+            wv_idx  = ui.number(value=0, min=0, step=1, format="%d") \
+                .classes("w-20 num").props("dense")
+            wv_next = ui.button("▶").props("flat dense")
+        wv_info = ui.label("no waveforms yet").classes("text-xs text-gray-400")
+        wv_opts = _base("time from trigger (µs)", "ADC (baseline-sub)", 46)
+        wv_opts["series"].append({
+            "name": "wfm", "type": "line", "showSymbol": False, "data": [],
+            "lineStyle": {"width": 1.4, "color": _BRIGHT_COLOR}})
+        wv_chart = _plotbox(wv_opts)
+        wv_state = {"wfs": None, "pre_us": 0.0, "label": ""}
+
+        def _wv_redraw():
+            wfs = wv_state["wfs"]
+            if wfs is None or len(wfs) == 0:
+                wv_chart.options["series"][0]["data"] = []
+                wv_chart.update()
+                wv_info.text = ("no waveforms — enable 'store raw waveforms' "
+                                "on the pulse card")
+                return
+            n = len(wfs)
+            i = max(0, min(int(wv_idx.value or 0), n - 1))
+            if i != int(wv_idx.value or 0):
+                wv_idx.value = i
+            w = _np.asarray(wfs[i], dtype=float)
+            n_pre = max(1, int(round(wv_state["pre_us"] * _SAMPLES_PER_US)))
+            baseline = (float(w[:n_pre].mean()) if len(w) >= n_pre
+                        else float(w.mean()))
+            w_bl = w - baseline
+            t = _np.arange(len(w)) / _SAMPLES_PER_US - wv_state["pre_us"]
+            wv_chart.options["series"][0]["data"] = [
+                [float(t[k]), float(w_bl[k])] for k in range(len(w))]
+            wv_chart.update()
+            lbl = f"{wv_state['label']} · " if wv_state["label"] else ""
+            wv_info.text = f"{lbl}waveform {i + 1} / {n}"
+
+        def wave_set(result, ch, label="", pre_us=0.0):
+            try:
+                wfs = result.waveforms.get(ch)
+            except Exception:
+                wfs = None
+            wv_state.update(wfs=wfs, pre_us=float(pre_us), label=str(label))
+            wv_idx.value = 0
+            _wv_redraw()
+
+        wv_idx.on_value_change(lambda _e: _wv_redraw())
+        wv_prev.on_click(lambda: (
+            wv_idx.set_value(max(0, int(wv_idx.value or 0) - 1)), _wv_redraw()))
+        wv_next.on_click(lambda: (
+            wv_idx.set_value(int(wv_idx.value or 0) + 1), _wv_redraw()))
+        PLOTS.update(wave_set=wave_set)
+
+    # IV points stream in from the sweep worker thread; redraw on the UI
+    # loop only when something changed (echart can't be touched off-loop).
+    def _pump_iv():
+        if dirty.get("iv"):
+            dirty["iv"] = False
+            _iv_redraw()
+    ui.timer(0.3, _pump_iv)
+
+
 def _build_level2_tab():
     """Single-SiPM measurements: IV, pulse counting, and scan.
 
@@ -3183,6 +3434,31 @@ def _build_level2_tab():
 
     log_lbl = ui.log(max_lines=24).classes("h-64 w-full")
     def log_msg(s: str): log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+
+    # ------------------------------------------------------------------
+    # Live-plot registry.  The right-hand plot column (built after the
+    # control cards, below) fills this with streaming callbacks; the run
+    # handlers stream points/traces into the views as data is recorded.
+    # Defined here so the handlers can close over `PLOTS` regardless of
+    # build order — lookups happen at click-time, after the column is up.
+    # `_plot_dirty["iv"]` is set from the IV worker thread and pumped onto
+    # the UI by a ui.timer inside the plot column (echart updates must run
+    # on the main loop, not the worker thread).
+    # ------------------------------------------------------------------
+    PLOTS: dict = {}
+    _plot_dirty = {"iv": False}
+
+    def _plot(_name, *args):
+        """Best-effort live-plot update — a chart glitch must never abort
+        a measurement run, so swallow (and log) any failure."""
+        fn = PLOTS.get(_name)
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            try: log_msg(f"  plot {_name} FAIL: {type(e).__name__}: {e}")
+            except Exception: pass
 
     # ==================================================================
     # Shared helpers used by every measurement card.
@@ -3211,7 +3487,15 @@ def _build_level2_tab():
         try: HUB.ks33500b.output_off(ks_ch)
         except Exception: pass
 
-    with ui.row().classes("w-full gap-3 items-start"):
+    # Controls on the left, the live-plot column on the right.  no-wrap
+    # keeps them side by side on a wide monitor; each side stays
+    # scrollable on its own when the window is narrow.
+    _split = ui.row().classes("w-full gap-4 items-start no-wrap")
+    with _split:
+        _left  = ui.column().style("flex:2 1 640px; min-width:0; gap:12px")
+        _right = ui.column().style("flex:1 1 440px; min-width:380px; gap:14px")
+
+    with _left, ui.row().classes("w-full gap-3 items-start"):
 
         # ==============================================================
         # CARD 1 — SiPM identity + position (all but T are optional)
@@ -3449,6 +3733,8 @@ def _build_level2_tab():
                 set_activity("L2 IV",
                              f"sipm {int(sipm_in.value)} · "
                              f"{iv_illum.value} · {meter} · {len(voltages)} V")
+                iv_slot = "bright" if bright else "dark"
+                _plot("iv_begin", iv_slot)   # replace this slot, keep the other
                 try:
                     if bright:
                         await _run_in_thread(
@@ -3474,6 +3760,9 @@ def _build_level2_tab():
                         except Exception: pass
                         try: print(f"[L2 IV] {line}", flush=True)
                         except Exception: pass
+                        # Worker thread: iv_point only buffers + flags;
+                        # the plot column's timer redraws on the UI loop.
+                        _plot("iv_point", iv_slot, v, mean_i)
                     if meter == "k6485":
                         result = await _run_in_thread(
                             lambda: P.iv_sweep_external_meter(
@@ -3499,6 +3788,12 @@ def _build_level2_tab():
                             P.iv_sweep, HUB.elec, voltages,
                             int(iv_npt.value), delay,
                         )
+                        # No per-point callback on the b2987 — fill the
+                        # trace from the returned block.
+                        for _v, _i in zip(result.avg_source_v,
+                                          result.avg_current_a):
+                            _plot("iv_point", iv_slot, _v, _i)
+                        _plot("iv_redraw")
                     log_msg(f"  done: I({result.avg_source_v[-1]:.2f} V) = "
                             f"{result.avg_current_a[-1]:.3e} A")
                     note_bias(v_set=result.avg_source_v[-1],
@@ -3636,6 +3931,12 @@ def _build_level2_tab():
                     result = await _run_in_thread(_run_acq)
                     log_msg(f"  done: n_waveforms={result.n_waveforms} "
                             f"channels={result.channel_ids}")
+                    # Charge spectrum overlays dark/bright; the waveform
+                    # viewer scrolls the capture channel's stored frames.
+                    chg_slot = "bright" if bright else "dark"
+                    _plot("charge_set", chg_slot, result, ch)
+                    _plot("wave_set", result, ch, chg_slot,
+                          float(pc_pre.value))
                     try:
                         p = MSTORE.save_l2_pulse_run(
                             result,
@@ -3794,6 +4095,7 @@ def _build_level2_tab():
                 means: list[float] = []
                 stds:  list[float] = []
                 raws:  list[float] = []
+                _plot("scan_begin", axis)   # replace this axis, keep the other
                 try:
                     await _run_in_thread(
                         _awg_pulse_on, ks_ch,
@@ -3837,6 +4139,7 @@ def _build_level2_tab():
                         stds.append(float(np.std(arr, ddof=1))
                                      if len(arr) > 1 else 0.0)
                         raws.extend(arr.tolist())
+                        _plot("scan_point", axis, float(pos), means[-1])
                         log_msg(f"    {axis}={pos:+.3f} mm  "
                                 f"I={means[-1]:+.3e} A ± {stds[-1]:.2e}")
                     scan_status.text = (f"done — {len(positions)} pts; "
@@ -3875,6 +4178,14 @@ def _build_level2_tab():
                     clear_activity()
 
             ui.button("run scan", on_click=run_scan).props("color=primary")
+
+    # ==================================================================
+    # RIGHT-HAND LIVE-PLOT COLUMN
+    # Built after the control cards so the run handlers above can stream
+    # into it via PLOTS[...].  Registers iv/scan/charge/wave callbacks.
+    # ==================================================================
+    with _right:
+        _build_l2_plots(PLOTS, _plot_dirty)
 
 
 # ===========================================================================
@@ -5945,6 +6256,199 @@ def _build_webcam_tab():
     wc.build_page()
 
 
+def _build_data_tab():
+    """HDF5 data explorer.
+
+    Left: every ``*.h5`` under ./data (recursively — bench/elec runs at the
+    top level, L1/L2 measurements in per-SiPM/per-T subfolders), newest
+    first, with a name filter. Right: the selected file's group/dataset tree
+    (``ui.tree``) and a detail pane that shows a node's attributes, a value
+    preview + numeric stats, and a quick plot for 1D/2D numeric datasets.
+    Introspection lives in :mod:`daq.h5browse` (pure, no GUI deps).
+    """
+    import numpy as np
+    from pathlib import Path
+    from daq import h5browse as HB
+    from daq import plotting as P
+
+    ui.label(
+        "Browse every recorded .h5 under ./data. Pick a file for its "
+        "group/dataset tree; click a node for attributes, a value preview, "
+        "and a quick plot of numeric datasets."
+    ).classes("text-gray-400 text-sm")
+
+    state = {"path": None, "files": []}
+
+    with ui.row().classes("w-full gap-3 no-wrap items-start"):
+        # ---- left: file browser ----
+        with ui.card().classes("daq-card").style("min-width:330px; max-width:360px"):
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.html("<h2>files</h2>")
+                count_lbl = ui.label("").classes("text-gray-400 text-xs")
+            flt = ui.input(placeholder="filter by name...") \
+                .props("dense clearable").classes("w-full")
+            ui.button("refresh", icon="refresh",
+                      on_click=lambda: refresh_files()).props("flat dense no-caps")
+            file_list = ui.column().classes("w-full gap-1") \
+                .style("max-height:62vh; overflow-y:auto")
+
+        # ---- right: structure + detail ----
+        with ui.column().classes("flex-grow gap-3").style("min-width:0"):
+            with ui.card().classes("daq-card w-full"):
+                file_hdr = ui.row().classes("items-center gap-3 w-full")
+                with file_hdr:
+                    ui.html("<h2>structure</h2>")
+                    hdr_info = ui.label("no file selected") \
+                        .classes("text-gray-400 text-sm")
+                    ui.space()
+                    dl_btn = ui.button("download", icon="download") \
+                        .props("flat dense no-caps")
+                    dl_btn.set_visibility(False)
+                tree_box = ui.column().classes("w-full") \
+                    .style("max-height:42vh; overflow:auto")
+                with tree_box:
+                    ui.label("select a file on the left").classes(
+                        "text-gray-500 text-sm")
+            with ui.card().classes("daq-card w-full"):
+                ui.html("<h2>detail</h2>")
+                detail_box = ui.column().classes("w-full")
+                with detail_box:
+                    ui.label("select a node in the tree").classes(
+                        "text-gray-500 text-sm")
+
+    def _download():
+        if state["path"]:
+            ui.download.file(state["path"], Path(state["path"]).name)
+    dl_btn.on_click(_download)
+
+    def show_detail(h5path: str | None):
+        detail_box.clear()
+        with detail_box:
+            if not state["path"] or not h5path:
+                ui.label("select a node in the tree").classes(
+                    "text-gray-500 text-sm")
+                return
+            try:
+                info = HB.node_detail(state["path"], h5path)
+            except Exception as e:
+                ui.label(f"error: {type(e).__name__}: {e}").classes("text-red-400")
+                return
+
+            ui.html(f"<code>{h5path}</code> &middot; <b>{info['kind']}</b>"
+                    + (f" &middot; {info['n_children']} child(ren)"
+                       if info["kind"] == "group" else ""))
+
+            if info["attrs"]:
+                ui.table(
+                    columns=[{"name": "k", "label": "attribute", "field": "k",
+                              "align": "left"},
+                             {"name": "v", "label": "value", "field": "v",
+                              "align": "left"}],
+                    rows=[{"k": k, "v": str(v)} for k, v in info["attrs"]],
+                    row_key="k",
+                ).props("dense flat").classes("w-full")
+            else:
+                ui.label("no attributes").classes("text-gray-500 text-xs")
+
+            if info["kind"] != "dataset":
+                return
+
+            ui.html(f"shape <code>{info['shape']}</code> &middot; "
+                    f"dtype <code>{info['dtype']}</code>")
+            s = info.get("stats")
+            if s and s.get("finite"):
+                ui.html(
+                    f"min <code>{s['min']:.4g}</code> &middot; "
+                    f"max <code>{s['max']:.4g}</code> &middot; "
+                    f"mean <code>{s['mean']:.4g}</code> &middot; "
+                    f"std <code>{s['std']:.4g}</code> &middot; "
+                    f"n <code>{s['n']}</code>"
+                    + (f" (finite {s['finite']})" if s['finite'] != s['n'] else "")
+                ).classes("text-gray-300 text-sm")
+
+            ui.label("preview").classes("text-gray-400 text-xs mt-1")
+            ui.code(info["preview"]).classes("w-full")
+
+            if not info["plottable"]:
+                return
+
+            plot = ui.matplotlib(figsize=(8.5, 3.2)).classes("w-full")
+            axp = plot.figure.add_subplot(111)
+            P.apply_dark_style(plot.figure, axp)
+            is_2d = info["ndim"] == 2
+            row_in = ui.number(label="row", value=0, min=0,
+                               max=max(0, info["shape"][0] - 1), step=1) \
+                .classes("w-28 num")
+            row_in.set_visibility(is_2d)
+
+            def do_plot(_=None, hp=h5path):
+                row = int(row_in.value) if is_2d else None
+                try:
+                    y = HB.read_dataset(state["path"], hp, row=row).ravel()
+                except Exception as e:
+                    ui.notify(f"plot failed: {e}", type="negative")
+                    return
+                axp.clear()
+                P.apply_dark_style(plot.figure, axp)
+                axp.plot(y, lw=0.8)
+                title = hp + (f"  row {row}" if is_2d else "")
+                axp.set_title(title, fontsize=9)
+                plot.figure.tight_layout()
+                plot.update()
+
+            with ui.row().classes("items-center gap-2"):
+                ui.button("plot", icon="show_chart", on_click=do_plot) \
+                    .props("dense color=primary no-caps")
+                if is_2d:
+                    ui.label(f"of {info['shape'][0]} rows").classes(
+                        "text-gray-500 text-xs")
+            do_plot()
+
+    def load_file(path: str):
+        state["path"] = path
+        hdr_info.set_text(Path(path).name)
+        dl_btn.set_visibility(True)
+        tree_box.clear()
+        detail_box.clear()
+        with detail_box:
+            ui.label("select a node in the tree").classes(
+                "text-gray-500 text-sm")
+        with tree_box:
+            try:
+                nodes = HB.build_tree(path)
+            except Exception as e:
+                ui.label(f"cannot open: {type(e).__name__}: {e}").classes(
+                    "text-red-400")
+                return
+            ui.tree(nodes, on_select=lambda e: show_detail(e.value)) \
+                .expand(["/"])
+
+    def refresh_files():
+        files = HB.list_data_files()
+        state["files"] = files
+        render_file_list()
+
+    def render_file_list():
+        q = (flt.value or "").strip().lower()
+        files = [f for f in state["files"] if q in f["rel"].lower()]
+        count_lbl.set_text(f"{len(files)}/{len(state['files'])}")
+        file_list.clear()
+        with file_list:
+            if not files:
+                ui.label("no matching .h5 files").classes(
+                    "text-gray-500 text-sm")
+            for f in files:
+                meta = (f"{HB.human_size(f['size'])} &middot; "
+                        f"{time.strftime('%m-%d %H:%M', time.localtime(f['mtime']))}")
+                with ui.element("div").classes("data-file-row").on(
+                        "click", lambda _e=None, p=f["path"]: load_file(p)):
+                    ui.html(f"<div class='df-name'>{f['rel']}</div>"
+                            f"<div class='df-meta'>{meta}</div>")
+
+    flt.on("update:model-value", lambda _e: render_file_list())
+    refresh_files()
+
+
 def _build_plots_tab():
     """Render saved bench HDF5 files using daq.plotting.
 
@@ -7448,6 +7952,7 @@ def index():
         t_rast   = ui.tab("raster")
         t_align  = ui.tab("alignment")
         t_plots  = ui.tab("plots")
+        t_data   = ui.tab("data")
 
     # The "instruments" menu is replaced by clickable status pills in the
     # header (see _pill_tabs below). Webcam doesn't have a status pill so
@@ -7499,6 +8004,12 @@ def index():
         # promoted out of the measurements dropdown.
         ui.button("📊 plots",
                   on_click=lambda: tabs.set_value(t_plots)) \
+            .props("flat no-caps").classes("menu-btn hdr-plots-btn")
+
+        # Direct shortcut to the HDF5 data explorer — sits next to plots
+        # since the two are the usual "look at recorded data" destinations.
+        ui.button("🗂 data",
+                  on_click=lambda: tabs.set_value(t_data)) \
             .props("flat no-caps").classes("menu-btn hdr-plots-btn")
 
         # ⚡ Connect-all in the header: tries each disconnected instrument
@@ -7612,6 +8123,7 @@ def index():
         with ui.tab_panel(t_l5):     _build_level5_tab()
         with ui.tab_panel(t_rast):   _build_raster_tab()
         with ui.tab_panel(t_align):  _build_alignment_tab()
+        with ui.tab_panel(t_data):   _build_data_tab()
 
     with ui.element("footer").classes("daq-footer"):
         ui.html("nEXO SiPM tile characterization DAQ &mdash; "

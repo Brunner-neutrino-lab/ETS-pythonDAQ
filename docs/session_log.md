@@ -12,6 +12,140 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-05-29 — L2 live-plot column (iv / scan / charge / waveform)
+
+### What changed
+
+The L2 tab in [daq/webgui/shell.py](../daq/webgui/shell.py) gained a
+right-hand live-plot column.  The page is now a left/right split: the
+existing iv/pulse/scan/sipm control cards on the left, four stacked
+echart views on the right that update **as data is recorded**.
+
+Four views (`_build_l2_plots()`, a new module-level builder):
+1. **iv** — current vs bias, *dark* + *bright* overlaid.  Streams
+   per-point: the K6485 path feeds the existing `progress_cb`; the
+   B2987 batch path fills the trace from the returned block.
+2. **scan** — current vs stage position, *X* + *Y* overlaid.  Streams
+   per-point from the (main-thread) scan loop.
+3. **charge** — amplitude histogram (the VX2740 amplitudes are already
+   baseline-subtracted, so this is the "amplitude − baseline" spectrum
+   the user asked for), *dark* + *bright* overlaid, step-line, bin
+   count adjustable.  Drawn once per pulse run.
+4. **waveform** — a single stored frame from the capture channel with
+   prev / ◀ / ▶ scroll through the acquisition; baseline-subtracts
+   using the pre-trigger region and aligns t=0 to the trigger.
+
+Overlay rule (per the user's spec) is **replace same slot, keep the
+other**: a new dark IV run overwrites only the dark trace, etc.  Each
+view has a clear button that wipes both slots.
+
+### How it's wired
+
+- A `PLOTS` dict + best-effort `_plot(name, *args)` wrapper live in
+  `_build_level2_tab`.  The plot column (built *after* the control
+  cards) fills `PLOTS` with streaming callbacks; the run handlers
+  (defined above it) call them by key, so build order doesn't matter —
+  lookups happen at click-time.
+- `_plot()` swallows + logs any chart error: a plotting glitch must
+  never abort a measurement run.
+- **Thread safety:** the IV sweep runs in a worker thread, so its
+  `progress_cb` only *buffers* points + sets `_plot_dirty["iv"]`; a
+  `ui.timer(0.3)` in the plot column redraws on the UI loop (echart
+  can't be touched off-loop).  Scan / charge / waveform callbacks all
+  fire on the main thread (after their `await _run_in_thread(...)`
+  returns) and redraw directly.
+
+### Decisions
+
+- **Right-side panel** (not a sub-tab) so a plot updates live while the
+  operator watches the controls — chosen by the user.
+- **Live point-by-point** for IV/scan; charge + waveform are inherently
+  post-acquisition (need the full amplitude/waveform arrays).
+- **echart, not matplotlib** — matches every other live plot in the
+  webapp (digitizer waveform/spectrum, L1 single waveform) and updates
+  incrementally without re-rendering a PNG.
+
+### Verification
+
+Headless build test (manual `nicegui.Client`, no request) renders the
+whole L2 tab and `_build_l2_plots` without error; all seven callbacks
+register and run against simulated IV/scan/pulse data (histogram +
+waveform redraw paths included).  **Not yet deployed** — needs
+`systemctl --user restart daq-webapp` to pick up the change, then a
+real run on the bench to confirm against live instruments.
+
+### Open threads
+
+- IV/scan y-axes are linear; reverse-bias currents span decades, so a
+  log-y toggle might help.  Left off for now (echart auto-scales and
+  some currents are negative).
+- The charge spectrum reads `result.amplitudes` directly (counts).  If
+  a future bench uses the RTO2024 (amplitudes already in volts) the
+  axis label "ADC" would be wrong — but L2 only drives the VX2740.
+- `no-wrap` on the split means very narrow windows scroll horizontally
+  rather than stacking; fine for lab monitors, noted in case a laptop
+  user complains.
+
+---
+
+## 2026-05-29 — Data tab: HDF5 explorer for all recorded runs
+
+### What changed
+
+New **`data`** tab in the web shell — a browser for every `.h5` under
+`./data`, not just the `bench_*.h5` the plots tab already knew about.
+
+- **`daq/h5browse.py`** (new, pure data layer, no NiceGUI deps so it's
+  unit-testable on its own):
+  - `list_data_files()` — `rglob("*.h5")` so it catches L1/L2 measurements
+    in their per-SiPM/per-T subfolders (`sipm{N}_T{K}K/`, `L1/`,
+    `T{K}K_anon/`) as well as top-level bench/elec runs. Newest first.
+  - `build_tree(path)` — HDF5 hierarchy as a `ui.tree` node list; node
+    `id` is the internal HDF5 path so the detail/read helpers re-open by it.
+  - `node_detail(path, h5path)` — attrs (numpy scalars/arrays formatted),
+    plus for datasets: shape/dtype, a bounded value preview, numeric stats.
+    Stats sample is capped (`_sample`, 2e6 elems via a leading axis-0 slice)
+    so a 1000x1500 waveform set doesn't get fully materialized for a hover.
+  - `read_dataset(path, h5path, row=None)` — full read, or one row of a 2D
+    dataset (so we plot a single waveform, not 1.5M points).
+- **`_build_data_tab()`** in `shell.py`: left = filterable file list (one
+  clickable `.data-file-row` per file, size + mtime); right = `ui.tree` of
+  the selected file + a detail card (attribute table, preview, stats, and a
+  quick matplotlib plot for 1D / per-row 2D numeric datasets). Download
+  button uses `ui.download.file`.
+- Registered the tab + a header **`🗂 data`** button next to `📊 plots`
+  (the two "look at recorded data" destinations sit together). New
+  `.data-file-row` CSS next to the `.daq-card` rules.
+
+### Verification
+
+- `h5browse` exercised directly against real files: tree walk, group
+  detail, 1D (`/iv/current_a`) and 2D (`/vx2740/ch0/waveforms`) dataset
+  detail, row slicing — all correct.
+- Mounted `_build_data_tab` on a throwaway unauthenticated page in a
+  separate app instance and HTTP-fetched it: 200, 14 file rows rendered,
+  no server errors. (Login is websocket-driven, so this side-channel was
+  easier than scripting the auth flow.)
+- `ui.tree.expand` / on_select `e.value` / `ui.download.file` signatures
+  confirmed against the installed NiceGUI 3.12.1.
+- Main `daq-webapp` service restarted, came back `active`. (The `stop`
+  side logged the known MJPEG-client SIGKILL-on-timeout; the new process
+  started clean.)
+
+### Open threads
+
+- Interactive paths (click file -> tree, click node -> detail/plot) build
+  over the websocket and weren't driven end-to-end here — the backend and
+  page-build are verified, but a human click-through on the live app is the
+  last mile.
+- The detail pane re-opens the file per node click. Fine for local disk;
+  if `data/` ever moves to a slow mount, consider caching the open handle
+  per selected file.
+- 2D plot is one row at a time. An overlay (first N rows) or a heatmap
+  would be a natural follow-up for waveform inspection.
+
+---
+
 ## 2026-05-28 — L2 identifiers go optional; pulse gains aux trigger
 
 ### What changed
