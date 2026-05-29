@@ -12,6 +12,129 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-05-28 — L2 single-SiPM tab rebuilt: IV / pulse / scan
+
+### What changed
+
+`_build_level2_tab` in [daq/webgui/shell.py](../daq/webgui/shell.py)
+fully replaced with a four-card layout matching the user's mental
+model of single-SiPM workflow:
+
+1. **sipm + position** — direct user-inputs (no channel-map lookup):
+   sipm id (file tag), MUX channel, center (x, y) in mm, T (K) with
+   the read-from-slowcontrol button.  "go to sipm" button moves the
+   stage + selects MUX without running any measurement (sanity check).
+2. **iv sweep** — dark/bright toggle + meter selector (k6485 / b2987)
+   + start / stop / step / N-per-V.  Bright wraps the sweep in
+   `_awg_pulse_on(ks_ch=1, ...)` / `_awg_off(1)` using the existing
+   `config.led_*` defaults.
+3. **pulse counting** — dark/bright toggle + bias + VX2740 channel +
+   threshold (ADC) + pre/post (µs) + N waveforms + store-raw switch.
+   Bright same AWG channel + LED defaults as IV.  Runs directly
+   against `HUB.dig._ctrl.run(...)` (bypasses `M.pulse_run` because
+   that path goes through the legacy lamp_stage abstraction that
+   doesn't apply on this bench).
+4. **scan** — axis toggle (X / Y) + bias + start / stop / step / N-per-pt +
+   settle + meter selector + light-mode toggle (VUV beam → AWG ch1,
+   Laser → AWG ch2) + AWG params (freq, amp, offset, width) that
+   default to the existing `led_*` config.  Loop:
+     - select MUX channel once
+     - turn on AWG with chosen channel + pulse params
+     - set bias
+     - for each position: move stage (deenergize_after=True) → settle
+       → take N samples on chosen meter → next move (auto-energizes)
+     - turn AWG off + bias off
+
+All four cards share two helpers defined at the top of the tab body:
+- `_awg_pulse_on(ks_ch, freq, amp, offset, width)` — set load=INF,
+  apply_pulse, configure_pulse, output_on
+- `_awg_off(ks_ch)` — output_off (silent on failure)
+
+The previous `current_measure` card was removed (functionality is
+covered by IV with start=stop=bias or by L1's current-samples card).
+
+### Decisions
+
+- **No channel-map lookup.** User supplies sipm id, MUX ch, and
+  (cx, cy) directly per measurement.  This matches how the bench
+  is actually used right now (no global channel-map CSV in play).
+- **"Bright" means AWG pulse, not lamp-stage move.** The old
+  `M.iv_sweep(illuminated=True)` etc. assumed a separately-moving
+  lamp_stage that doesn't exist on this bench.  Instead, "bright"
+  here just enables the AWG pulse on ch1 with the existing
+  `config.led_*` defaults before the measurement and disables it
+  after.  Result still saves to MSTORE with `illuminated=True`.
+- **Scan illumination is two distinct AWG channels** (ch1 = VUV
+  beam, ch2 = Laser) with per-mode pulse parameters editable from
+  the card.  No way to express "dark scan" in the current card —
+  if needed, set amp=0 or add a dark toggle later.
+- **Scan motion follows the user's spec exactly**: move → de-energize
+  → record → re-energize (implicit via the next move) → next.  Uses
+  `P.move_stage(deenergize_after=True)` which leaves the stage
+  de-energized at each measurement instant.
+- **New `MSTORE.save_l2_scan`** persists positions + means + stds +
+  raw samples to `data/sipm{N}_T{K}/<ms>.h5` under
+  `/scan/<x|y>/<unix_ms>/` with all relevant attrs (axis, bias,
+  meter, light_mode, light_*, center_*, mux_channel, n_per_point,
+  settle_s).  Matches the existing per-(sipm, T) folder convention.
+
+### Open threads
+
+- **Dark scan not exposed.** The card always enables the AWG.  If a
+  user wants a "dark" position scan (e.g., to map leakage vs
+  position), add a third light-mode option `"off"` that skips the
+  `_awg_pulse_on` step and saves with light_mode="dark".
+- **No live plot of the scan in the page.** Status line shows the
+  current point + final summary.  A small matplotlib plot like the
+  L1 single-waveform card would be a nice add.
+- **`M.iv_sweep` / `M.current_measure` / `M.pulse_run` no longer
+  called from L2.** They're still used by L3/L4/L5 (tile sweep,
+  temp point, full run).  The lamp_stage assumption is fine there
+  — when those bench setups exist, the abstraction makes sense.
+- **AWG load is hard-coded "INF".** If the lab adds a 50 Ω target,
+  expose the load as a per-scan field.
+
+---
+
+## 2026-05-28 — WFG (33500B) amplitude change rejected by instrument
+
+### What changed
+
+Fixed a bug where changing amplitude (or offset) for the Keysight
+33500B from the GUI did nothing and threw an error on the instrument's
+front panel.
+
+- Root cause: `KS33500BDriver.apply()` built the `APPLy:<func>` SCPI
+  command with a 4th parameter (`phase`) for SIN/SQU/RAMP/PULS. The
+  33500-series `APPLy` command accepts at most `freq,amplitude,offset`
+  — no phase. The extra value raised **-108 "Parameter not allowed"**
+  and the instrument discarded the *whole* command, so amplitude never
+  updated. Every GUI Apply hits this path (`apply_sine` etc.).
+- Fix (in submodule `keysight33500b-python`): `APPLy` now sends only
+  freq/amp/offset; phase is written separately via `:SOURce<n>:PHASe`
+  (skipped for NOIS/DC). ARB folded into the same branch — its APPLy
+  syntax is identical (no phase).
+- Verified the emitted SCPI against a fake instrument under the
+  `ets-daq` conda env. NOT yet confirmed against the real 33500B —
+  Lucas to hit Apply post-restart and confirm amplitude changes with
+  no front-panel error.
+- Committed in submodule (`4fae808`) + parent pointer bump (`4ee7540`),
+  webapp restarted.
+
+### Lessons / tribal knowledge
+
+- The 33500 `APPLy:<func>` is freq/amp/offset only. Phase, duty,
+  symmetry are all separate commands. Don't append phase to APPLy.
+
+### Open threads
+
+- Confirm fix on real hardware.
+- Submodule changes were committed on the submodule's `main`; not
+  pushed to its remote. Push when convenient so the pointer bump
+  resolves for other clones.
+
+---
+
 ## 2026-05-28 — Per-measurement HDF5 persistence (L1 + L2 tabs)
 
 ### What changed
