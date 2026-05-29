@@ -12,6 +12,95 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-05-28 — L2 identifiers go optional; pulse gains aux trigger
+
+### What changed
+
+Per the user's spec, every SiPM-identification field on the L2 page
+is now opt-in:
+
+- **`sipm + position (optional)` card**: each of `SiPM id`, `MUX ch`,
+  and `Location` is gated by its own switch.  Off ⇒ the field is
+  omitted from the measurement file AND the corresponding action is
+  skipped at run-time (no MUX `select`, no stage move).  Only `T (K)`
+  remains mandatory (it's used in the per-T folder name).
+- **`go to sipm` button** acts on whatever's enabled.  If neither MUX
+  nor Location are on, it's a no-op with an explanatory log line.
+- **`_prep_position()` helper** (used by IV, Pulse, and Scan) now
+  conditionally selects the MUX and conditionally moves the stage,
+  rather than requiring both.  The MUX can be disconnected when
+  unused.
+
+**`MSTORE` save signatures** widened to accept
+`sipm_id=None, mux_channel=None, center_x_mm=None, center_y_mm=None`.
+Folder convention:
+- sipm_id present → `data/sipm{N}_T{K:.1f}K/<ms>.h5`
+- sipm_id absent  → `data/T{K:.1f}K_anon/<ms>.h5`
+
+New `_write_optional_attrs(group, **kw)` helper skips any None values
+so on-disk attrs only contain what the operator entered.
+
+### Pulse card — aux-trigger channel
+
+New optional `trigger on another ch` switch reveals two extra fields:
+`aux ch` and `aux thr (ADC)`.  When enabled, the auxiliary channel is
+added to the VX2740's `sipm_channels` + `thresholds` dict, so the
+digitizer self-triggers when **either** the capture channel or the
+aux channel crosses its per-channel threshold.  Both channels are
+read out (the result's `channel_ids` includes both), so analysis can
+correlate them.  Saved as `/pulse/<dark|illuminated>/<ms>/` attrs
+(`capture_ch`, `capture_thr_adc`, `aux_trigger_ch`,
+`aux_trigger_thr_adc`) so the trigger chain is unambiguous downstream.
+
+### Scan card — auto-range from center
+
+Added a small `use ±0.75 cm from center` button.  When the Location
+switch is on, it fills `start`/`stop` with `center − 7.5 mm` →
+`center + 7.5 mm` along the currently-selected axis.  Per the user's
+spec: "If I enter a location, then scan x and scan y should be
+centered on that location, running from -0.75 cm to 0.75."  Operator
+can still edit start/stop manually for smaller or asymmetric windows.
+
+When Location is off, the scan still runs along the selected axis at
+the entered absolute coords; the "other axis" defaults to 0 mm
+rather than refusing to run.
+
+### Other touches
+
+- New fields on `ExperimentConfig`: `led_frequency_hz`,
+  `led_amplitude_v`, `led_offset_v`, `led_pulse_width`.  These were
+  duplicated in `scripts/bench_test.py:DEFAULT_CFG` until now; the
+  L2 bright wrappers (`_awg_pulse_on(1, freq, amp, offset, width)`)
+  now read them from config.
+
+### Decisions
+
+- **Per-field switches, not "leave the box empty"** — NiceGUI's
+  `ui.number` doesn't have clean empty-state semantics, and 0 is a
+  meaningful value for center_x / center_y.  An explicit on/off
+  switch removes ambiguity.
+- **Save-file folder picks `_anon` suffix when sipm_id is absent**
+  rather than collapsing all anonymous saves into a single folder
+  — keeps per-T separation either way.
+- **Aux trigger via `sipm_channels`** (per-channel threshold, both
+  channels read out) rather than a separate "trigger only" channel.
+  The VX2740 firmware natively does ITLA-OR across enabled channels
+  for self-trigger; this is the cleanest mapping.
+
+### Open threads
+
+- L2 scan UX is getting busy.  If a "dark scan" light mode is added
+  later, the toggle becomes a three-way segmented control; not a
+  problem, just noting.
+- `bench_test.py:DEFAULT_CFG` still has its own LED defaults — the
+  config.py copies should be the single source of truth.  Small
+  follow-up.
+- Pulse aux-trigger thresholds use `per_channel`; if both should
+  share a value, the operator enters it twice.  Could expose a
+  `threshold_mode: global / per_ch` toggle but the UX cost > value.
+
+---
+
 ## 2026-05-28 — L2 single-SiPM tab rebuilt: IV / pulse / scan
 
 ### What changed

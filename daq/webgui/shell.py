@@ -3160,31 +3160,109 @@ def _build_level1_tab():
 # ===========================================================================
 
 def _build_level2_tab():
-    ui.label("Run an IV sweep, current_measure, or pulse acquisition on one SiPM. "
-             "Each click writes an HDF5 file to data/sipm{N}_T{K}/<unix_ms>.h5.") \
-        .classes("text-gray-400 text-sm")
+    """Single-SiPM measurements: IV, pulse counting, and scan.
+
+    Operator provides the SiPM identity directly (no channel-map lookup):
+    sipm id (label), MUX channel, and the (x, y) center position in mm.
+    All measurements:
+      - select that MUX channel
+      - move the stage to (center_x, center_y)
+      - run the measurement (dark or bright; bright = AWG ch1 pulse)
+      - save to data/sipm{N}_T{K}/<unix_ms>.h5
+
+    The scan card sweeps one axis (X or Y) around the center, takes
+    N current samples per position, and supports two illumination modes:
+    VUV beam (AWG ch1) and Laser (AWG ch2), each with its own pulse
+    parameters.
+    """
+    ui.label(
+        "Single-SiPM measurements: IV (dark/bright), pulse counting "
+        "(dark/bright), and 1-D scan (X or Y, dark/VUV/laser). "
+        "Each click writes data/sipm{N}_T{K}/<unix_ms>.h5."
+    ).classes("text-gray-400 text-sm")
 
     log_lbl = ui.log(max_lines=24).classes("h-64 w-full")
     def log_msg(s: str): log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
 
-    with ui.row().classes("w-full gap-3 items-start"):
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>SiPM selection</h2>")
-            sipm_in = ui.number(label="SiPM id", value=1, step=1).classes("w-40 num")
-            illum   = ui.switch("illuminated", value=False)
+    # ==================================================================
+    # Shared helpers used by every measurement card.
+    # ==================================================================
+    def _awg_pulse_on(ks_ch: int, freq: float, amp: float, offset: float,
+                       width_s: float) -> None:
+        """Configure + enable a Keysight 33500B channel with a pulse train.
 
-            # Temperature: auto-read from slowcontrol if connected; otherwise
-            # the user enters it. The value at click time is baked into the
-            # file's attrs and the output folder name.
+        Called inside a worker thread (no await).  Raises on missing AWG.
+        """
+        awg = HUB.ks33500b
+        if awg is None:
+            raise RuntimeError(
+                "Keysight 33500B not connected — required for bright / scan "
+                "illumination.  Connect it on the Connections tab.")
+        awg.set_load("INF", channel=ks_ch)
+        awg.apply_pulse(float(freq), float(amp), float(offset), 0.0,
+                         channel=ks_ch)
+        awg.configure_pulse(period_s=1.0 / max(float(freq), 1e-9),
+                             width_s=float(width_s),
+                             channel=ks_ch)
+        awg.output_on(ks_ch)
+
+    def _awg_off(ks_ch: int) -> None:
+        if HUB.ks33500b is None: return
+        try: HUB.ks33500b.output_off(ks_ch)
+        except Exception: pass
+
+    with ui.row().classes("w-full gap-3 items-start"):
+
+        # ==============================================================
+        # CARD 1 — SiPM identity + position (all but T are optional)
+        # ==============================================================
+        with ui.card().classes("daq-card"):
+            ui.html("<h2>sipm + position (optional)</h2>")
+            ui.label(
+                "Toggle the switch next to a field to include it.  "
+                "Off ⇒ field is omitted from the measurement file AND "
+                "the corresponding action is skipped at run-time (no MUX "
+                "select, no stage move).  T (K) is always required for "
+                "the per-T folder name."
+            ).classes("text-xs text-gray-400")
+
+            # ---- SiPM id (optional, label-only — file tag) ----
+            with ui.row().classes("gap-2 items-end"):
+                sipm_use = ui.switch("SiPM id", value=False) \
+                    .props("dense")
+                sipm_in = ui.number(value=1, step=1).classes("w-24 num")
+                sipm_in.bind_enabled_from(sipm_use, "value")
+
+            # ---- MUX channel (optional — gates whether MUX is touched) ----
+            with ui.row().classes("gap-2 items-end"):
+                mux_use = ui.switch("MUX ch", value=False) \
+                    .props("dense")
+                mux_in  = ui.number(value=1, step=1, min=1, max=96) \
+                    .classes("w-24 num")
+                mux_in.bind_enabled_from(mux_use, "value")
+
+            # ---- Location (optional — gates whether stage moves) ----
+            with ui.row().classes("gap-2 items-end"):
+                loc_use = ui.switch("Location", value=False) \
+                    .props("dense")
+                cx_in = ui.number(label="x (mm)", value=0.0,
+                                   step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                cy_in = ui.number(label="y (mm)", value=0.0,
+                                   step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                cx_in.bind_enabled_from(loc_use, "value")
+                cy_in.bind_enabled_from(loc_use, "value")
+
+            # ---- Temperature (always required) ----
             with ui.row().classes("gap-2 items-end"):
                 temp_in = ui.number(label="T (K)", value=298.0, step=0.1,
-                                    format="%.2f").classes("w-32 num")
+                                     format="%.2f").classes("w-32 num")
                 temp_src = ui.label("manual").classes("text-xs text-gray-500")
                 async def read_T_from_sc():
                     if HUB.sc is None:
                         log_msg("slow control not connected — keep manual T")
-                        temp_src.text = "manual"
-                        return
+                        temp_src.text = "manual"; return
                     try:
                         T = await _run_in_thread(P.read_temperature, HUB.sc)
                         temp_in.value = float(T)
@@ -3194,68 +3272,164 @@ def _build_level2_tab():
                         log_msg(f"  T read FAIL: {type(e).__name__}: {e}")
                         temp_src.text = "manual"
                 ui.button("read T", on_click=read_T_from_sc).props("dense")
-                def _mark_manual(_):
-                    temp_src.text = "manual"
-                temp_in.on_value_change(_mark_manual)
+                temp_in.on_value_change(lambda _: setattr(temp_src, "text",
+                                                           "manual"))
 
-            def refresh_list():
-                ids = [e.sipm_id for e in HUB.config.sipm_list()]
-                if ids:
-                    log_msg(f"channel map: {len(ids)} SiPMs ({min(ids)}..{max(ids)})")
-                else:
-                    log_msg("no channel map — go to Config tab and load yaml")
-            ui.button("inspect map", on_click=refresh_list)
+            async def _go_to_sipm():
+                """Apply whatever the operator entered: select MUX channel
+                (if enabled) + move stage (if enabled).  No measurement.
+                Logs a no-op if neither toggle is on."""
+                if not (mux_use.value or loc_use.value):
+                    log_msg("go-to: neither MUX nor Location enabled — "
+                            "nothing to do"); return
+                if mux_use.value:
+                    if HUB.mux is None:
+                        log_msg("MUX enabled but mux not connected"); return
+                    try:
+                        await _run_in_thread(P.select_channel, HUB.mux,
+                                              int(mux_in.value))
+                        log_msg(f"  MUX → ch {int(mux_in.value)}")
+                    except Exception as e:
+                        log_msg(f"  MUX FAIL: {e}"); return
+                if loc_use.value:
+                    if HUB.stage is None:
+                        log_msg("Location enabled but stage not connected")
+                        return
+                    try:
+                        await _run_in_thread(
+                            P.move_stage, HUB.stage,
+                            float(cx_in.value), float(cy_in.value),
+                            bool(HUB.config.stage_deenergize),
+                        )
+                        log_msg(f"  stage → ({cx_in.value:.3f}, "
+                                f"{cy_in.value:.3f}) mm")
+                    except Exception as e:
+                        log_msg(f"  stage FAIL: {e}")
 
+            ui.button("go to sipm", on_click=_go_to_sipm) \
+                .props("dense color=secondary")
+
+        # ---- helpers shared by all measurement cards ----
+        def _opt_kwargs() -> dict:
+            """Pack the optional identifier fields (None when their switch
+            is off).  Pass directly to MSTORE.save_l2_* via **_opt_kwargs()."""
+            return {
+                "sipm_id":     int(sipm_in.value) if sipm_use.value else None,
+                "mux_channel": int(mux_in.value)  if mux_use.value  else None,
+                "center_x_mm": float(cx_in.value) if loc_use.value  else None,
+                "center_y_mm": float(cy_in.value) if loc_use.value  else None,
+            }
+
+        async def _prep_position() -> bool:
+            """Apply the entered identifiers: select MUX channel (if
+            enabled) and move stage to (cx, cy) (if enabled).  Returns
+            True if everything that was requested succeeded; True also
+            when nothing was requested.  Logs and returns False on any
+            failure."""
+            if mux_use.value:
+                if HUB.mux is None:
+                    log_msg("MUX enabled but mux not connected — abort")
+                    return False
+                try:
+                    await _run_in_thread(P.select_channel, HUB.mux,
+                                          int(mux_in.value))
+                except Exception as e:
+                    log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
+                    return False
+            if loc_use.value:
+                if HUB.stage is None:
+                    log_msg("Location enabled but stage not connected — abort")
+                    return False
+                try:
+                    await _run_in_thread(
+                        P.move_stage, HUB.stage,
+                        float(cx_in.value), float(cy_in.value),
+                        bool(HUB.config.stage_deenergize),
+                    )
+                except Exception as e:
+                    log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
+                    return False
+            return True
+
+        # ==============================================================
+        # CARD 2 — IV (dark / bright × b2987 / k6485)
+        # ==============================================================
         with ui.card().classes("daq-card"):
             ui.html("<h2>iv sweep</h2>")
-            iv_start = ui.number(label="start (V)", value=HUB.config.iv_voltage_start, step=0.1).classes("w-32 num")
-            iv_stop  = ui.number(label="stop (V)",  value=HUB.config.iv_voltage_stop,  step=0.1).classes("w-32 num")
-            iv_step  = ui.number(label="step (V)",  value=HUB.config.iv_voltage_step,  step=0.01).classes("w-32 num")
-            iv_npt   = ui.number(label="pts / V",   value=HUB.config.iv_n_per_point,   step=1).classes("w-32 num")
+            iv_illum = ui.toggle({"dark": "dark", "bright": "bright"},
+                                  value="dark").props("dense")
             iv_meter = ui.select(
-                {"b2987": "B2987 (built-in ammeter)",
-                 "k6485": "K6485 picoammeter"},
-                value="b2987", label="current meter",
-            ).classes("w-56")
+                {"k6485": "K6485 picoammeter",
+                 "b2987": "B2987 (built-in ammeter)"},
+                value="k6485", label="current meter").classes("w-56")
+            with ui.row().classes("gap-2 items-end"):
+                iv_start = ui.number(label="start (V)",
+                                      value=HUB.config.iv_voltage_start,
+                                      step=0.1).classes("w-24 num")
+                iv_stop  = ui.number(label="stop (V)",
+                                      value=HUB.config.iv_voltage_stop,
+                                      step=0.1).classes("w-24 num")
+                iv_step  = ui.number(label="step (V)",
+                                      value=HUB.config.iv_voltage_step,
+                                      step=0.01).classes("w-24 num")
+                iv_npt   = ui.number(label="N / V",
+                                      value=HUB.config.iv_n_per_point,
+                                      step=1).classes("w-20 num")
+
             async def run_iv():
-                if HUB.elec is None: log_msg("electrometer not connected"); return
-                meter = str(iv_meter.value or "b2987")
+                if HUB.elec is None: log_msg("b2987 not connected"); return
+                meter = str(iv_meter.value or "k6485")
                 if meter == "k6485" and HUB.k6485 is None:
                     log_msg("K6485 not connected"); return
+                bright = (iv_illum.value == "bright")
+                if bright and HUB.ks33500b is None:
+                    log_msg("Keysight 33500B not connected — bright needs AWG")
+                    return
+                if not await _prep_position(): return
+
                 import numpy as np
-                voltages = np.arange(float(iv_start.value),
-                                     float(iv_stop.value) + float(iv_step.value)*0.5,
-                                     float(iv_step.value)).tolist()
-                log_msg(f"IV sipm={int(sipm_in.value)} illum={illum.value} "
-                        f"meter={meter} {len(voltages)} voltages")
-                set_activity("L2 IV sweep",
-                             f"sipm {int(sipm_in.value)}, {len(voltages)} pts, "
-                             f"meter={meter}, "
-                             f"{'illum' if illum.value else 'dark'}")
+                voltages = np.arange(
+                    float(iv_start.value),
+                    float(iv_stop.value) + float(iv_step.value) * 0.5,
+                    float(iv_step.value),
+                ).tolist()
+                log_msg(f"IV sipm={int(sipm_in.value)} {iv_illum.value} "
+                        f"{meter} {len(voltages)} V, N={int(iv_npt.value)}/V")
+                set_activity("L2 IV",
+                             f"sipm {int(sipm_in.value)} · "
+                             f"{iv_illum.value} · {meter} · {len(voltages)} V")
                 try:
-                    result = await _run_in_thread(
-                        lambda: M.iv_sweep(
-                            sipm_id     = int(sipm_in.value),
-                            instruments = HUB.instruments,
-                            config      = HUB.config,
-                            meter       = meter,
-                            illuminated = illum.value,
-                            voltages    = voltages,
-                            n_per_point = int(iv_npt.value),
+                    if bright:
+                        await _run_in_thread(
+                            _awg_pulse_on, 1,
+                            HUB.config.led_frequency_hz,
+                            HUB.config.led_amplitude_v,
+                            HUB.config.led_offset_v,
+                            HUB.config.led_pulse_width,
                         )
-                    )
-                    log_msg(f"  done: {len(result.avg_source_v)} pts  "
-                            f"I({result.avg_source_v[-1]:.2f}V) = {result.avg_current_a[-1]:.3e} A")
+                    delay = float(getattr(HUB.config, "iv_delay_s", 0.05))
+                    if meter == "k6485":
+                        result = await _run_in_thread(
+                            P.iv_sweep_external_meter, HUB.elec, HUB.k6485,
+                            voltages, int(iv_npt.value), delay,
+                        )
+                    else:
+                        result = await _run_in_thread(
+                            P.iv_sweep, HUB.elec, voltages,
+                            int(iv_npt.value), delay,
+                        )
+                    log_msg(f"  done: I({result.avg_source_v[-1]:.2f} V) = "
+                            f"{result.avg_current_a[-1]:.3e} A")
                     note_bias(v_set=result.avg_source_v[-1],
                               i_meas=result.avg_current_a[-1],
-                              output_on=True)
+                              output_on=False)
                     try:
                         p = MSTORE.save_l2_iv_sweep(
                             result,
-                            sipm_id       = int(sipm_in.value),
                             temperature_K = float(temp_in.value),
-                            illuminated   = bool(illum.value),
+                            illuminated   = bright,
                             meter         = meter,
+                            **_opt_kwargs(),
                         )
                         log_msg(f"  saved: {p}")
                     except Exception as e:
@@ -3263,99 +3437,135 @@ def _build_level2_tab():
                 except Exception as e:
                     log_msg(f"  IV FAIL: {type(e).__name__}: {e}")
                 finally:
+                    if bright:
+                        await _run_in_thread(_awg_off, 1)
+                    try: await _run_in_thread(P.bias_off, HUB.elec)
+                    except Exception: pass
                     clear_activity()
-            ui.button("run iv sweep", on_click=run_iv).props("color=primary")
+            ui.button("run iv", on_click=run_iv).props("color=primary")
 
+        # ==============================================================
+        # CARD 3 — Pulse counting (dark / bright)
+        # ==============================================================
         with ui.card().classes("daq-card"):
-            ui.html("<h2>current measure</h2>")
-            ui.label("Bias stays off; reads the chosen meter and averages.") \
-                .classes("text-gray-500 text-xs")
-            cm_n     = ui.number(label="n samples",
-                                 value=HUB.config.iv_n_per_point, step=1) \
-                .classes("w-32 num")
-            cm_delay = ui.number(label="delay (s)",
-                                 value=getattr(HUB.config, "iv_delay_s", 0.1),
-                                 step=0.01, format="%.3f") \
-                .classes("w-32 num")
-            cm_meter = ui.select(
-                {"b2987": "B2987 (built-in ammeter)",
-                 "k6485": "K6485 picoammeter"},
-                value="b2987", label="current meter",
-            ).classes("w-56")
-            async def run_current_measure():
-                if HUB.elec is None: log_msg("electrometer not connected"); return
-                meter = str(cm_meter.value or "b2987")
-                if meter == "k6485" and HUB.k6485 is None:
-                    log_msg("K6485 not connected"); return
-                n = int(cm_n.value or 1)
-                d = float(cm_delay.value or 0.0)
-                log_msg(f"current_measure sipm={int(sipm_in.value)} "
-                        f"illum={illum.value} meter={meter} n={n}")
-                set_activity("L2 current measure",
-                             f"sipm {int(sipm_in.value)}, n={n}, meter={meter}, "
-                             f"{'illum' if illum.value else 'dark'}")
-                try:
-                    result = await _run_in_thread(
-                        lambda: M.current_measure(
-                            sipm_id     = int(sipm_in.value),
-                            instruments = HUB.instruments,
-                            config      = HUB.config,
-                            meter       = meter,
-                            illuminated = illum.value,
-                            n_samples   = n,
-                            delay_s     = d,
-                        )
-                    )
-                    mean_i = float(result.avg_current_a[0])
-                    err_i  = float(result.err_current_a[0])
-                    log_msg(f"  done: I = {mean_i:.3e} A  ± {err_i:.2e} A  "
-                            f"(n={result.n_per_voltage})")
-                    note_bias(v_set=0.0, i_meas=mean_i, output_on=False)
-                    try:
-                        p = MSTORE.save_l2_current_measure(
-                            result,
-                            sipm_id       = int(sipm_in.value),
-                            temperature_K = float(temp_in.value),
-                            illuminated   = bool(illum.value),
-                            meter         = meter,
-                        )
-                        log_msg(f"  saved: {p}")
-                    except Exception as e:
-                        log_msg(f"  SAVE FAIL: {type(e).__name__}: {e}")
-                except Exception as e:
-                    log_msg(f"  CURRENT_MEASURE FAIL: {type(e).__name__}: {e}")
-                finally:
-                    clear_activity()
-            ui.button("run current measure", on_click=run_current_measure) \
-                .props("color=primary")
+            ui.html("<h2>pulse counting</h2>")
+            pc_illum = ui.toggle({"dark": "dark", "bright": "bright"},
+                                  value="dark").props("dense")
+            with ui.row().classes("gap-2 items-end"):
+                pc_bias = ui.number(label="bias (V)",
+                                     value=HUB.config.pulse_bias_v,
+                                     step=0.1).classes("w-24 num")
+                pc_ch   = ui.number(label="capture ch",
+                                     value=0, step=1, min=0, max=63) \
+                    .classes("w-24 num")
+                pc_thr  = ui.number(label="self-trig thr (ADC)",
+                                     value=50, step=10).classes("w-32 num")
+            # Optional aux trigger: enable a SECOND channel + threshold so
+            # the digitizer can self-trigger on EITHER channel (any ITLA-OR
+            # channel above its per-channel threshold).  Capture channel
+            # always gets its own threshold.
+            with ui.row().classes("gap-2 items-end"):
+                pc_aux_use = ui.switch("trigger on another ch", value=False) \
+                    .props("dense")
+                pc_aux_ch  = ui.number(label="aux ch",
+                                        value=4, step=1, min=0, max=63) \
+                    .classes("w-24 num")
+                pc_aux_thr = ui.number(label="aux thr (ADC)",
+                                        value=50, step=10).classes("w-28 num")
+                pc_aux_ch.bind_enabled_from(pc_aux_use, "value")
+                pc_aux_thr.bind_enabled_from(pc_aux_use, "value")
+            with ui.row().classes("gap-2 items-end"):
+                pc_pre  = ui.number(label="pre (µs)",
+                                     value=HUB.config.pulse_pre_us,
+                                     step=0.5).classes("w-24 num")
+                pc_post = ui.number(label="post (µs)",
+                                     value=HUB.config.pulse_post_us,
+                                     step=0.5).classes("w-24 num")
+                pc_n    = ui.number(label="N waveforms",
+                                     value=HUB.config.pulse_n_waveforms,
+                                     step=100).classes("w-28 num")
+            pc_store = ui.switch("store raw waveforms", value=True)
 
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>pulse acquisition</h2>")
-            pulse_v = ui.number(label="bias (V)",  value=HUB.config.pulse_bias_v,      step=0.1).classes("w-32 num")
-            pulse_n = ui.number(label="waveforms", value=HUB.config.pulse_n_waveforms, step=100).classes("w-32 num")
             async def run_pulse():
                 if HUB.elec is None or HUB.dig is None:
-                    log_msg("electrometer or digitizer not connected"); return
-                log_msg(f"PULSE sipm={int(sipm_in.value)} illum={illum.value} "
-                        f"bias={pulse_v.value} V n={int(pulse_n.value)}")
-                set_activity("L2 pulse acquisition",
-                             f"sipm {int(sipm_in.value)}, {int(pulse_n.value)} wfs, "
-                             f"{float(pulse_v.value):.2f} V")
+                    log_msg("b2987 or digitizer not connected"); return
+                ctrl = getattr(HUB.dig, "_ctrl", None)
+                if ctrl is None:
+                    log_msg("digitizer backend has no controller"); return
+                bright = (pc_illum.value == "bright")
+                if bright and HUB.ks33500b is None:
+                    log_msg("Keysight 33500B not connected — bright needs AWG")
+                    return
+                if not await _prep_position(): return
+
+                ch  = max(0, min(63, int(pc_ch.value)))
+                thr = int(pc_thr.value)
+                n   = int(pc_n.value)
+                store = bool(pc_store.value)
+                bias = float(pc_bias.value)
+                # Resolve the trigger set.  The aux channel (if enabled)
+                # is added so the VX2740 fires on ANY of the listed
+                # channels crossing its per-channel threshold; both
+                # channels are read out so the analyst can correlate.
+                aux_ch  = int(pc_aux_ch.value)  if pc_aux_use.value else None
+                aux_thr = int(pc_aux_thr.value) if pc_aux_use.value else None
+                sipm_chs = [ch]
+                thresholds = {ch: thr}
+                if aux_ch is not None and aux_ch != ch:
+                    sipm_chs.append(aux_ch)
+                    thresholds[aux_ch] = aux_thr
+
+                sipm_label = (int(sipm_in.value) if sipm_use.value
+                              else "anon")
+                aux_desc = (f" + trig ch{aux_ch}@{aux_thr}"
+                            if aux_ch is not None else "")
+                log_msg(f"PULSE sipm={sipm_label} {pc_illum.value} "
+                        f"bias={bias:.2f} ch{ch} thr={thr}{aux_desc} "
+                        f"N={n} store={store}")
+                set_activity("L2 pulse",
+                             f"sipm {sipm_label} · {pc_illum.value} "
+                             f"· ch{ch}{aux_desc} · N={n}")
+
+                def _run_acq():
+                    if bright:
+                        _awg_pulse_on(1,
+                                       HUB.config.led_frequency_hz,
+                                       HUB.config.led_amplitude_v,
+                                       HUB.config.led_offset_v,
+                                       HUB.config.led_pulse_width)
+                    try:
+                        P.set_bias(HUB.elec, bias, settle_s=0.3)
+                        ctrl.configure_record_window(pre_us=float(pc_pre.value),
+                                                     post_us=float(pc_post.value))
+                        ctrl.configure_channels(
+                            sipm_channels=sipm_chs,
+                            thresholds=thresholds,
+                            threshold_mode="per_channel",
+                            include_pmt=False,
+                        )
+                        ctrl.configure_trigger(mode="self")
+                        return ctrl.run(n_waveforms=n, batch_size=min(1000, n),
+                                         store_waveforms=store, timeout_s=60.0)
+                    finally:
+                        if bright: _awg_off(1)
+                        try: P.bias_off(HUB.elec)
+                        except Exception: pass
                 try:
-                    note_bias(v_set=float(pulse_v.value), output_on=True)
-                    result = await _run_in_thread(
-                        M.pulse_run,
-                        int(sipm_in.value), HUB.instruments, HUB.config,
-                        illum.value, float(pulse_v.value), int(pulse_n.value),
-                    )
-                    log_msg(f"  done: n_waveforms={result.n_waveforms} channels={result.channel_ids}")
+                    note_bias(v_set=bias, output_on=True)
+                    result = await _run_in_thread(_run_acq)
+                    log_msg(f"  done: n_waveforms={result.n_waveforms} "
+                            f"channels={result.channel_ids}")
                     try:
                         p = MSTORE.save_l2_pulse_run(
                             result,
-                            sipm_id       = int(sipm_in.value),
-                            temperature_K = float(temp_in.value),
-                            illuminated   = bool(illum.value),
-                            bias_v        = float(pulse_v.value),
+                            temperature_K       = float(temp_in.value),
+                            illuminated         = bright,
+                            bias_v              = bias,
+                            capture_ch          = ch,
+                            capture_thr_adc     = thr,
+                            aux_trigger_ch      = aux_ch,
+                            aux_trigger_thr_adc = aux_thr,
+                            **_opt_kwargs(),
                         )
                         log_msg(f"  saved: {p}")
                     except Exception as e:
@@ -3363,8 +3573,227 @@ def _build_level2_tab():
                 except Exception as e:
                     log_msg(f"  PULSE FAIL: {type(e).__name__}: {e}")
                 finally:
+                    note_bias(v_set=0.0, output_on=False)
                     clear_activity()
             ui.button("run pulse", on_click=run_pulse).props("color=primary")
+
+        # ==============================================================
+        # CARD 4 — Scan (X or Y, with VUV / Laser illumination on ks33500b)
+        # ==============================================================
+        with ui.card().classes("daq-card"):
+            ui.html("<h2>scan</h2>")
+            ui.label(
+                "Hold SiPM at fixed bias and sweep one stage axis around "
+                "the center; at each point: move → de-energize → record "
+                "→ re-energize → next.  Bias source: B2987.  AWG (33500B): "
+                "ch1 for VUV beam, ch2 for Laser."
+            ).classes("text-xs text-gray-400")
+            with ui.row().classes("gap-2 items-end"):
+                scan_axis = ui.toggle({"x": "X", "y": "Y"},
+                                       value="x").props("dense")
+                scan_meter = ui.select(
+                    {"k6485": "K6485", "b2987": "B2987"},
+                    value="k6485", label="meter").classes("w-32")
+                scan_light = ui.toggle(
+                    {"vuv":   "VUV beam (ch1)",
+                     "laser": "Laser (ch2)"},
+                    value="vuv").props("dense")
+            with ui.row().classes("gap-2 items-end"):
+                scan_bias  = ui.number(label="bias (V)",
+                                        value=HUB.config.pulse_bias_v,
+                                        step=0.1).classes("w-24 num")
+                scan_start = ui.number(label="start (mm)", value=-7.5,
+                                        step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                scan_stop  = ui.number(label="stop (mm)", value=7.5,
+                                        step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                scan_step  = ui.number(label="step (mm)", value=0.5,
+                                        step=0.01, format="%.3f") \
+                    .classes("w-24 num")
+                scan_npt   = ui.number(label="N / pt", value=5,
+                                        step=1).classes("w-20 num")
+                scan_settle = ui.number(label="settle (s)", value=0.1,
+                                         step=0.01, format="%.2f") \
+                    .classes("w-24 num")
+            # If Location is enabled on the SiPM card, this button fills
+            # start/stop with center ± 7.5 mm (= ±0.75 cm) along the
+            # currently-selected axis.  Per the user's spec: "If I enter
+            # a location, then scan x and scan y should be centered on
+            # that location, running from -0.75 cm to 0.75."
+            def _fill_range_from_center():
+                if not loc_use.value:
+                    log_msg("scan range: Location switch is off — enable it "
+                            "(or just edit start/stop directly)")
+                    return
+                center = (float(cx_in.value)
+                          if str(scan_axis.value) == "x"
+                          else float(cy_in.value))
+                scan_start.value = center - 7.5
+                scan_stop.value  = center + 7.5
+                log_msg(f"scan range set to {scan_start.value:+.3f} "
+                        f"→ {scan_stop.value:+.3f} mm "
+                        f"({str(scan_axis.value).upper()}-axis)")
+            ui.button("use ±0.75 cm from center",
+                       on_click=_fill_range_from_center) \
+                .props("dense flat")
+            # AWG params for whichever light mode is active.  Defaults to
+            # the LED config; user can override per scan.
+            with ui.row().classes("gap-2 items-end"):
+                scan_freq  = ui.number(label="freq (Hz)",
+                                        value=HUB.config.led_frequency_hz,
+                                        step=10.0,
+                                        format="%.1f").classes("w-28 num")
+                scan_amp   = ui.number(label="amp (Vpp)",
+                                        value=HUB.config.led_amplitude_v,
+                                        step=0.1).classes("w-24 num")
+                scan_offs  = ui.number(label="offset (V)",
+                                        value=HUB.config.led_offset_v,
+                                        step=0.1).classes("w-24 num")
+                scan_width = ui.number(label="width (s)",
+                                        value=HUB.config.led_pulse_width,
+                                        step=1e-7,
+                                        format="%.9f").classes("w-32 num")
+            scan_status = ui.label("idle").classes("text-xs text-gray-400")
+
+            async def run_scan():
+                # Stage is mandatory (we move every point).  MUX is only
+                # required if the operator turned it on in the SiPM card.
+                if HUB.elec is None or HUB.stage is None:
+                    log_msg("b2987 or stage not connected"); return
+                if mux_use.value and HUB.mux is None:
+                    log_msg("MUX enabled but mux not connected"); return
+                meter = str(scan_meter.value or "k6485")
+                if meter == "k6485" and HUB.k6485 is None:
+                    log_msg("K6485 not connected"); return
+                if HUB.ks33500b is None:
+                    log_msg("Keysight 33500B not connected — scan needs AWG")
+                    return
+                # Light → AWG channel
+                ks_ch = 1 if str(scan_light.value) == "vuv" else 2
+
+                # MUX select only if enabled.  Scan does its own stage
+                # moves so we skip the stage move here even when Location
+                # is enabled — the per-point loop below will visit
+                # (center_other, position_along_axis) starting from the
+                # first scan point.
+                if mux_use.value:
+                    try:
+                        await _run_in_thread(P.select_channel, HUB.mux,
+                                              int(mux_in.value))
+                    except Exception as e:
+                        log_msg(f"  MUX FAIL: {type(e).__name__}: {e}"); return
+
+                import numpy as np
+                positions = np.arange(
+                    float(scan_start.value),
+                    float(scan_stop.value) + float(scan_step.value) * 0.5,
+                    float(scan_step.value),
+                ).astype(float)
+                axis = str(scan_axis.value)
+                # Resolve the "other axis" position.  If Location is on,
+                # use the operator's center.  If off, default to 0 mm —
+                # the scan still runs along the selected axis, just at
+                # (0, pos_y) or (pos_x, 0).
+                cx = float(cx_in.value) if loc_use.value else 0.0
+                cy = float(cy_in.value) if loc_use.value else 0.0
+                bias = float(scan_bias.value)
+                npt  = int(scan_npt.value or 1)
+                stl  = float(scan_settle.value or 0.0)
+                light_mode = "vuv_beam" if str(scan_light.value) == "vuv" else "laser"
+                sipm_label = (int(sipm_in.value) if sipm_use.value
+                              else "anon")
+                log_msg(f"SCAN {axis} sipm={sipm_label} "
+                        f"meter={meter} light={light_mode} "
+                        f"bias={bias:.2f} {len(positions)} pts × N={npt}")
+                set_activity("L2 scan",
+                             f"sipm {sipm_label} · {axis}-axis · "
+                             f"{len(positions)} pts · {light_mode}")
+
+                means: list[float] = []
+                stds:  list[float] = []
+                raws:  list[float] = []
+                try:
+                    await _run_in_thread(
+                        _awg_pulse_on, ks_ch,
+                        float(scan_freq.value),
+                        float(scan_amp.value),
+                        float(scan_offs.value),
+                        float(scan_width.value),
+                    )
+                    await _run_in_thread(P.set_bias, HUB.elec, bias,
+                                          0.3)
+                    note_bias(v_set=bias, output_on=True)
+
+                    for i, pos in enumerate(positions):
+                        if axis == "x":
+                            x_target, y_target = float(pos), cy
+                        else:
+                            x_target, y_target = cx, float(pos)
+                        scan_status.text = (f"pt {i+1}/{len(positions)}: "
+                                            f"({x_target:.3f}, "
+                                            f"{y_target:.3f}) mm")
+                        # move → de-energize after; re-energizes
+                        # automatically on the next move_to()
+                        await _run_in_thread(
+                            P.move_stage, HUB.stage,
+                            x_target, y_target,
+                            True,  # deenergize_after
+                        )
+                        if stl > 0:
+                            await asyncio.sleep(stl)
+                        # Sample N readings
+                        def _take(n_=npt, m_=meter):
+                            if m_ == "k6485":
+                                arr, _ts = HUB.k6485.read_n(n_, 0.0)
+                                return np.asarray(arr, dtype=np.float64)
+                            else:
+                                return np.array([HUB.elec.measure_current()
+                                                  for _ in range(n_)],
+                                                 dtype=np.float64)
+                        arr = await _run_in_thread(_take)
+                        means.append(float(np.mean(arr)))
+                        stds.append(float(np.std(arr, ddof=1))
+                                     if len(arr) > 1 else 0.0)
+                        raws.extend(arr.tolist())
+                        log_msg(f"    {axis}={pos:+.3f} mm  "
+                                f"I={means[-1]:+.3e} A ± {stds[-1]:.2e}")
+                    scan_status.text = (f"done — {len(positions)} pts; "
+                                        f"min |I|={min(abs(m) for m in means):.2e}, "
+                                        f"max |I|={max(abs(m) for m in means):.2e}")
+                    log_msg("  scan done")
+                    try:
+                        p = MSTORE.save_l2_scan(
+                            positions_mm  = positions,
+                            mean_current_a= np.array(means, dtype=np.float64),
+                            std_current_a = np.array(stds,  dtype=np.float64),
+                            raw_current_a = np.array(raws,  dtype=np.float64),
+                            temperature_K = float(temp_in.value),
+                            axis          = axis,
+                            bias_v        = bias,
+                            meter         = meter,
+                            light_mode    = light_mode,
+                            light_freq_hz = float(scan_freq.value),
+                            light_amp_v   = float(scan_amp.value),
+                            light_width_s = float(scan_width.value),
+                            n_per_point   = npt,
+                            settle_s      = stl,
+                            **_opt_kwargs(),
+                        )
+                        log_msg(f"  saved: {p}")
+                    except Exception as e:
+                        log_msg(f"  SAVE FAIL: {type(e).__name__}: {e}")
+                except Exception as e:
+                    log_msg(f"  SCAN FAIL: {type(e).__name__}: {e}")
+                    scan_status.text = f"FAIL: {type(e).__name__}: {e}"
+                finally:
+                    await _run_in_thread(_awg_off, ks_ch)
+                    try: await _run_in_thread(P.bias_off, HUB.elec)
+                    except Exception: pass
+                    note_bias(v_set=0.0, output_on=False)
+                    clear_activity()
+
+            ui.button("run scan", on_click=run_scan).props("color=primary")
 
 
 # ===========================================================================

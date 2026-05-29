@@ -132,6 +132,12 @@ class ExperimentConfig:
     # Rigol DG1022 waveform generator. On Linux, "/dev/usbtmc0" goes through
     # the kernel USBTMC driver; on Windows use the USB::INSTR VISA string.
     wfg_visa:           str = "/dev/usbtmc0"
+    # LED pulse defaults — used by L2 bright measurements and the bench
+    # harness.  Matches the lab default (~1 kHz, 3 Vpp, 400 ns pulse).
+    led_frequency_hz:  float = 1000.0
+    led_amplitude_v:   float = 3.0
+    led_offset_v:      float = 1.5
+    led_pulse_width:   float = 4e-7
     # Keysight 33510B at 172.16.0.46 on the lab subnet (Agilent 33510B,
     # S/N MY57200344, firmware 3.05-1.19-2.00-52-00).
     # Using raw-SOCKET (port 5025) instead of VXI-11 (::INSTR) — same
