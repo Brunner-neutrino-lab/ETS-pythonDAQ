@@ -12,6 +12,416 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-05-29 — L3 rebuilt as a per-SiPM measurement sequence
+
+### What changed
+
+Replaced the old "L3 — tile sweep" (one global setting across the channel
+map) with **L3 — sequence**: a list of per-SiPM specs run in order, scripting
+the L2 measurements across a whole tile. Adding the same SiPM twice repeats it.
+
+New module **`daq/sequence.py`**:
+- `MeasurementSpec` (one list entry = one SiPM) + `SequenceFile`; YAML
+  `save_sequence`/`load_sequence` (mirrors config.py style, filters unknown keys).
+- Three sample counts per the user's ask: `n_iv_samples_{dark,illum}`,
+  `n_waveforms_{dark,illum}`, single `n_scan_samples`. Pulse is a **bias sweep**
+  (`pulse_bias_v` list). Conditions: dark / bright / both.
+- Spec-driven executors `_exec_iv/_exec_pulse/_exec_scan` call the L1 primitives
+  + the digitizer `_ctrl` + the AWG directly (mirroring the L2 run handlers but
+  driven by the spec). **L2 / measurement.py untouched.**
+- `run_sequence(...)`: entries → leaves (iv / pulse-per-bias / scan), resume via
+  `manifest.is_done(step_id)`, two-level `on_progress`, cooperative `abort` dict.
+  `build_sequence_steps` gives the manifest/progress total.
+
+Storage (single run.h5, repeat-safe index):
+- `daq/storage.py`: `write_iv_seq/write_pulse_seq/write_scan_seq` under
+  **`/seq/{idx}/{sipm}/{T}K/{dark|illuminated}/...`** (pulse → `pulse/{bias_mV}/`,
+  scan → `scan/{axis}/`) + `/meta/sequence` JSON. Old write_iv/write_pulse/
+  write_flux unchanged → tile/temppoint/run still work.
+- `daq/h5io.py`: new `write_scan`. `daq/resume.py`: `Step` gained optional
+  `seq_index`/`bias_v`/`axis` (`.get` on load → backward compatible) + `set_steps()`.
+
+GUI: `daq/gui/hub.py` adds `ks33500b` to the `instruments` dict (runner needs the
+AWG for bright/scan). `daq/webgui/shell.py` `_build_level3_tab` fully rebuilt:
+checkbox-gated spec builder (fields from L2 defaults), editable list
+(add/duplicate/edit/up/down/delete), save/load YAML, run + ⛔ abort with
+entry+step progress. Tab relabeled "L3 — sequence".
+
+HV interplay: `run_sequence` trusts an already-armed confirmer (GUI dialog →
+interactive prompt for >60 V); headless + none + >threshold → fail fast before
+moving hardware; an explicit confirmer is cleared in `finally`. Added `hv_confirm`
+getter to the b2987 driver/controller.
+
+### Decisions (user)
+Replace old L3 · per-entry checkboxes {IV,pulse,scan} · GUI builder + YAML ·
+single run.h5, per-entry index groups · three sample counts.
+
+### Verified (simulation)
+Compile + import; YAML round-trip; `/seq/0`+`/seq/1` (repeat of SiPM 1); pulse
+bias subgroups `48000mV/49000mV`; resume skips all; scan datasets+attrs; HV
+(armed/explicit/headless) correct; L3 tab builds headless.
+
+### Open threads
+- Not yet run on a live webapp/browser or real hardware. Pulse leg needs the
+  digitizer `_ctrl` (sim has it; guard raises cleanly if absent).
+- Resume keys on list index — editing the YAML shifts indices; a spec-list hash
+  is in `/meta/sequence` but drift-warning isn't wired into the GUI yet.
+- NOTE: the working tree changed under this session (shell.py line offsets,
+  `measurement_store.py`/`h5browse.py` gained unrelated WIP, and an earlier
+  HV-interlock log entry I wrote was replaced) — looks like a concurrent edit or
+  checkout. My L3 + HV code is present and compiles, but reconcile before commit.
+
+---
+
+## 2026-05-29 — L2 measurements page: 420 px procedure + stretched plots (v3)
+
+### What changed
+
+Tuned the L2 layout per the v3 mockup:
+
+- **Layout columns** are now `420px minmax(0,1fr)` with
+  `align-items:stretch`. The procedure card is narrow + tall; the
+  plots column gets all remaining width. On a 1800 px monitor each
+  plot widens from ~400 to ~640 px.
+- **Procedure card stretches** to the plots' height. `.card-l2` is a
+  flex column (`min-height:0`); `.mpanel.is-active` is also
+  `display:flex; flex-direction:column; flex:1`; `.runrow` has
+  `margin-top:auto` — so the run button is pinned to the bottom of
+  whichever tab is active.
+- **Plot column matches.** `.l2-plots` got `grid-auto-rows:1fr;
+  height:100%` and `.l2-plots > .card-l2` flexes; `.plotbox-l2`
+  switched from `height:240px` to `flex:1 1 auto; min-height:260px`.
+- **Param grids trimmed for the narrow column.** IV switched from
+  `g4` to `g2`. Scan AWG subgroup went from `g4` to `g2`. Scan
+  source pills shortened (`VUV (ch1)` → `VUV`). Dropped the scan
+  intro paragraph.
+- **Run button** bumped to 42 px; standalone status pills hidden
+  (`set_visibility(False)`) so the inline holder next to the run
+  button is the only visible one.
+
+### Files touched
+
+- `daq/webgui/shell.py` — `.l2-panel` CSS scope: `.l2-layout`,
+  `.card-l2`, `.mpanel`, `.runrow`, `.l2-plots`, `.plotbox-l2`;
+  IV/Scan grid swaps; scan intro removed and source pills shortened;
+  three `*_status` HTMLs hidden.
+
+---
+
+## 2026-05-29 — L2 measurements page: horizontal context strip + 1:1 split
+
+### What changed
+
+Reorganized the L2 measurements tab around the *measurement procedure*
+card as the hero, per the second-pass mockup
+(`measurements_page_target.html` v2):
+
+- **SiPM context flattened into a horizontal strip** above the layout
+  (no more tall left card). One row: SiPM id, MUX ch, Bright (x, y),
+  Dark (x, y), T (+ read T button + manual/slowctrl source indicator),
+  and a live "Save folder · next file" preview on the right.
+- **Per-field include-toggles are now compact inline switches**
+  (`.inc-toggle` CSS class shrinks the Quasar QToggle to 13 px) inside
+  the field's eyebrow label. The corresponding cfld dims via
+  `is-off` (opacity 0.4) when unchecked.
+- **Save destination promoted into the strip.** Folder override is a
+  plain `ui.input` (placeholder "auto (data/...)"). The live preview
+  shows `data/<auto>/<colored sub>/<unix_ms>.h5` and refreshes on
+  every relevant change (sipm id, sipm toggle, T, folder text).
+- **Layout is now 1:1** (`grid-template-columns:1fr 1fr`) — procedure
+  card on the left, 2×2 plot grid on the right. Output card removed
+  (its inputs moved into the strip). `_out_kwargs()` now always passes
+  `basename=None` since the basename input is gone.
+- **Run button enlarged** to 40 px / 14 px / weight 500 via a scoped
+  override on `.l2-panel .runrow .q-btn` so the most-clicked control
+  is unmissable.
+
+### Decisions
+
+- **Save-folder semantics preserved.** The strip's input maps to the
+  existing `folder` kwarg of `MSTORE.save_l2_*`: empty → auto
+  `sipm{N}_T{K}/` subfolder; filled → custom subfolder under `data/`.
+  The strip's preview text is purely visual — it doesn't change save
+  routing.
+- **T is always included in the file.** The strip omits a toggle for
+  T (matching the v2 HTML — the user wants T as a load-bearing key
+  in every file). The path preview always includes a `T<K>` part.
+- The "go to SiPM" button stays in the strip next to the locations,
+  using `mux_in`/`cx_in`/`cy_in` closures from the same scope.
+
+### Files touched
+
+- `daq/webgui/shell.py` — added `.l2-ctx` CSS scope (~60 lines),
+  replaced the SiPM context card + Output card with the strip
+  (~200 lines), changed `.l2-layout` to `1fr 1fr`, dropped
+  `out_base`. The measurement procedure card and `_build_l2_plots`
+  callbacks (IV/Scan/Charge/Waveform browser) are unchanged.
+
+### Open threads
+
+- Strip currently dims fields via opacity only; inputs are still
+  interactive when their include-switch is off (their values just
+  won't reach the file). Acceptable for now; could disable inputs
+  via `bind_enabled_from` if it confuses users.
+- The "always" indicator for T was dropped from the strip lbl to
+  save space — the path preview makes its always-included status
+  obvious. Revisit if users ask.
+
+---
+
+## 2026-05-29 — L2 pulse sweep (vs bias) + sweep plot
+
+### What changed
+
+The L2 pulse-counting panel can now **sweep bias** instead of only
+acquiring at a single bias — the GUI form of the bench `ov_scan`.
+
+- **Mode toggle** (`single bias` / `bias sweep`) in the pulse panel.
+  `single` shows the existing Bias field; `sweep` swaps it for
+  start/stop/step (absolute V, same semantics as the IV sweep).
+  Capture ch + self-trig thr + aux trigger + pre/post/N/store are
+  shared by both modes (no field duplication).
+- **`run_pulse_sweep()`** ([daq/webgui/shell.py](../daq/webgui/shell.py)):
+  configures the digitizer once, then at each bias `set_bias` →
+  `ctrl.run(N)` → reduce `amplitudes[ch]` to mean/std/count and a
+  trigger rate (`n_pulses / elapsed`, wall-clock measured around the
+  acquire). Streams per-bias into the plots and logs a per-point line.
+- The single ▶ button dispatches on mode and relabels
+  (`run pulse` / `run pulse sweep`).
+
+**New 5th plot** in `_build_l2_plots` — full-width, dual y-axis:
+mean amplitude (left, ADC) and trigger rate (right, Hz) vs bias, with
+the same clickable legend-dot / clear affordances as the other cards.
+`psweep_begin()` / `psweep_point(bias, mean_amp, rate_hz)` registered
+in `PLOTS`. NaN means (zero-pulse bias) are dropped from the amp trace
+but the rate point is kept. Per-bias charge spectrum + (if `store`)
+waveforms also refresh live in their existing views.
+
+**New saver** `save_l2_pulse_sweep()`
+([daq/measurement_store.py](../daq/measurement_store.py)),
+`measurement_type="pulse_sweep"`: summary arrays (bias_v, mean_amp_adc,
+std_amp_adc, n_pulses, rate_hz, n_waveforms) as datasets on the sweep
+group, plus per-bias `point_NNN/chN/` amplitude+timestamp subgroups
+(via `h5io.write_pulse`) so the spectra stay recoverable. Honors the
+operator folder/basename + optional-identifier conventions.
+
+### Decisions
+
+- **Toggle in the pulse panel, not a 4th sub-tab** (user choice) —
+  reuses the channel/trigger/window config; the panel does double duty.
+- **Absolute bias V** (user choice), mirroring the IV sweep — no
+  dependency on a cached/valid V_BD. OV is derivable offline.
+- **Plot both mean amplitude and rate** (user choice) on one dual-axis
+  card rather than two cards — the gain curve and DCR/light-response
+  curve share the bias x-axis.
+- **Rate = n_pulses / wall-clock elapsed** around `ctrl.run`, not from
+  `result.timestamps` — robust even if a result lacks timestamps (they
+  are still saved per-bias when present, for offline rate refinement).
+
+### Verification
+
+Headless build of the whole L2 tab + the new callbacks (incl. the
+NaN-gap path) and a `save_l2_pulse_sweep` HDF5 round-trip all pass.
+Deployed: `systemctl --user restart daq-webapp`, serving clean (no
+tracebacks; a client loaded the page). **Not yet exercised on live
+instruments** — confirm a real bias sweep on the bench (watch for the
+HV interlock prompt if a sweep crosses the 60 V threshold).
+
+### Open threads
+
+- In sweep mode the charge/waveform views flip through each bias as it
+  runs and settle on the last one — intended as live feedback, but
+  there's no "pick a bias to inspect" control afterward (the data is in
+  the HDF5 `point_NNN/` groups; the Data tab can open it).
+- `store=on` during a long sweep keeps every bias's waveforms in the
+  result objects transiently; fine for typical N, heavy for large N ×
+  many biases. No cap enforced.
+
+---
+
+## 2026-05-29 — L2 output: operator-chosen folder + basename
+
+### What changed
+
+The L2 page can now direct where each measurement file goes instead of
+always `data/sipm{N}_T{K}K/<unix_ms>.h5`.
+
+- **`daq/measurement_store.py`**: the four L2 savers (`save_l2_iv_sweep`,
+  `save_l2_current_measure`, `save_l2_pulse_run`, `save_l2_scan`) gained
+  `folder=None, basename=None` kwargs, resolved by a new `_l2_path` helper:
+  - `folder` blank -> the existing per-(sipm, T) auto folder; otherwise an
+    operator subfolder under `data/` (created if missing).
+  - `basename` blank -> the unix-ms stamp; otherwise `<basename>.h5`, with
+    the ms stamp appended **only on collision** so a run never silently
+    overwrites another.
+  - Both inputs are sanitized: `_safe_subdir` rejects anything that escapes
+    the data root (`../..`), `_safe_stem` strips directory parts + a
+    trailing `.h5` from a typed basename.
+- **L2 tab** (`_build_level2_tab`): new **output (optional)** card (CARD 1b)
+  with a typeable folder combobox (`ui.select` `with_input` +
+  `new_value_mode="add-unique"`, options from `h5browse.list_folders()`), a
+  refresh button, a basename input, and a **create folder** button
+  (`h5browse.make_folder`, so it appears immediately in the data tab).
+  `_out_kwargs()` packs `{folder, basename}` (None when blank) and is
+  splatted into all three save calls next to `_opt_kwargs()`.
+
+### Decisions
+
+- **Blank == default, not data-root.** The folder combobox drops the ""
+  root entry — "no folder" means the auto per-(sipm, T) dir, which is a
+  distinct intent from "write into data/ directly".
+- **Collision -> append ms, don't refuse.** A chosen basename is a label,
+  not a uniqueness contract; appending the stamp keeps both files. The
+  HDF5-internal path still carries the measurement type, so same-basename
+  files of different types still h5repack-merge cleanly.
+- **Typed-but-not-created folder is fine** — the saver mkdirs it at write
+  time; "create folder" is just for making it show up in the data tab
+  ahead of the run.
+
+### Verification
+
+- `_l2_path` unit cases: default, anon (no sipm), custom nested folder +
+  basename, collision suffix, `.h5`/path-part stripping, and the escape
+  guard (`../../etc` rejected).
+- Full `save_l2_iv_sweep` against a minimal SweepResult: default path,
+  custom `campaignX/wafer3/iv_dark.h5`, and the collision ->
+  `iv_dark_<ms>.h5` all land correctly.
+- Isolated L2 page build: 200, output card + folder/basename/create-folder
+  controls present, no server errors.
+- `daq-webapp` restarted, `active`.
+
+### Open threads
+
+- Folder/basename apply per save independently of the sipm/T identifier
+  switches — an operator could set a custom folder *and* sipm_id; the
+  custom folder wins for location, sipm_id still tags the file attrs.
+  Intentional, but worth a sentence in any user-facing doc.
+- No live preview of the resolved path before clicking run. Could echo
+  "will write: <path>" under the card. Minor.
+- Live websocket click-through (type a new folder, run an IV, confirm the
+  file lands) still wants a human pass on the running app.
+
+---
+
+## 2026-05-29 — Data tab: file management + click-to-plot
+
+### What changed
+
+Extended the `data` explorer (added earlier today) with the two things the
+user asked for:
+
+1. **File management in the browser** — `daq/h5browse.py` gained
+   `list_folders` / `make_folder` / `move_file` / `delete_file`, all routed
+   through `_safe_under_root` (resolve + reject anything that escapes the
+   data root — the rel paths come from the browser). The left file card now
+   has a **new-folder** button (header) and per-row **move** / **delete**
+   icon buttons; move opens a destination-folder dropdown, delete a confirm
+   dialog. Dialogs are built once and reused. If the file being viewed is
+   moved/deleted, `_reset_active_if` clears the structure + detail panes so
+   we don't dangle on a stale path.
+2. **Click a node -> analysis plot** — clicking e.g. `/iv` now renders the
+   real IV curve, not just attributes. New `GROUP_PLOTS` map in `h5browse`
+   ties each top-level HDF5 group to the applicable `daq.plotting` PLOTS
+   keys (iv->iv/iv_leakage, vx2740->mean_waveform/spectrum/waveform,
+   vx2740_ov_scan->ov_scan/ov_spectra, etc.). `_domain_plot` shows a
+   plot-type select + only the knobs that plot's fn actually accepts
+   (introspected via `inspect.signature`), and `context_hints` seeds
+   channel / bias_group / dark-light from *where* the user clicked
+   (e.g. clicking under `/vx2740/ch3/...` -> channel 3,
+   `/k6485/below_vbd/...` -> below_vbd, `vx2740_thresh_scan_dark` -> dark).
+   The raw per-dataset value plot is kept below, for datasets.
+
+### Decisions
+
+- **Reuse `daq.plotting`** for the analysis plots rather than re-deriving:
+  those fns already accept a file path and locate their own group, so
+  dispatch is just "group name -> PLOTS key(s) -> fn(path, ax, **opts)".
+  Extra opts are harmless (every fn takes `**opts`).
+- **Knob visibility by signature introspection** instead of a hand-kept
+  per-plot knob table — self-maintaining as plots are added/changed.
+- **Delete is confirm-gated, move is not** — a move is reversible (move it
+  back); a delete isn't.
+
+### Verification
+
+- `h5browse`: domain/hints mapping, folder/move/delete round-trip on a
+  throwaway `_zztest.h5`, and the path-escape guard (`../../etc/passwd`
+  rejected) all pass.
+- Every mapped group's plot fn called the way the tab calls it, against a
+  real bench file — all 15 (iv, iv_leakage, k6485_bars/ts, mean_waveform,
+  spectrum, waveform, ov_scan, ov_spectra, dcr_vs_ov, led_amp_sweep,
+  crosstalk_ap, threshold_scan) render with data artists, none raise.
+- Isolated page-build render: 200, 14 file rows each with a move button,
+  new-folder button present, no server errors.
+- `daq-webapp` restarted, came back `active`.
+
+### Open threads
+
+- Still no end-to-end click-through on the live websocket app — backend +
+  page-build verified, but a human should click iv/spectrum/move/delete
+  once on the running app.
+- No multi-select / bulk move. One file at a time; fine for now.
+- `_domain_plot` rebuilds a matplotlib figure per node click (same as the
+  raw plot). Fine on local disk; revisit if it feels heavy.
+
+---
+
+## 2026-05-29 — Electrometer high-voltage interlock
+
+### What changed
+
+A safety interlock on the B2987B voltage source: any commanded `|V|`
+above a threshold (default **60 V**) is denied unless an operator
+confirms.
+
+Enforced at the **driver** (`keysight2987b-python/b2987b/driver.py`),
+which is the single sink every voltage command funnels through:
+- `set_voltage()` and `configure_list_sweep()` both call a new
+  `_guard_hv()`. Point-sets *and* hardware list-sweeps are covered.
+- `_hv_confirm` callback (`set_hv_confirm()`), `hv_threshold` property,
+  `HighVoltageInterlock` exception, `HV_DEFAULT_THRESHOLD = 60.0`.
+- **Deny-by-default**: no confirmer → raise. So no unattended path
+  (scripts, Claude, forgotten code) can push HV silently.
+- **Simulation mode is exempt** (`mode != "hardware"` short-circuits),
+  so sim/CI/Claude test runs never trip the prompt.
+
+Controller (`controller.py`) exposes `hv_threshold` + `set_hv_confirm()`
+passthroughs so callers never reach into `_driver`.
+
+GUI (`daq/webgui/shell.py`): registered one confirmer at elec-connect
+(`_arm_hv_guard`, also armed defensively in the bias handlers /
+apply_source). The confirmer bridges the driver's *synchronous* guard —
+which runs inside the worker thread of `await asyncio.to_thread(...)` —
+back onto the event loop via `run_coroutine_threadsafe` to raise a modal
+(`_hv_dialog`), broadcast to connected clients, first answer wins.
+Closing the dialog / timeout (120 s) / no client all deny. Added an
+"HV interlock threshold" number field (default 60) to the Source block;
+edits apply live.
+
+CLI (`scripts/bench_test.py`): `--allow-high-voltage` auto-approves
+(logged loud); else prompt on a TTY; non-interactive denies. Note the
+default bench IV sweep stops at **55 V**, under the threshold — routine
+runs never see the prompt.
+
+### Decisions
+
+- **Driver-level, not GUI-level.** GUI-level couldn't be "written once":
+  bench scripts, primitives, measurement/raster, and the bypassing
+  Electrometer panel all skip GUI code. The driver is the only universal
+  chokepoint. (User explicitly weighed both; chose driver + deny default
+  + confirm-every-time.)
+- **Threshold lives in the driver (default 60), selectable from the GUI.**
+
+### Open threads
+
+- End-to-end GUI dialog needs a human click to fully verify (logic +
+  fail-safe paths unit-tested; webapp imports clean). Not yet restarted
+  the live service — do it when the bench is free.
+- Multi-client broadcast cancels the *other* clients' pending dialogs but
+  leaves them visually open until reload; fine for 1-2 operators.
+
+---
+
 ## 2026-05-29 — L2 live-plot column (iv / scan / charge / waveform)
 
 ### What changed

@@ -21,7 +21,7 @@ import sys
 import time
 from typing import Callable
 
-from nicegui import app, ui
+from nicegui import app, ui, Client
 
 # Make instrument submodules importable when running from the repo root
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,6 +64,81 @@ def set_activity(name: str, detail: str = "") -> None:
     ACTIVITY["name"] = name
     ACTIVITY["started"] = time.time()
     ACTIVITY["detail"] = detail
+
+
+# ---------------------------------------------------------------------------
+# Electrometer high-voltage interlock
+#
+# The driver denies any |V| above its threshold (default 60 V) unless a
+# confirmer approves. Here we register a confirmer that bridges the driver's
+# synchronous guard — which runs inside the worker thread of an
+# `await asyncio.to_thread(...)` call — back onto the GUI event loop to raise a
+# modal dialog, then blocks the worker thread for the operator's answer.
+# Closing the dialog, a timeout, or no connected client all deny (fail-safe).
+# ---------------------------------------------------------------------------
+
+from b2987b.driver import HV_DEFAULT_THRESHOLD
+
+_HV_LOOP = None                 # GUI event loop, captured on first arm
+_HV_CONFIRM_TIMEOUT_S = 120.0
+
+
+async def _hv_dialog(vmax: float, threshold: float) -> bool:
+    clients = [c for c in list(Client.instances.values())
+               if getattr(c, "has_socket_connection", False)]
+    if not clients:
+        return False
+
+    async def _ask(client) -> bool:
+        with client:
+            with ui.dialog() as dlg, ui.card():
+                ui.label("High-voltage interlock").classes("text-h6")
+                ui.label(f"A command is requesting {vmax:.1f} V, above the "
+                         f"{threshold:.0f} V limit.")
+                ui.label("Confirm only if this is intended.").classes("text-warning")
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("flat")
+                    ui.button("Confirm high voltage", color="negative",
+                              on_click=lambda: dlg.submit(True))
+            return bool(await dlg)
+
+    tasks = [asyncio.create_task(_ask(c)) for c in clients]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    for t in done:
+        try:
+            return bool(t.result())
+        except Exception:
+            return False
+    return False
+
+
+def _hv_confirm_sync(vmax: float) -> bool:
+    """Driver confirmer (called from a worker thread). Bridges to the dialog."""
+    loop = _HV_LOOP
+    if loop is None:
+        log.error("HV interlock: no GUI loop captured; denying %.1f V", vmax)
+        return False
+    threshold = HUB.elec.hv_threshold if HUB.elec is not None else HV_DEFAULT_THRESHOLD
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_hv_dialog(vmax, threshold), loop)
+        return bool(fut.result(timeout=_HV_CONFIRM_TIMEOUT_S))
+    except Exception as e:
+        log.error("HV interlock: confirm bridge failed (%s); denying %.1f V", e, vmax)
+        return False
+
+
+def _arm_hv_guard() -> None:
+    """Idempotent: capture the loop and register the confirmer on the elec."""
+    global _HV_LOOP
+    if _HV_LOOP is None:
+        try:
+            _HV_LOOP = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+    if HUB.elec is not None:
+        HUB.elec.set_hv_confirm(_hv_confirm_sync)
 
 
 def clear_activity() -> None:
@@ -1441,6 +1516,266 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
 }
 @keyframes stage-pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 
+/* ============================================================
+   L2 measurements panel.
+   ============================================================ */
+.l2-panel { display:flex; flex-direction:column; gap:14px; }
+.l2-panel .l2-intro {
+  display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+}
+.l2-panel .l2-intro .t { font-size:13px; color:var(--mut); }
+.l2-panel .l2-intro .path {
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+  color:var(--mut); background:var(--panel2); padding:3px 8px;
+  border-radius:5px; border:1px solid var(--line);
+}
+.l2-panel .l2-layout {
+  display:grid; grid-template-columns:420px minmax(0,1fr);
+  gap:14px; align-items:stretch;
+}
+@media (max-width:1100px) {
+  .l2-panel .l2-layout { grid-template-columns:1fr; align-items:start; }
+}
+.l2-panel .l2-stack { display:flex; flex-direction:column; gap:14px; height:100%; }
+
+/* Horizontal SiPM-context + save-path strip (replaces the tall context card) */
+.l2-panel .l2-ctx {
+  display:flex; align-items:flex-end; gap:18px;
+  padding:10px 14px; background:var(--panel);
+  border:1px solid var(--line); border-radius:12px;
+  flex-wrap:wrap;
+}
+.l2-panel .l2-ctx .cg     { display:flex; align-items:flex-end; gap:12px; }
+.l2-panel .l2-ctx .cdiv   { width:1px; align-self:stretch;
+                            background:var(--line); margin:2px 0; }
+.l2-panel .l2-ctx .cfld   { display:flex; flex-direction:column; gap:3px; }
+.l2-panel .l2-ctx .cfld > .lbl {
+  font-size:10px; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--mut); display:flex; align-items:center; gap:6px; height:14px;
+}
+.l2-panel .l2-ctx .row2  { display:flex; gap:5px; }
+.l2-panel .l2-ctx .cfld.is-off > .lbl,
+.l2-panel .l2-ctx .cfld.is-off .nicegui-input,
+.l2-panel .l2-ctx .cfld.is-off .nicegui-number { opacity:.4; }
+
+/* Inline include-toggle (smaller than the body switches) */
+.l2-panel .l2-ctx .inc-toggle .q-toggle__inner {
+  width:24px !important; min-height:14px !important;
+}
+.l2-panel .l2-ctx .inc-toggle .q-toggle__track {
+  height:13px !important; opacity:1 !important;
+  background:var(--panel2) !important;
+  border:1px solid var(--line) !important;
+}
+.l2-panel .l2-ctx .inc-toggle .q-toggle__thumb {
+  width:11px !important; height:11px !important; top:1px !important;
+}
+.l2-panel .l2-ctx .inc-toggle .q-toggle__label { display:none !important; }
+
+/* Compact strip fields override the body-field heights */
+.l2-panel .l2-ctx .cfld .q-field--filled .q-field__control {
+  height:30px !important; min-height:30px !important; padding:0 10px !important;
+}
+.l2-panel .l2-ctx .cfld .q-field__native,
+.l2-panel .l2-ctx .cfld .q-field__input { font-size:12px !important; }
+
+.l2-panel .l2-ctx .save-preview {
+  display:flex; flex-direction:column; gap:3px;
+  min-width:280px; flex:1;
+}
+.l2-panel .l2-ctx .save-preview .next {
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+  color:var(--mut); background:var(--panel2);
+  border:1px solid var(--line); border-radius:6px;
+  padding:6px 10px; height:30px; display:flex; align-items:center;
+  overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
+}
+.l2-panel .l2-ctx .save-preview .next .em { color:var(--acc); }
+.l2-panel .l2-ctx .save-preview .next .ph { color:#ef4444; opacity:.85; }
+.l2-panel .card-l2 {
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:12px; padding:14px 16px;
+  display:flex; flex-direction:column;
+  min-height:0;
+}
+/* Procedure card stretches to fill the layout column. */
+.l2-panel .l2-stack > .card-l2 { flex:1; }
+.l2-panel .eyebrow {
+  font-size:11px; letter-spacing:.07em; text-transform:uppercase;
+  color:var(--mut); margin:0 0 12px; font-weight:500;
+}
+
+/* Generic field (label-above + unit suffix inside) */
+.l2-panel .fld { display:flex; flex-direction:column; gap:4px; }
+.l2-panel .fld > label.fld-lbl { font-size:11px; color:var(--mut); }
+.l2-panel .fld .nicegui-input,
+.l2-panel .fld .nicegui-number,
+.l2-panel .fld .nicegui-select { width:100%; }
+.l2-panel .fld .q-field--filled .q-field__control {
+  height:32px !important; min-height:32px !important;
+  background:var(--panel2) !important; border:1px solid var(--line) !important;
+  border-radius:8px !important; padding:0 12px !important;
+}
+.l2-panel .fld .q-field--filled .q-field__control::before,
+.l2-panel .fld .q-field--filled .q-field__control::after { display:none !important; }
+.l2-panel .fld .q-field__native, .l2-panel .fld .q-field__input {
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px;
+  padding:0 !important; color:var(--fg) !important;
+  font-variant-numeric:tabular-nums;
+}
+.l2-panel .fld .q-field__suffix {
+  color:var(--mut); opacity:.75;
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px;
+}
+.l2-panel .hint { font-size:11px; color:var(--mut); opacity:.7; margin:0; }
+
+/* SiPM context rows */
+.l2-panel .ctxrow {
+  display:grid; grid-template-columns:104px 1fr auto; gap:10px;
+  align-items:end; padding:6px 0;
+}
+.l2-panel .ctxrow + .ctxrow { border-top:1px solid var(--line); }
+.l2-panel .ctxrow .lab {
+  font-size:12px; color:var(--mut); padding-bottom:9px;
+}
+.l2-panel .ctxrow .vals { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.l2-panel .ctxrow .vals.one { grid-template-columns:1fr; }
+.l2-panel .ctxrow .inc { display:flex; align-items:center;
+                         padding-bottom:6px; gap:6px; }
+.l2-panel .ctxrow.dim .lab,
+.l2-panel .ctxrow.dim .vals { opacity:.45; }
+
+/* Measurement sub-tabs strip */
+.l2-panel .mtabs {
+  display:flex; gap:2px; border-bottom:1px solid var(--line);
+  margin:-2px 0 14px;
+}
+.l2-panel .mtab {
+  background:none !important; border:none !important;
+  color:var(--mut) !important; font-size:.74rem !important;
+  font-weight:500 !important; letter-spacing:.05em;
+  text-transform:uppercase; padding:.45rem .9rem !important;
+  min-height:0 !important; border-radius:0 !important;
+  border-bottom:2px solid transparent !important; margin-bottom:-1px;
+}
+.l2-panel .mtab:hover { color:var(--fg) !important; }
+.l2-panel .mtab.is-active {
+  color:var(--fg) !important; border-bottom-color:var(--acc) !important;
+}
+.l2-panel .mpanel { display:none; flex:1; flex-direction:column; min-height:0; }
+.l2-panel .mpanel.is-active { display:flex; }
+
+/* Pill toggles (radio choices) — re-skin Quasar QBtnToggle */
+.l2-panel .pillrow {
+  display:flex; gap:10px; align-items:center;
+  margin-bottom:12px; flex-wrap:wrap;
+}
+.l2-panel .pillrow .pl {
+  font-size:11px; color:var(--mut); letter-spacing:.04em;
+  text-transform:uppercase;
+}
+.l2-panel .pills .q-btn-toggle {
+  background:var(--panel2) !important;
+  border:1px solid var(--line) !important;
+  border-radius:8px !important; padding:2px !important; gap:2px !important;
+}
+.l2-panel .pills .q-btn-toggle .q-btn {
+  background:transparent !important; border:none !important; box-shadow:none !important;
+  color:var(--mut) !important;
+  padding:5px 12px !important; min-height:0 !important;
+  font-size:12px !important; font-weight:400 !important;
+  letter-spacing:.02em !important;
+}
+.l2-panel .pills .q-btn-toggle .q-btn:hover { color:var(--fg) !important; }
+.l2-panel .pills .q-btn-toggle .q-btn--active,
+.l2-panel .pills .q-btn-toggle .q-btn[aria-pressed="true"] {
+  background:var(--acc) !important; color:#fff !important;
+}
+
+/* Aux trigger block, dimmed when its toggle is off */
+.l2-panel .aux {
+  display:grid; grid-template-columns:1fr 1fr; gap:8px;
+  padding:8px 10px; background:var(--panel2);
+  border:1px dashed var(--line); border-radius:8px;
+  margin-bottom:10px; transition:opacity .12s;
+}
+.l2-panel .aux.is-off { opacity:.35; pointer-events:none; }
+
+/* Subgroup (AWG params inside Scan) */
+.l2-panel .subgroup {
+  padding:10px 12px; background:var(--panel2);
+  border:1px solid var(--line); border-radius:8px; margin-bottom:10px;
+}
+.l2-panel .subgroup .gt {
+  font-size:11px; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--mut); margin:0 0 8px;
+}
+
+/* Input grids */
+.l2-panel .g2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
+.l2-panel .g3 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:10px; }
+.l2-panel .g4 { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:10px; }
+
+/* Toggle row */
+.l2-panel .tgl-row { display:flex; align-items:center; gap:9px; font-size:13px; }
+
+/* Run row — pinned to the bottom of the active mpanel via margin-top:auto. */
+.l2-panel .runrow {
+  display:flex; align-items:center; gap:12px;
+  margin-top:auto; padding-top:14px; flex-wrap:wrap;
+}
+.l2-panel .runrow .q-btn { height:42px !important; min-height:42px !important;
+                           padding:0 22px !important; font-size:14px !important;
+                           font-weight:500 !important; }
+.l2-panel .statuspill { font-size:12px; color:var(--mut); font-family:ui-monospace,Menlo,Consolas,monospace; }
+
+/* Plot column 2×2 grid — stretches to match the procedure card height. */
+.l2-panel .l2-plots {
+  display:grid; grid-template-columns:1fr 1fr;
+  grid-auto-rows:1fr; gap:14px;
+  height:100%; align-items:stretch;
+}
+.l2-panel .l2-plots > .card-l2 {
+  flex:1; display:flex; flex-direction:column; min-height:260px;
+}
+@media (max-width:760px) { .l2-panel .l2-plots { grid-template-columns:1fr; } }
+
+/* Plot card header */
+.l2-panel .plot-head {
+  display:flex; align-items:center; gap:10px;
+  margin-bottom:10px; flex-wrap:wrap;
+}
+.l2-panel .plot-head .t {
+  font-size:12px; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--mut); font-weight:500;
+}
+.l2-panel .plot-head .legend { display:flex; gap:8px; }
+.l2-panel .lgd {
+  display:inline-flex; align-items:center; gap:5px;
+  cursor:pointer; font-size:11px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;
+  user-select:none;
+}
+.l2-panel .lgd .sw {
+  width:10px; height:10px; border-radius:50%; background:currentColor;
+}
+.l2-panel .lgd[data-c="blue"]   { color:#3b82f6; }
+.l2-panel .lgd[data-c="orange"] { color:#f59e0b; }
+.l2-panel .lgd[data-c="green"]  { color:#22c55e; }
+.l2-panel .lgd.is-off { color:var(--mut) !important; opacity:.5; }
+
+.l2-panel .plotbox-l2 {
+  position:relative; width:100%;
+  flex:1 1 auto; min-height:260px;
+  border:1px solid var(--line); border-radius:8px;
+  background:var(--panel2);
+}
+.l2-panel .plot-empty-l2 {
+  position:absolute; inset:0; display:flex;
+  align-items:center; justify-content:center;
+  color:var(--mut); font-size:12px; pointer-events:none;
+}
+
 /* Mode toggle for the acquisition card (single | sweep). */
 .acq-mode { margin-bottom:.4rem; }
 .acq-mode .q-btn-toggle { background:var(--panel2) !important;
@@ -1676,6 +2011,8 @@ async def _quick_connect(instrument_key: str) -> bool:
         connection_state.record_connect(
             instrument_key, str(addr) if addr else None
         )
+        if instrument_key == "elec":
+            _arm_hv_guard()
         return True
 
     HUB.status[instrument_key] = f"FAIL: {type(err).__name__}: {err}"
@@ -1981,6 +2318,8 @@ def _build_connections_tab(header_pills: dict[str, ui.html]):
 
         if err is None:
             connection_state.record_connect(k, str(addr) if addr else None)
+            if k == "elec":
+                _arm_hv_guard()
             refresh(k)
             return True
 
@@ -2848,6 +3187,7 @@ def _build_level1_tab():
                 async def set_bias():
                     if HUB.elec is None:
                         log_msg("electrometer not connected"); return
+                    _arm_hv_guard()
                     v = float(bias_v_in.value or 0)
                     log_msg(f"set_bias {v:.3f} V")
                     try:
@@ -2866,6 +3206,7 @@ def _build_level1_tab():
                         log_msg("electrometer not connected")
                         bias_sw.value = False
                         return
+                    _arm_hv_guard()
                     on = bool(_e.value)
                     try:
                         if on:
@@ -3169,30 +3510,27 @@ def _build_level1_tab():
 # ===========================================================================
 
 def _build_l2_plots(PLOTS: dict, dirty: dict) -> None:
-    """Build the L2 right-hand live-plot column and register streaming
-    callbacks in PLOTS.
+    """Build the L2 2×2 plot grid and register streaming callbacks.
 
-    Four stacked echart views:
-      iv      — current vs bias, dark + bright overlaid (live, per-point)
-      scan    — current vs stage position, X + Y overlaid (live, per-point)
-      charge  — amplitude histogram (baseline-subtracted, from the
-                digitizer), dark + bright overlaid (per pulse run)
-      wave    — a single stored waveform with prev/next scroll
+    Layout:
+        [IV · current vs bias       ] [Scan · current vs position]
+        [Charge spectrum            ] [Waveform browser           ]
+        [Pulse sweep · vs bias (full width, dual y-axis)          ]
+
+    Each card header has a colored, clickable LEGEND DOT per overlay
+    trace (dark/bright on IV+Spectrum, X/Y on Scan) that toggles
+    visibility, plus a CLEAR button that wipes both slots.
 
     Overlay rule is "replace same slot, keep the other": a new dark IV
-    run overwrites the dark trace but leaves bright untouched (and
-    symmetrically for scan X/Y and charge dark/bright).  Each view has a
-    clear button that wipes both slots.
+    run overwrites the dark trace but leaves bright untouched.
 
-    Registered callbacks (all best-effort, called via the run handlers'
+    Streaming callbacks (best-effort, called via the run handlers'
     `_plot(...)` wrapper):
-      iv_begin(label)            reset the dark|bright IV slot
-      iv_point(label, v, i)      append a point (worker-thread safe)
-      iv_redraw()                force redraw (b2987 batch path)
-      scan_begin(axis)           reset the x|y scan slot
-      scan_point(axis, pos, i)   append a point (main thread)
-      charge_set(label, result, ch)   set the dark|bright histogram
-      wave_set(result, ch, label, pre_us)   load waveforms for scrolling
+      iv_begin(label) / iv_point(label, v, i) / iv_redraw()
+      scan_begin(axis) / scan_point(axis, pos, i)
+      charge_set(label, result, ch)
+      wave_set(result, ch, label, pre_us)
+      psweep_begin() / psweep_point(bias, mean_amp, rate_hz)
     """
     import numpy as _np
 
@@ -3214,195 +3552,377 @@ def _build_l2_plots(PLOTS: dict, dirty: dict) -> None:
     def _base(xname, yname, ygap=56):
         return {
             "tooltip": {"trigger": "axis"},
-            "legend": {"textStyle": {"color": "#dde3ee"}, "top": 2,
-                       "right": 8, "data": []},
-            "grid": {"left": 66, "right": 16, "top": 30, "bottom": 36},
+            "grid": {"left": 64, "right": 14, "top": 14, "bottom": 32},
             "backgroundColor": "transparent",
             "textStyle": {"color": "#dde3ee"},
-            "xAxis": _axis(xname, 22),
+            "xAxis": _axis(xname, 20),
             "yAxis": _axis(yname, ygap),
             "series": [],
         }
 
-    def _plotbox(opts):
-        with ui.element("div").style(
-                "position:relative;width:100%;height:200px;"
-                "border:1px solid var(--line);border-radius:8px;"
-                "background:var(--panel2)"):
-            return ui.echart(opts).classes("w-full").style("height:100%")
+    def _series(name, color, *, kind="line", step=None):
+        s = {"name": name, "type": kind, "showSymbol": False, "data": [],
+             "lineStyle": {"width": 1.6, "color": color},
+             "itemStyle": {"color": color}}
+        if step:
+            s["step"] = step
+        return s
 
-    def _two_trace(opts, names, colors, kind="line"):
-        opts["legend"]["data"] = list(names)
-        for nm, col in zip(names, colors):
-            s = {"name": nm, "type": kind, "showSymbol": False, "data": [],
-                 "lineStyle": {"width": 1.6, "color": col},
-                 "itemStyle": {"color": col}}
-            opts["series"].append(s)
+    def _legend_dot(label: str, color_name: str, on_click) -> ui.html:
+        """A clickable legend dot. Click toggles visibility; the visible
+        state is reflected by toggling the .is-off class on the element."""
+        el = ui.html(
+            f'<span class="lgd" data-c="{color_name}">'
+            f'<span class="sw"></span>{label}</span>'
+        )
+        el.on("click", on_click)
+        return el
 
-    # ----------------------------- IV --------------------------------
-    with ui.card().classes("daq-card w-full"):
-        with ui.row().classes("w-full items-center"):
-            ui.html("<h2>iv — current vs bias</h2>")
-            ui.element("div").style("flex:1")
-            ui.button("clear", on_click=lambda: iv_clear()).props("flat dense")
-        iv_opts = _base("bias (V)", "current (A)")
-        _two_trace(iv_opts, ["dark", "bright"], [_DARK_COLOR, _BRIGHT_COLOR])
-        iv_chart = _plotbox(iv_opts)
-        iv_store = {"dark": [], "bright": []}
+    with ui.element("div").classes("l2-plots w-full"):
 
-        def _iv_redraw():
-            iv_chart.options["series"][0]["data"] = list(iv_store["dark"])
-            iv_chart.options["series"][1]["data"] = list(iv_store["bright"])
-            iv_chart.update()
+        # ============== IV plot ==============
+        with ui.card().classes("card-l2"):
+            iv_visible = {"dark": True, "bright": True}
+            with ui.element("div").classes("plot-head"):
+                ui.html('<span class="t">IV · current vs bias</span>')
+                with ui.element("div").classes("legend").style("margin-left:auto"):
+                    iv_dot_dark   = _legend_dot(
+                        "dark", "blue",
+                        lambda _e=None: _iv_toggle("dark"))
+                    iv_dot_bright = _legend_dot(
+                        "bright", "orange",
+                        lambda _e=None: _iv_toggle("bright"))
+                ui.button("clear", on_click=lambda: iv_clear()) \
+                    .props("flat dense")
 
-        def iv_begin(label):
-            iv_store[label] = []
-            dirty["iv"] = True
+            iv_opts = _base("bias (V)", "current (A)")
+            iv_opts["series"].append(_series("dark",   _DARK_COLOR))
+            iv_opts["series"].append(_series("bright", _BRIGHT_COLOR))
+            with ui.element("div").classes("plotbox-l2"):
+                iv_chart = ui.echart(iv_opts).classes("w-full") \
+                    .style("height:100%")
+                iv_empty = ui.html(
+                    '<div class="plot-empty-l2">no data — run iv</div>'
+                )
 
-        def iv_point(label, v, i):
-            iv_store[label].append([float(v), float(i)])
-            dirty["iv"] = True       # pumped onto the UI by the timer below
+            iv_store = {"dark": [], "bright": []}
 
-        def iv_clear():
-            iv_store["dark"] = []; iv_store["bright"] = []
-            _iv_redraw()
+            def _iv_redraw():
+                d = list(iv_store["dark"])   if iv_visible["dark"]   else []
+                b = list(iv_store["bright"]) if iv_visible["bright"] else []
+                iv_chart.options["series"][0]["data"] = d
+                iv_chart.options["series"][1]["data"] = b
+                iv_chart.update()
+                iv_empty.set_visibility(
+                    not (d or b)
+                )
 
-        PLOTS.update(iv_begin=iv_begin, iv_point=iv_point,
-                     iv_redraw=_iv_redraw)
+            def iv_begin(label):
+                iv_store[label] = []
+                dirty["iv"] = True
 
-    # ---------------------------- scan -------------------------------
-    with ui.card().classes("daq-card w-full"):
-        with ui.row().classes("w-full items-center"):
-            ui.html("<h2>scan — current vs position</h2>")
-            ui.element("div").style("flex:1")
-            ui.button("clear", on_click=lambda: scan_clear()).props("flat dense")
-        scan_opts = _base("position (mm)", "current (A)")
-        _two_trace(scan_opts, ["X", "Y"], [_X_COLOR, _Y_COLOR])
-        scan_chart = _plotbox(scan_opts)
-        scan_store = {"x": [], "y": []}
+            def iv_point(label, v, i):
+                iv_store[label].append([float(v), float(i)])
+                dirty["iv"] = True
 
-        def _scan_redraw():
-            scan_chart.options["series"][0]["data"] = list(scan_store["x"])
-            scan_chart.options["series"][1]["data"] = list(scan_store["y"])
-            scan_chart.update()
+            def iv_clear():
+                iv_store["dark"] = []; iv_store["bright"] = []
+                _iv_redraw()
 
-        def scan_begin(axis):
-            scan_store[axis] = []
-            _scan_redraw()
+            def _iv_toggle(label):
+                iv_visible[label] = not iv_visible[label]
+                dot = iv_dot_dark if label == "dark" else iv_dot_bright
+                if iv_visible[label]:
+                    dot.classes(remove="is-off")
+                else:
+                    dot.classes(add="is-off")
+                _iv_redraw()
 
-        def scan_point(axis, pos, i):
-            scan_store[axis].append([float(pos), float(i)])
-            _scan_redraw()           # run_scan loop is on the main thread
+            PLOTS.update(iv_begin=iv_begin, iv_point=iv_point,
+                         iv_redraw=_iv_redraw)
 
-        def scan_clear():
-            scan_store["x"] = []; scan_store["y"] = []
-            _scan_redraw()
+        # ============== Scan plot ==============
+        with ui.card().classes("card-l2"):
+            scan_visible = {"x": True, "y": True}
+            with ui.element("div").classes("plot-head"):
+                ui.html('<span class="t">Scan · current vs position</span>')
+                with ui.element("div").classes("legend").style("margin-left:auto"):
+                    scan_dot_x = _legend_dot(
+                        "X", "blue", lambda _e=None: _scan_toggle("x"))
+                    scan_dot_y = _legend_dot(
+                        "Y", "green", lambda _e=None: _scan_toggle("y"))
+                ui.button("clear", on_click=lambda: scan_clear()) \
+                    .props("flat dense")
 
-        PLOTS.update(scan_begin=scan_begin, scan_point=scan_point)
+            scan_opts = _base("position (mm)", "current (A)")
+            scan_opts["series"].append(_series("X", _X_COLOR))
+            scan_opts["series"].append(_series("Y", _Y_COLOR))
+            with ui.element("div").classes("plotbox-l2"):
+                scan_chart = ui.echart(scan_opts).classes("w-full") \
+                    .style("height:100%")
+                scan_empty = ui.html(
+                    '<div class="plot-empty-l2">no data — run scan</div>'
+                )
 
-    # --------------------------- charge ------------------------------
-    with ui.card().classes("daq-card w-full"):
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.html("<h2>charge spectrum</h2>")
-            ui.element("div").style("flex:1")
-            chg_bins = ui.number(label="bins", value=100, min=10, step=10) \
-                .classes("w-24 num").props("dense")
-            ui.button("clear", on_click=lambda: charge_clear()).props("flat dense")
-        chg_opts = _base("amplitude (ADC, baseline-sub)", "counts", ygap=46)
-        _two_trace(chg_opts, ["dark", "bright"], [_DARK_COLOR, _BRIGHT_COLOR])
-        for s in chg_opts["series"]:
-            s["step"] = "middle"     # step lines overlay more legibly
-        chg_chart = _plotbox(chg_opts)
-        chg_store = {"dark": None, "bright": None}   # raw amplitude arrays
+            scan_store = {"x": [], "y": []}
 
-        def _chg_redraw():
-            bins = max(10, int(chg_bins.value or 100))
-            for idx, label in enumerate(("dark", "bright")):
-                amps = chg_store[label]
-                if amps is None or len(amps) == 0:
-                    chg_chart.options["series"][idx]["data"] = []
-                    continue
-                arr = _np.asarray(amps, dtype=float)
-                hist, edges = _np.histogram(arr, bins=bins)
-                chg_chart.options["series"][idx]["data"] = [
-                    [float((edges[i] + edges[i + 1]) / 2), int(h)]
-                    for i, h in enumerate(hist)]
-            chg_chart.update()
+            def _scan_redraw():
+                xd = list(scan_store["x"]) if scan_visible["x"] else []
+                yd = list(scan_store["y"]) if scan_visible["y"] else []
+                scan_chart.options["series"][0]["data"] = xd
+                scan_chart.options["series"][1]["data"] = yd
+                scan_chart.update()
+                scan_empty.set_visibility(not (xd or yd))
 
-        def charge_set(label, result, ch):
-            try:
-                amps = result.amplitudes.get(ch)
-            except Exception:
-                amps = None
-            chg_store[label] = list(amps) if amps is not None else []
-            _chg_redraw()
+            def scan_begin(axis):
+                scan_store[axis] = []
+                _scan_redraw()
 
-        def charge_clear():
-            chg_store["dark"] = None; chg_store["bright"] = None
-            _chg_redraw()
+            def scan_point(axis, pos, i):
+                scan_store[axis].append([float(pos), float(i)])
+                _scan_redraw()
 
-        chg_bins.on_value_change(lambda _e: _chg_redraw())
-        PLOTS.update(charge_set=charge_set)
+            def scan_clear():
+                scan_store["x"] = []; scan_store["y"] = []
+                _scan_redraw()
 
-    # -------------------------- waveform -----------------------------
-    with ui.card().classes("daq-card w-full"):
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.html("<h2>waveform</h2>")
-            ui.element("div").style("flex:1")
-            wv_prev = ui.button("◀").props("flat dense")
-            wv_idx  = ui.number(value=0, min=0, step=1, format="%d") \
-                .classes("w-20 num").props("dense")
-            wv_next = ui.button("▶").props("flat dense")
-        wv_info = ui.label("no waveforms yet").classes("text-xs text-gray-400")
-        wv_opts = _base("time from trigger (µs)", "ADC (baseline-sub)", 46)
-        wv_opts["series"].append({
-            "name": "wfm", "type": "line", "showSymbol": False, "data": [],
-            "lineStyle": {"width": 1.4, "color": _BRIGHT_COLOR}})
-        wv_chart = _plotbox(wv_opts)
-        wv_state = {"wfs": None, "pre_us": 0.0, "label": ""}
+            def _scan_toggle(axis):
+                scan_visible[axis] = not scan_visible[axis]
+                dot = scan_dot_x if axis == "x" else scan_dot_y
+                if scan_visible[axis]:
+                    dot.classes(remove="is-off")
+                else:
+                    dot.classes(add="is-off")
+                _scan_redraw()
 
-        def _wv_redraw():
-            wfs = wv_state["wfs"]
-            if wfs is None or len(wfs) == 0:
-                wv_chart.options["series"][0]["data"] = []
+            PLOTS.update(scan_begin=scan_begin, scan_point=scan_point)
+
+        # ============== Charge spectrum ==============
+        with ui.card().classes("card-l2"):
+            cs_visible = {"dark": True, "bright": True}
+            with ui.element("div").classes("plot-head"):
+                ui.html('<span class="t">Charge spectrum</span>')
+                with ui.element("div").classes("legend").style("margin-left:auto"):
+                    cs_dot_dark   = _legend_dot(
+                        "dark", "blue",
+                        lambda _e=None: _cs_toggle("dark"))
+                    cs_dot_bright = _legend_dot(
+                        "bright", "orange",
+                        lambda _e=None: _cs_toggle("bright"))
+                with ui.element("div").classes("fld").style("width:80px"):
+                    chg_bins = ui.number(value=100, min=10, step=10,
+                                         format="%d") \
+                        .props('dense filled hide-bottom-space suffix="bins"')
+                ui.button("clear", on_click=lambda: charge_clear()) \
+                    .props("flat dense")
+
+            chg_opts = _base("amplitude (ADC, baseline-sub)", "counts", ygap=46)
+            chg_opts["series"].append(
+                _series("dark", _DARK_COLOR, step="middle"))
+            chg_opts["series"].append(
+                _series("bright", _BRIGHT_COLOR, step="middle"))
+            with ui.element("div").classes("plotbox-l2"):
+                chg_chart = ui.echart(chg_opts).classes("w-full") \
+                    .style("height:100%")
+                chg_empty = ui.html(
+                    '<div class="plot-empty-l2">no data — run pulse</div>'
+                )
+
+            chg_store = {"dark": None, "bright": None}
+
+            def _chg_redraw():
+                bins = max(10, int(chg_bins.value or 100))
+                any_data = False
+                for idx, label in enumerate(("dark", "bright")):
+                    amps = chg_store[label]
+                    if amps is None or len(amps) == 0 or not cs_visible[label]:
+                        chg_chart.options["series"][idx]["data"] = []
+                        continue
+                    arr = _np.asarray(amps, dtype=float)
+                    hist, edges = _np.histogram(arr, bins=bins)
+                    chg_chart.options["series"][idx]["data"] = [
+                        [float((edges[i] + edges[i + 1]) / 2), int(h)]
+                        for i, h in enumerate(hist)]
+                    any_data = True
+                chg_chart.update()
+                chg_empty.set_visibility(not any_data)
+
+            def charge_set(label, result, ch):
+                try:
+                    amps = result.amplitudes.get(ch)
+                except Exception:
+                    amps = None
+                chg_store[label] = list(amps) if amps is not None else []
+                _chg_redraw()
+
+            def charge_clear():
+                chg_store["dark"] = None; chg_store["bright"] = None
+                _chg_redraw()
+
+            def _cs_toggle(label):
+                cs_visible[label] = not cs_visible[label]
+                dot = cs_dot_dark if label == "dark" else cs_dot_bright
+                if cs_visible[label]:
+                    dot.classes(remove="is-off")
+                else:
+                    dot.classes(add="is-off")
+                _chg_redraw()
+
+            chg_bins.on_value_change(lambda _e: _chg_redraw())
+            PLOTS.update(charge_set=charge_set)
+
+        # ============== Waveform browser ==============
+        with ui.card().classes("card-l2"):
+            with ui.element("div").classes("plot-head"):
+                ui.html('<span class="t">Waveform browser</span>')
+                with ui.element("div").style("margin-left:auto; display:flex; gap:6px; align-items:center"):
+                    wv_prev = ui.button("◀").props("flat dense")
+                    with ui.element("div").classes("fld").style("width:70px"):
+                        wv_idx = ui.number(value=0, min=0, step=1,
+                                           format="%d") \
+                            .props("dense filled hide-bottom-space")
+                    wv_next = ui.button("▶").props("flat dense")
+                wv_info = ui.html(
+                    '<span class="hint">0 captured</span>'
+                ).style("margin-left:8px")
+
+            wv_opts = _base("time from trigger (µs)", "ADC (baseline-sub)", 46)
+            wv_opts["series"].append({
+                "name": "wfm", "type": "line", "showSymbol": False, "data": [],
+                "lineStyle": {"width": 1.4, "color": _BRIGHT_COLOR}})
+            with ui.element("div").classes("plotbox-l2"):
+                wv_chart = ui.echart(wv_opts).classes("w-full") \
+                    .style("height:100%")
+                wv_empty = ui.html(
+                    '<div class="plot-empty-l2">no waveforms yet</div>'
+                )
+
+            wv_state = {"wfs": None, "pre_us": 0.0, "label": ""}
+
+            def _wv_redraw():
+                wfs = wv_state["wfs"]
+                if wfs is None or len(wfs) == 0:
+                    wv_chart.options["series"][0]["data"] = []
+                    wv_chart.update()
+                    wv_empty.set_visibility(True)
+                    wv_info.set_content('<span class="hint">'
+                                        'no waveforms yet</span>')
+                    return
+                n = len(wfs)
+                i = max(0, min(int(wv_idx.value or 0), n - 1))
+                if i != int(wv_idx.value or 0):
+                    wv_idx.value = i
+                w = _np.asarray(wfs[i], dtype=float)
+                n_pre = max(1, int(round(wv_state["pre_us"] * _SAMPLES_PER_US)))
+                baseline = (float(w[:n_pre].mean()) if len(w) >= n_pre
+                            else float(w.mean()))
+                w_bl = w - baseline
+                t = _np.arange(len(w)) / _SAMPLES_PER_US - wv_state["pre_us"]
+                wv_chart.options["series"][0]["data"] = [
+                    [float(t[k]), float(w_bl[k])] for k in range(len(w))]
                 wv_chart.update()
-                wv_info.text = ("no waveforms — enable 'store raw waveforms' "
-                                "on the pulse card")
-                return
-            n = len(wfs)
-            i = max(0, min(int(wv_idx.value or 0), n - 1))
-            if i != int(wv_idx.value or 0):
-                wv_idx.value = i
-            w = _np.asarray(wfs[i], dtype=float)
-            n_pre = max(1, int(round(wv_state["pre_us"] * _SAMPLES_PER_US)))
-            baseline = (float(w[:n_pre].mean()) if len(w) >= n_pre
-                        else float(w.mean()))
-            w_bl = w - baseline
-            t = _np.arange(len(w)) / _SAMPLES_PER_US - wv_state["pre_us"]
-            wv_chart.options["series"][0]["data"] = [
-                [float(t[k]), float(w_bl[k])] for k in range(len(w))]
-            wv_chart.update()
-            lbl = f"{wv_state['label']} · " if wv_state["label"] else ""
-            wv_info.text = f"{lbl}waveform {i + 1} / {n}"
+                wv_empty.set_visibility(False)
+                lbl = f"{wv_state['label']} · " if wv_state["label"] else ""
+                wv_info.set_content(
+                    f'<span class="hint">{lbl}waveform {i + 1} / {n}</span>'
+                )
 
-        def wave_set(result, ch, label="", pre_us=0.0):
-            try:
-                wfs = result.waveforms.get(ch)
-            except Exception:
-                wfs = None
-            wv_state.update(wfs=wfs, pre_us=float(pre_us), label=str(label))
-            wv_idx.value = 0
-            _wv_redraw()
+            def wave_set(result, ch, label="", pre_us=0.0):
+                try:
+                    wfs = result.waveforms.get(ch)
+                except Exception:
+                    wfs = None
+                wv_state.update(wfs=wfs, pre_us=float(pre_us), label=str(label))
+                wv_idx.value = 0
+                _wv_redraw()
 
-        wv_idx.on_value_change(lambda _e: _wv_redraw())
-        wv_prev.on_click(lambda: (
-            wv_idx.set_value(max(0, int(wv_idx.value or 0) - 1)), _wv_redraw()))
-        wv_next.on_click(lambda: (
-            wv_idx.set_value(int(wv_idx.value or 0) + 1), _wv_redraw()))
-        PLOTS.update(wave_set=wave_set)
+            wv_idx.on_value_change(lambda _e: _wv_redraw())
+            wv_prev.on_click(lambda: (
+                wv_idx.set_value(max(0, int(wv_idx.value or 0) - 1)),
+                _wv_redraw()))
+            wv_next.on_click(lambda: (
+                wv_idx.set_value(int(wv_idx.value or 0) + 1),
+                _wv_redraw()))
+            PLOTS.update(wave_set=wave_set)
 
-    # IV points stream in from the sweep worker thread; redraw on the UI
-    # loop only when something changed (echart can't be touched off-loop).
+        # ============== Pulse sweep (vs bias) ==============
+        # Spans both grid columns: a dual-axis curve of mean pulse
+        # amplitude (left, ADC) and trigger rate (right, Hz) vs bias.
+        with ui.card().classes("card-l2").style("grid-column:1/-1"):
+            ps_visible = {"amp": True, "rate": True}
+            with ui.element("div").classes("plot-head"):
+                ui.html('<span class="t">Pulse sweep · vs bias</span>')
+                with ui.element("div").classes("legend").style("margin-left:auto"):
+                    ps_dot_amp  = _legend_dot(
+                        "mean amp", "blue",
+                        lambda _e=None: _ps_toggle("amp"))
+                    ps_dot_rate = _legend_dot(
+                        "rate", "green",
+                        lambda _e=None: _ps_toggle("rate"))
+                ui.button("clear", on_click=lambda: psweep_clear()) \
+                    .props("flat dense")
+
+            ps_opts = {
+                "tooltip": {"trigger": "axis"},
+                "grid": {"left": 64, "right": 62, "top": 14, "bottom": 32},
+                "backgroundColor": "transparent",
+                "textStyle": {"color": "#dde3ee"},
+                "xAxis": _axis("bias (V)", 20),
+                "yAxis": [
+                    _axis("mean amp (ADC)", 46),
+                    {**_axis("rate (Hz)", 46), "position": "right"},
+                ],
+                "series": [
+                    {**_series("mean amp", _DARK_COLOR), "yAxisIndex": 0},
+                    {**_series("rate",     _Y_COLOR),    "yAxisIndex": 1},
+                ],
+            }
+            with ui.element("div").classes("plotbox-l2"):
+                ps_chart = ui.echart(ps_opts).classes("w-full") \
+                    .style("height:100%")
+                ps_empty = ui.html(
+                    '<div class="plot-empty-l2">no data — '
+                    'run pulse in bias-sweep mode</div>'
+                )
+
+            ps_store = {"amp": [], "rate": []}
+
+            def _ps_redraw():
+                a = list(ps_store["amp"])  if ps_visible["amp"]  else []
+                r = list(ps_store["rate"]) if ps_visible["rate"] else []
+                ps_chart.options["series"][0]["data"] = a
+                ps_chart.options["series"][1]["data"] = r
+                ps_chart.update()
+                ps_empty.set_visibility(not (a or r))
+
+            def psweep_begin():
+                ps_store["amp"] = []; ps_store["rate"] = []
+                _ps_redraw()
+
+            def psweep_point(bias, mean_amp, rate_hz):
+                b = float(bias)
+                if mean_amp is not None and _np.isfinite(mean_amp):
+                    ps_store["amp"].append([b, float(mean_amp)])
+                if rate_hz is not None and _np.isfinite(rate_hz):
+                    ps_store["rate"].append([b, float(rate_hz)])
+                _ps_redraw()
+
+            def psweep_clear():
+                ps_store["amp"] = []; ps_store["rate"] = []
+                _ps_redraw()
+
+            def _ps_toggle(which):
+                ps_visible[which] = not ps_visible[which]
+                dot = ps_dot_amp if which == "amp" else ps_dot_rate
+                if ps_visible[which]:
+                    dot.classes(remove="is-off")
+                else:
+                    dot.classes(add="is-off")
+                _ps_redraw()
+
+            PLOTS.update(psweep_begin=psweep_begin, psweep_point=psweep_point)
+
+    # IV points stream in from the worker thread; redraw on the UI loop.
     def _pump_iv():
         if dirty.get("iv"):
             dirty["iv"] = False
@@ -3411,46 +3931,28 @@ def _build_l2_plots(PLOTS: dict, dirty: dict) -> None:
 
 
 def _build_level2_tab():
-    """Single-SiPM measurements: IV, pulse counting, and scan.
+    """Single-SiPM measurements panel — IV, pulse counting, and 1-D scan.
 
-    Operator provides the SiPM identity directly (no channel-map lookup):
-    sipm id (label), MUX channel, and the (x, y) center position in mm.
-    All measurements:
-      - select that MUX channel
-      - move the stage to (center_x, center_y)
-      - run the measurement (dark or bright; bright = AWG ch1 pulse)
-      - save to data/sipm{N}_T{K}/<unix_ms>.h5
-
-    The scan card sweeps one axis (X or Y) around the center, takes
-    N current samples per position, and supports two illumination modes:
-    VUV beam (AWG ch1) and Laser (AWG ch2), each with its own pulse
-    parameters.
+    Layout:
+        [intro line + path badge]
+        [layout grid]
+          LEFT controls column:
+            - SiPM context card (per-row include-in-file toggles)
+            - Output card (folder + basename overrides)
+            - Measurement procedure card with sub-tabs:
+                · IV sweep    (condition pills, meter, start/stop/step/N)
+                · Pulse       (condition pills, bias/ch/thr, aux trigger,
+                               pre/post/N, store raw)
+                · 1-D scan    (axis & source pills, meter, bias/range/step/
+                               N/settle, AWG subgroup, ±0.75 cm helper)
+          RIGHT:
+            - 2×2 plot grid with legend-toggle dots (built by
+              _build_l2_plots — same registry of streaming callbacks).
     """
-    ui.label(
-        "Single-SiPM measurements: IV (dark/bright), pulse counting "
-        "(dark/bright), and 1-D scan (X or Y, dark/VUV/laser). "
-        "Each click writes data/sipm{N}_T{K}/<unix_ms>.h5."
-    ).classes("text-gray-400 text-sm")
-
-    log_lbl = ui.log(max_lines=24).classes("h-64 w-full")
-    def log_msg(s: str): log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
-
-    # ------------------------------------------------------------------
-    # Live-plot registry.  The right-hand plot column (built after the
-    # control cards, below) fills this with streaming callbacks; the run
-    # handlers stream points/traces into the views as data is recorded.
-    # Defined here so the handlers can close over `PLOTS` regardless of
-    # build order — lookups happen at click-time, after the column is up.
-    # `_plot_dirty["iv"]` is set from the IV worker thread and pumped onto
-    # the UI by a ui.timer inside the plot column (echart updates must run
-    # on the main loop, not the worker thread).
-    # ------------------------------------------------------------------
     PLOTS: dict = {}
     _plot_dirty = {"iv": False}
 
     def _plot(_name, *args):
-        """Best-effort live-plot update — a chart glitch must never abort
-        a measurement run, so swallow (and log) any failure."""
         fn = PLOTS.get(_name)
         if fn is None:
             return
@@ -3460,20 +3962,13 @@ def _build_level2_tab():
             try: log_msg(f"  plot {_name} FAIL: {type(e).__name__}: {e}")
             except Exception: pass
 
-    # ==================================================================
-    # Shared helpers used by every measurement card.
-    # ==================================================================
     def _awg_pulse_on(ks_ch: int, freq: float, amp: float, offset: float,
                        width_s: float) -> None:
-        """Configure + enable a Keysight 33500B channel with a pulse train.
-
-        Called inside a worker thread (no await).  Raises on missing AWG.
-        """
         awg = HUB.ks33500b
         if awg is None:
             raise RuntimeError(
                 "Keysight 33500B not connected — required for bright / scan "
-                "illumination.  Connect it on the Connections tab.")
+                "illumination. Connect it on the Connections tab.")
         awg.set_load("INF", channel=ks_ch)
         awg.apply_pulse(float(freq), float(amp), float(offset), 0.0,
                          channel=ks_ch)
@@ -3487,710 +3982,1193 @@ def _build_level2_tab():
         try: HUB.ks33500b.output_off(ks_ch)
         except Exception: pass
 
-    # Controls on the left, the live-plot column on the right.  no-wrap
-    # keeps them side by side on a wide monitor; each side stays
-    # scrollable on its own when the window is narrow.
-    _split = ui.row().classes("w-full gap-4 items-start no-wrap")
-    with _split:
-        _left  = ui.column().style("flex:2 1 640px; min-width:0; gap:12px")
-        _right = ui.column().style("flex:1 1 440px; min-width:380px; gap:14px")
+    with ui.element("div").classes("l2-panel w-full"):
 
-    with _left, ui.row().classes("w-full gap-3 items-start"):
+        # ----- Horizontal context + save-path strip -----
+        # SiPM identification + bright/dark locations + temperature + the
+        # live "next file" preview, all in one row above the procedure card.
+        # Per-field include toggles drive both file-metadata inclusion AND
+        # the colored portion of the preview path.
 
-        # ==============================================================
-        # CARD 1 — SiPM identity + position (all but T are optional)
-        # ==============================================================
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>sipm + position (optional)</h2>")
-            ui.label(
-                "Toggle the switch next to a field to include it.  "
-                "Off ⇒ field is omitted from the measurement file AND "
-                "the corresponding action is skipped at run-time (no MUX "
-                "select, no stage move).  T (K) is always required for "
-                "the per-T folder name."
-            ).classes("text-xs text-gray-400")
+        def _update_path_preview():
+            base = (out_folder.value or "").strip().rstrip("/")
+            base_disp = base if base else "data/&lt;auto&gt;"
+            parts: list[str] = []
+            if bool(sipm_use.value):
+                parts.append(f"sipm{int(sipm_in.value or 0)}")
+            parts.append(f"T{int(round(float(temp_in.value or 0)))}")
+            sub = "_".join(parts)
+            next_file.set_content(
+                f'{base_disp}/<span class="em">{sub}</span>'
+                f'/&lt;unix_ms&gt;.h5'
+            )
 
-            # ---- SiPM id (optional, label-only — file tag) ----
-            with ui.row().classes("gap-2 items-end"):
-                sipm_use = ui.switch("SiPM id", value=False) \
-                    .props("dense")
-                sipm_in = ui.number(value=1, step=1).classes("w-24 num")
-                sipm_in.bind_enabled_from(sipm_use, "value")
+        with ui.element("div").classes("l2-ctx w-full"):
 
-            # ---- MUX channel (optional — gates whether MUX is touched) ----
-            with ui.row().classes("gap-2 items-end"):
-                mux_use = ui.switch("MUX ch", value=False) \
-                    .props("dense")
-                mux_in  = ui.number(value=1, step=1, min=1, max=96) \
-                    .classes("w-24 num")
-                mux_in.bind_enabled_from(mux_use, "value")
+            # === SiPM id + MUX ch ===
+            with ui.element("div").classes("cg"):
+                sipm_cfld = ui.element("div").classes("cfld")
+                with sipm_cfld:
+                    with ui.element("div").classes("lbl"):
+                        sipm_use = ui.switch(value=False) \
+                            .props("dense color=primary").classes("inc-toggle")
+                        ui.html('<span>SiPM id</span>')
+                    sipm_in = ui.number(value=1, step=1, format="%d") \
+                        .props('dense filled hide-bottom-space') \
+                        .style("width:70px")
+                mux_cfld = ui.element("div").classes("cfld")
+                with mux_cfld:
+                    with ui.element("div").classes("lbl"):
+                        mux_use = ui.switch(value=False) \
+                            .props("dense color=primary").classes("inc-toggle")
+                        ui.html('<span>MUX ch</span>')
+                    mux_in = ui.number(value=1, step=1, min=1, max=96,
+                                       format="%d") \
+                        .props('dense filled hide-bottom-space') \
+                        .style("width:70px")
 
-            # ---- Bright-measurement location ----
-            # When on, the stage moves the LIGHT SOURCE to (x, y) for any
-            # bright measurement (IV bright, pulse bright, scan center).
-            # Dark measurements use the dark-location row below instead.
-            with ui.row().classes("gap-2 items-end"):
-                loc_use = ui.switch("Bright location", value=False) \
-                    .props("dense")
-                cx_in = ui.number(label="x (mm)", value=0.0,
-                                   step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                cy_in = ui.number(label="y (mm)", value=0.0,
-                                   step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                cx_in.bind_enabled_from(loc_use, "value")
-                cy_in.bind_enabled_from(loc_use, "value")
+            ui.element("div").classes("cdiv")
 
-            # ---- Dark-measurement location ----
-            # When on, the stage moves the LIGHT SOURCE to (dx, dy) for
-            # any dark measurement (typically a spot well away from the
-            # SiPM so the LED's residual light can't bias the result).
-            # When off, the stage doesn't move for dark measurements.
-            with ui.row().classes("gap-2 items-end"):
-                dark_loc_use = ui.switch("Dark location", value=False) \
-                    .props("dense")
-                dx_in = ui.number(label="x (mm)", value=0.0,
-                                   step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                dy_in = ui.number(label="y (mm)", value=0.0,
-                                   step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                dx_in.bind_enabled_from(dark_loc_use, "value")
-                dy_in.bind_enabled_from(dark_loc_use, "value")
+            # === Bright + Dark + "go to SiPM" ===
+            with ui.element("div").classes("cg"):
+                bright_cfld = ui.element("div").classes("cfld")
+                with bright_cfld:
+                    with ui.element("div").classes("lbl"):
+                        loc_use = ui.switch(value=False) \
+                            .props("dense color=primary").classes("inc-toggle")
+                        ui.html('<span>Bright (x, y) mm</span>')
+                    with ui.element("div").classes("row2"):
+                        cx_in = ui.number(value=0.0, step=0.1, format="%.3f") \
+                            .props('dense filled hide-bottom-space') \
+                            .style("width:74px")
+                        cy_in = ui.number(value=0.0, step=0.1, format="%.3f") \
+                            .props('dense filled hide-bottom-space') \
+                            .style("width:74px")
+                dark_cfld = ui.element("div").classes("cfld")
+                with dark_cfld:
+                    with ui.element("div").classes("lbl"):
+                        dark_loc_use = ui.switch(value=False) \
+                            .props("dense color=primary").classes("inc-toggle")
+                        ui.html('<span>Dark (x, y) mm</span>')
+                    with ui.element("div").classes("row2"):
+                        dx_in = ui.number(value=0.0, step=0.1, format="%.3f") \
+                            .props('dense filled hide-bottom-space') \
+                            .style("width:74px")
+                        dy_in = ui.number(value=0.0, step=0.1, format="%.3f") \
+                            .props('dense filled hide-bottom-space') \
+                            .style("width:74px")
 
-            # ---- Temperature (always required) ----
-            with ui.row().classes("gap-2 items-end"):
-                temp_in = ui.number(label="T (K)", value=298.0, step=0.1,
-                                     format="%.2f").classes("w-32 num")
-                temp_src = ui.label("manual").classes("text-xs text-gray-500")
+                async def _go_to_sipm():
+                    if not (mux_use.value or loc_use.value):
+                        log_msg("go-to: neither MUX nor Bright location enabled")
+                        return
+                    if mux_use.value:
+                        if HUB.mux is None:
+                            log_msg("MUX enabled but mux not connected"); return
+                        try:
+                            await _run_in_thread(
+                                P.select_channel, HUB.mux, int(mux_in.value))
+                            log_msg(f"  MUX → ch {int(mux_in.value)}")
+                        except Exception as e:
+                            log_msg(f"  MUX FAIL: {e}"); return
+                    if loc_use.value:
+                        if HUB.stage is None:
+                            log_msg("Bright location enabled but stage not "
+                                    "connected"); return
+                        try:
+                            await _run_in_thread(
+                                P.move_stage, HUB.stage,
+                                float(cx_in.value), float(cy_in.value),
+                                bool(HUB.config.stage_deenergize))
+                            log_msg(f"  stage → ({cx_in.value:.3f}, "
+                                    f"{cy_in.value:.3f}) mm")
+                        except Exception as e:
+                            log_msg(f"  stage FAIL: {e}")
+                ui.button("go to SiPM →", on_click=_go_to_sipm) \
+                    .props("flat dense").style("margin-bottom:1px")
+
+            ui.element("div").classes("cdiv")
+
+            # === Temperature + read T ===
+            with ui.element("div").classes("cg"):
+                temp_cfld = ui.element("div").classes("cfld")
+                with temp_cfld:
+                    with ui.element("div").classes("lbl"):
+                        ui.html('<span>T</span>')
+                        temp_src_html = ui.html(
+                            '<span style="font-size:9px; opacity:.6">manual</span>'
+                        )
+                    temp_in = ui.number(value=298.0, step=0.1, format="%.2f") \
+                        .props('dense filled hide-bottom-space suffix="K"') \
+                        .style("width:108px")
+
                 async def read_T_from_sc():
                     if HUB.sc is None:
-                        log_msg("slow control not connected — keep manual T")
-                        temp_src.text = "manual"; return
+                        log_msg("slow control not connected"); return
                     try:
                         T = await _run_in_thread(P.read_temperature, HUB.sc)
                         temp_in.value = float(T)
-                        temp_src.text = "slowcontrol"
+                        temp_src_html.set_content(
+                            '<span style="font-size:9px; opacity:.6">'
+                            'slowctrl</span>')
                         log_msg(f"T = {T:.3f} K (from slowcontrol)")
                     except Exception as e:
                         log_msg(f"  T read FAIL: {type(e).__name__}: {e}")
-                        temp_src.text = "manual"
-                ui.button("read T", on_click=read_T_from_sc).props("dense")
-                temp_in.on_value_change(lambda _: setattr(temp_src, "text",
-                                                           "manual"))
 
-            async def _go_to_sipm():
-                """Apply whatever the operator entered: select MUX channel
-                (if enabled) + move stage (if enabled).  No measurement.
-                Logs a no-op if neither toggle is on."""
-                if not (mux_use.value or loc_use.value):
-                    log_msg("go-to: neither MUX nor Location enabled — "
-                            "nothing to do"); return
-                if mux_use.value:
-                    if HUB.mux is None:
-                        log_msg("MUX enabled but mux not connected"); return
-                    try:
-                        await _run_in_thread(P.select_channel, HUB.mux,
-                                              int(mux_in.value))
-                        log_msg(f"  MUX → ch {int(mux_in.value)}")
-                    except Exception as e:
-                        log_msg(f"  MUX FAIL: {e}"); return
-                if loc_use.value:
-                    if HUB.stage is None:
-                        log_msg("Location enabled but stage not connected")
-                        return
-                    try:
-                        await _run_in_thread(
-                            P.move_stage, HUB.stage,
-                            float(cx_in.value), float(cy_in.value),
-                            bool(HUB.config.stage_deenergize),
-                        )
-                        log_msg(f"  stage → ({cx_in.value:.3f}, "
-                                f"{cy_in.value:.3f}) mm")
-                    except Exception as e:
-                        log_msg(f"  stage FAIL: {e}")
+                def _on_T_change(_e=None):
+                    temp_src_html.set_content(
+                        '<span style="font-size:9px; opacity:.6">manual</span>')
+                    _update_path_preview()
+                temp_in.on_value_change(_on_T_change)
+                ui.button("read T", on_click=read_T_from_sc) \
+                    .props("flat dense").style("margin-bottom:1px")
 
-            ui.button("go to sipm", on_click=_go_to_sipm) \
-                .props("dense color=secondary")
+            ui.element("div").classes("cdiv").style("margin-left:auto")
 
-        # ---- helpers shared by all measurement cards ----
-        def _opt_kwargs() -> dict:
-            """Pack the optional identifier fields (None when their switch
-            is off).  Pass directly to MSTORE.save_l2_* via **_opt_kwargs().
-
-            Both bright (`center_x_mm`/`center_y_mm`) and dark
-            (`dark_x_mm`/`dark_y_mm`) coordinates are included
-            whenever their respective switches are on, regardless of
-            which one the current measurement actually used — the
-            file then records the full position setup for both.
-            """
-            return {
-                "sipm_id":     int(sipm_in.value) if sipm_use.value else None,
-                "mux_channel": int(mux_in.value)  if mux_use.value  else None,
-                "center_x_mm": float(cx_in.value) if loc_use.value  else None,
-                "center_y_mm": float(cy_in.value) if loc_use.value  else None,
-                "dark_x_mm":   float(dx_in.value) if dark_loc_use.value else None,
-                "dark_y_mm":   float(dy_in.value) if dark_loc_use.value else None,
-            }
-
-        async def _prep_position(bright: bool = False) -> bool:
-            """Apply the entered identifiers ahead of a measurement.
-
-            MUX:  selected whenever the MUX switch is on (wiring,
-                  independent of light state).
-            Stage: bright measurement → moves to (cx, cy) if the
-                  Bright-location switch is on.
-                  dark measurement   → moves to (dx, dy) if the
-                  Dark-location switch is on.  Otherwise no move.
-                  The stage carries the light source, so:
-                    - bright + bright-loc on  → light goes over SiPM
-                    - dark   + dark-loc   on  → light parks away
-                    - either + corresponding switch off → no move
-
-            Returns True if everything requested succeeded (True also
-            when nothing was requested).  Logs + returns False on any
-            failure.
-            """
-            if mux_use.value:
-                if HUB.mux is None:
-                    log_msg("MUX enabled but mux not connected — abort")
-                    return False
-                try:
-                    await _run_in_thread(P.select_channel, HUB.mux,
-                                          int(mux_in.value))
-                except Exception as e:
-                    log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
-                    return False
-            # Choose which coord pair (if any) to move to based on
-            # bright vs dark + which Location switch is on.
-            if bright and loc_use.value:
-                target_x, target_y = float(cx_in.value), float(cy_in.value)
-                tag = "bright"
-            elif (not bright) and dark_loc_use.value:
-                target_x, target_y = float(dx_in.value), float(dy_in.value)
-                tag = "dark"
-            else:
-                return True   # no stage move requested
-            if HUB.stage is None:
-                log_msg(f"{tag.title()} location enabled but stage not "
-                        "connected — abort")
-                return False
-            try:
-                await _run_in_thread(
-                    P.move_stage, HUB.stage,
-                    target_x, target_y,
-                    bool(HUB.config.stage_deenergize),
+            # === Save folder + live "next file" preview ===
+            with ui.element("div").classes("save-preview"):
+                ui.html(
+                    '<span class="lbl" style="font-size:10px; '
+                    'letter-spacing:.04em; text-transform:uppercase; '
+                    'color:var(--mut)">Save folder · next file</span>'
                 )
-            except Exception as e:
-                log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
-                return False
-            return True
+                with ui.row().style("gap:6px; margin:0; padding:0; "
+                                    "flex-wrap:nowrap"):
+                    out_folder = ui.input(value="",
+                                          placeholder="auto (data/...)") \
+                        .props('dense filled hide-bottom-space') \
+                        .style("flex:0 0 150px")
+                    next_file = ui.html('').classes("next") \
+                        .style("flex:1 1 auto; min-width:0")
 
-        # ==============================================================
-        # CARD 2 — IV (dark / bright × b2987 / k6485)
-        # ==============================================================
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>iv sweep</h2>")
-            iv_illum = ui.toggle({"dark": "dark", "bright": "bright"},
-                                  value="dark").props("dense")
-            iv_meter = ui.select(
-                {"k6485": "K6485 picoammeter",
-                 "b2987": "B2987 (built-in ammeter)"},
-                value="k6485", label="current meter").classes("w-56")
-            with ui.row().classes("gap-2 items-end"):
-                iv_start = ui.number(label="start (V)",
-                                      value=HUB.config.iv_voltage_start,
-                                      step=0.1).classes("w-24 num")
-                iv_stop  = ui.number(label="stop (V)",
-                                      value=HUB.config.iv_voltage_stop,
-                                      step=0.1).classes("w-24 num")
-                iv_step  = ui.number(label="step (V)",
-                                      value=HUB.config.iv_voltage_step,
-                                      step=0.01).classes("w-24 num")
-                iv_npt   = ui.number(label="N / V",
-                                      value=HUB.config.iv_n_per_point,
-                                      step=1).classes("w-20 num")
+        # Wire dim/preview reactions.
+        def _dim(el, off: bool):
+            if off: el.classes(add="is-off")
+            else:   el.classes(remove="is-off")
+        sipm_in.on_value_change(lambda _: _update_path_preview())
+        sipm_use.on_value_change(lambda _: (
+            _dim(sipm_cfld, not bool(sipm_use.value)),
+            _update_path_preview()))
+        mux_use.on_value_change(
+            lambda _: _dim(mux_cfld, not bool(mux_use.value)))
+        loc_use.on_value_change(
+            lambda _: _dim(bright_cfld, not bool(loc_use.value)))
+        dark_loc_use.on_value_change(
+            lambda _: _dim(dark_cfld, not bool(dark_loc_use.value)))
+        out_folder.on_value_change(lambda _: _update_path_preview())
+        _dim(sipm_cfld, True); _dim(mux_cfld, True)
+        _dim(bright_cfld, True); _dim(dark_cfld, True)
+        _update_path_preview()
 
-            async def run_iv():
-                if HUB.elec is None: log_msg("b2987 not connected"); return
-                meter = str(iv_meter.value or "k6485")
-                if meter == "k6485" and HUB.k6485 is None:
-                    log_msg("K6485 not connected"); return
-                bright = (iv_illum.value == "bright")
-                if bright and HUB.ks33500b is None:
-                    log_msg("Keysight 33500B not connected — bright needs AWG")
-                    return
-                if not await _prep_position(bright=bright): return
+        # Layout — left = measurement procedure, right = plots (1:1)
+        with ui.element("div").classes("l2-layout w-full"):
 
-                import numpy as np
-                voltages = np.arange(
-                    float(iv_start.value),
-                    float(iv_stop.value) + float(iv_step.value) * 0.5,
-                    float(iv_step.value),
-                ).tolist()
-                log_msg(f"IV sipm={int(sipm_in.value)} {iv_illum.value} "
-                        f"{meter} {len(voltages)} V, N={int(iv_npt.value)}/V")
-                set_activity("L2 IV",
-                             f"sipm {int(sipm_in.value)} · "
-                             f"{iv_illum.value} · {meter} · {len(voltages)} V")
-                iv_slot = "bright" if bright else "dark"
-                _plot("iv_begin", iv_slot)   # replace this slot, keep the other
-                try:
-                    if bright:
-                        await _run_in_thread(
-                            _awg_pulse_on, 1,
-                            HUB.config.led_frequency_hz,
-                            HUB.config.led_amplitude_v,
-                            HUB.config.led_offset_v,
-                            HUB.config.led_pulse_width,
-                        )
-                    delay = float(getattr(HUB.config, "iv_delay_s", 0.05))
-                    # Per-voltage progress feedback.  The cb fires inside
-                    # the worker thread, so it goes to BOTH the page log
-                    # (NiceGUI queues UI updates from any thread) and
-                    # stdout (guaranteed real-time in the systemd journal
-                    # via `journalctl --user -fu daq-webapp -f`).  The
-                    # journal path is the reliable one — the page log
-                    # may batch.
-                    n_total = len(voltages)
-                    def _iv_prog(i, n, v, mean_i, std_i):
-                        line = (f"  [{i}/{n}] v={v:+.3f} V  "
-                                f"I={mean_i:+.3e} A ± {std_i:.2e}")
-                        try: log_msg(line)
-                        except Exception: pass
-                        try: print(f"[L2 IV] {line}", flush=True)
-                        except Exception: pass
-                        # Worker thread: iv_point only buffers + flags;
-                        # the plot column's timer redraws on the UI loop.
-                        _plot("iv_point", iv_slot, v, mean_i)
-                    if meter == "k6485":
-                        result = await _run_in_thread(
-                            lambda: P.iv_sweep_external_meter(
-                                HUB.elec, HUB.k6485, voltages,
-                                n_per_voltage=int(iv_npt.value),
-                                delay_s=delay,
-                                progress_cb=_iv_prog,
-                            )
-                        )
-                    else:
-                        # The B2987's on-instrument sweep doesn't support
-                        # progress callbacks — it returns one block.
-                        # Heartbeat once at the start so the user sees
-                        # something.
-                        print(f"[L2 IV] b2987 sweep starting "
-                              f"({n_total} voltages, "
-                              f"{int(iv_npt.value)} pts/V) — "
-                              "no per-point progress on this meter",
-                              flush=True)
-                        log_msg(f"  b2987 sweep starting "
-                                f"({n_total} V, no per-pt updates)")
-                        result = await _run_in_thread(
-                            P.iv_sweep, HUB.elec, voltages,
-                            int(iv_npt.value), delay,
-                        )
-                        # No per-point callback on the b2987 — fill the
-                        # trace from the returned block.
-                        for _v, _i in zip(result.avg_source_v,
-                                          result.avg_current_a):
-                            _plot("iv_point", iv_slot, _v, _i)
-                        _plot("iv_redraw")
-                    log_msg(f"  done: I({result.avg_source_v[-1]:.2f} V) = "
-                            f"{result.avg_current_a[-1]:.3e} A")
-                    note_bias(v_set=result.avg_source_v[-1],
-                              i_meas=result.avg_current_a[-1],
-                              output_on=False)
-                    try:
-                        p = MSTORE.save_l2_iv_sweep(
-                            result,
-                            temperature_K = float(temp_in.value),
-                            illuminated   = bright,
-                            meter         = meter,
-                            **_opt_kwargs(),
-                        )
-                        log_msg(f"  saved: {p}")
-                    except Exception as e:
-                        log_msg(f"  SAVE FAIL: {type(e).__name__}: {e}")
-                except Exception as e:
-                    log_msg(f"  IV FAIL: {type(e).__name__}: {e}")
-                finally:
-                    if bright:
-                        await _run_in_thread(_awg_off, 1)
-                    try: await _run_in_thread(P.bias_off, HUB.elec)
-                    except Exception: pass
-                    clear_activity()
-            ui.button("run iv", on_click=run_iv).props("color=primary")
+            # =============== LEFT: controls column ===============
+            with ui.element("div").classes("l2-stack"):
 
-        # ==============================================================
-        # CARD 3 — Pulse counting (dark / bright)
-        # ==============================================================
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>pulse counting</h2>")
-            pc_illum = ui.toggle({"dark": "dark", "bright": "bright"},
-                                  value="dark").props("dense")
-            with ui.row().classes("gap-2 items-end"):
-                pc_bias = ui.number(label="bias (V)",
-                                     value=HUB.config.pulse_bias_v,
-                                     step=0.1).classes("w-24 num")
-                pc_ch   = ui.number(label="capture ch",
-                                     value=0, step=1, min=0, max=63) \
-                    .classes("w-24 num")
-                pc_thr  = ui.number(label="self-trig thr (ADC)",
-                                     value=50, step=10).classes("w-32 num")
-            # Optional aux trigger: enable a SECOND channel + threshold so
-            # the digitizer can self-trigger on EITHER channel (any ITLA-OR
-            # channel above its per-channel threshold).  Capture channel
-            # always gets its own threshold.
-            with ui.row().classes("gap-2 items-end"):
-                pc_aux_use = ui.switch("trigger on another ch", value=False) \
-                    .props("dense")
-                pc_aux_ch  = ui.number(label="aux ch",
-                                        value=4, step=1, min=0, max=63) \
-                    .classes("w-24 num")
-                pc_aux_thr = ui.number(label="aux thr (ADC)",
-                                        value=50, step=10).classes("w-28 num")
-                pc_aux_ch.bind_enabled_from(pc_aux_use, "value")
-                pc_aux_thr.bind_enabled_from(pc_aux_use, "value")
-            with ui.row().classes("gap-2 items-end"):
-                pc_pre  = ui.number(label="pre (µs)",
-                                     value=HUB.config.pulse_pre_us,
-                                     step=0.5).classes("w-24 num")
-                pc_post = ui.number(label="post (µs)",
-                                     value=HUB.config.pulse_post_us,
-                                     step=0.5).classes("w-24 num")
-                pc_n    = ui.number(label="N waveforms",
-                                     value=HUB.config.pulse_n_waveforms,
-                                     step=100).classes("w-28 num")
-            pc_store = ui.switch("store raw waveforms", value=True)
+                # ----- (legacy SiPM context / Output cards removed —
+                #        now lives in the horizontal strip above) -----
+                pass  # placeholder so block isn't empty when no other cards exist
 
-            async def run_pulse():
-                if HUB.elec is None or HUB.dig is None:
-                    log_msg("b2987 or digitizer not connected"); return
-                ctrl = getattr(HUB.dig, "_ctrl", None)
-                if ctrl is None:
-                    log_msg("digitizer backend has no controller"); return
-                bright = (pc_illum.value == "bright")
-                if bright and HUB.ks33500b is None:
-                    log_msg("Keysight 33500B not connected — bright needs AWG")
-                    return
-                if not await _prep_position(bright=bright): return
+                # ----- MEASUREMENT PROCEDURE CARD with sub-tabs -----
+                with ui.card().classes("card-l2"):
+                    ui.html('<p class="eyebrow">Measurement procedure</p>')
 
-                ch  = max(0, min(63, int(pc_ch.value)))
-                thr = int(pc_thr.value)
-                n   = int(pc_n.value)
-                store = bool(pc_store.value)
-                bias = float(pc_bias.value)
-                # Resolve the trigger set.  The aux channel (if enabled)
-                # is added so the VX2740 fires on ANY of the listed
-                # channels crossing its per-channel threshold; both
-                # channels are read out so the analyst can correlate.
-                aux_ch  = int(pc_aux_ch.value)  if pc_aux_use.value else None
-                aux_thr = int(pc_aux_thr.value) if pc_aux_use.value else None
-                sipm_chs = [ch]
-                thresholds = {ch: thr}
-                if aux_ch is not None and aux_ch != ch:
-                    sipm_chs.append(aux_ch)
-                    thresholds[aux_ch] = aux_thr
+                    # ===== Sub-tab strip =====
+                    with ui.row().classes("mtabs w-full"):
+                        tab_iv    = ui.button("iv sweep") \
+                            .props("flat dense no-caps").classes("mtab is-active")
+                        tab_pulse = ui.button("pulse counting") \
+                            .props("flat dense no-caps").classes("mtab")
+                        tab_scan  = ui.button("1-d scan") \
+                            .props("flat dense no-caps").classes("mtab")
 
-                sipm_label = (int(sipm_in.value) if sipm_use.value
-                              else "anon")
-                aux_desc = (f" + trig ch{aux_ch}@{aux_thr}"
-                            if aux_ch is not None else "")
-                log_msg(f"PULSE sipm={sipm_label} {pc_illum.value} "
-                        f"bias={bias:.2f} ch{ch} thr={thr}{aux_desc} "
-                        f"N={n} store={store}")
-                set_activity("L2 pulse",
-                             f"sipm {sipm_label} · {pc_illum.value} "
-                             f"· ch{ch}{aux_desc} · N={n}")
+                    panel_iv    = ui.element("div").classes("mpanel is-active")
+                    panel_pulse = ui.element("div").classes("mpanel")
+                    panel_scan  = ui.element("div").classes("mpanel")
 
-                def _run_acq():
-                    if bright:
-                        _awg_pulse_on(1,
-                                       HUB.config.led_frequency_hz,
-                                       HUB.config.led_amplitude_v,
-                                       HUB.config.led_offset_v,
-                                       HUB.config.led_pulse_width)
-                    try:
-                        P.set_bias(HUB.elec, bias, settle_s=0.3)
-                        ctrl.configure_record_window(pre_us=float(pc_pre.value),
-                                                     post_us=float(pc_post.value))
-                        ctrl.configure_channels(
-                            sipm_channels=sipm_chs,
-                            thresholds=thresholds,
-                            threshold_mode="per_channel",
-                            include_pmt=False,
-                        )
-                        ctrl.configure_trigger(mode="self")
-                        return ctrl.run(n_waveforms=n, batch_size=min(1000, n),
-                                         store_waveforms=store, timeout_s=60.0)
-                    finally:
-                        if bright: _awg_off(1)
-                        try: P.bias_off(HUB.elec)
-                        except Exception: pass
-                try:
-                    note_bias(v_set=bias, output_on=True)
-                    result = await _run_in_thread(_run_acq)
-                    log_msg(f"  done: n_waveforms={result.n_waveforms} "
-                            f"channels={result.channel_ids}")
-                    # Charge spectrum overlays dark/bright; the waveform
-                    # viewer scrolls the capture channel's stored frames.
-                    chg_slot = "bright" if bright else "dark"
-                    _plot("charge_set", chg_slot, result, ch)
-                    _plot("wave_set", result, ch, chg_slot,
-                          float(pc_pre.value))
-                    try:
-                        p = MSTORE.save_l2_pulse_run(
-                            result,
-                            temperature_K       = float(temp_in.value),
-                            illuminated         = bright,
-                            bias_v              = bias,
-                            capture_ch          = ch,
-                            capture_thr_adc     = thr,
-                            aux_trigger_ch      = aux_ch,
-                            aux_trigger_thr_adc = aux_thr,
-                            **_opt_kwargs(),
-                        )
-                        log_msg(f"  saved: {p}")
-                    except Exception as e:
-                        log_msg(f"  SAVE FAIL: {type(e).__name__}: {e}")
-                except Exception as e:
-                    log_msg(f"  PULSE FAIL: {type(e).__name__}: {e}")
-                finally:
-                    note_bias(v_set=0.0, output_on=False)
-                    clear_activity()
-            ui.button("run pulse", on_click=run_pulse).props("color=primary")
-
-        # ==============================================================
-        # CARD 4 — Scan (X or Y, with VUV / Laser illumination on ks33500b)
-        # ==============================================================
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>scan</h2>")
-            ui.label(
-                "Hold SiPM at fixed bias and sweep one stage axis around "
-                "the center; at each point: move → de-energize → record "
-                "→ re-energize → next.  Bias source: B2987.  AWG (33500B): "
-                "ch1 for VUV beam, ch2 for Laser."
-            ).classes("text-xs text-gray-400")
-            with ui.row().classes("gap-2 items-end"):
-                scan_axis = ui.toggle({"x": "X", "y": "Y"},
-                                       value="x").props("dense")
-                scan_meter = ui.select(
-                    {"k6485": "K6485", "b2987": "B2987"},
-                    value="k6485", label="meter").classes("w-32")
-                scan_light = ui.toggle(
-                    {"vuv":   "VUV beam (ch1)",
-                     "laser": "Laser (ch2)"},
-                    value="vuv").props("dense")
-            with ui.row().classes("gap-2 items-end"):
-                scan_bias  = ui.number(label="bias (V)",
-                                        value=HUB.config.pulse_bias_v,
-                                        step=0.1).classes("w-24 num")
-                scan_start = ui.number(label="start (mm)", value=-7.5,
-                                        step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                scan_stop  = ui.number(label="stop (mm)", value=7.5,
-                                        step=0.1, format="%.3f") \
-                    .classes("w-24 num")
-                scan_step  = ui.number(label="step (mm)", value=0.5,
-                                        step=0.01, format="%.3f") \
-                    .classes("w-24 num")
-                scan_npt   = ui.number(label="N / pt", value=5,
-                                        step=1).classes("w-20 num")
-                scan_settle = ui.number(label="settle (s)", value=0.1,
-                                         step=0.01, format="%.2f") \
-                    .classes("w-24 num")
-            # If Location is enabled on the SiPM card, this button fills
-            # start/stop with center ± 7.5 mm (= ±0.75 cm) along the
-            # currently-selected axis.  Per the user's spec: "If I enter
-            # a location, then scan x and scan y should be centered on
-            # that location, running from -0.75 cm to 0.75."
-            def _fill_range_from_center():
-                if not loc_use.value:
-                    log_msg("scan range: Location switch is off — enable it "
-                            "(or just edit start/stop directly)")
-                    return
-                center = (float(cx_in.value)
-                          if str(scan_axis.value) == "x"
-                          else float(cy_in.value))
-                scan_start.value = center - 7.5
-                scan_stop.value  = center + 7.5
-                log_msg(f"scan range set to {scan_start.value:+.3f} "
-                        f"→ {scan_stop.value:+.3f} mm "
-                        f"({str(scan_axis.value).upper()}-axis)")
-            ui.button("use ±0.75 cm from center",
-                       on_click=_fill_range_from_center) \
-                .props("dense flat")
-            # AWG params for whichever light mode is active.  Defaults to
-            # the LED config; user can override per scan.
-            with ui.row().classes("gap-2 items-end"):
-                scan_freq  = ui.number(label="freq (Hz)",
-                                        value=HUB.config.led_frequency_hz,
-                                        step=10.0,
-                                        format="%.1f").classes("w-28 num")
-                scan_amp   = ui.number(label="amp (Vpp)",
-                                        value=HUB.config.led_amplitude_v,
-                                        step=0.1).classes("w-24 num")
-                scan_offs  = ui.number(label="offset (V)",
-                                        value=HUB.config.led_offset_v,
-                                        step=0.1).classes("w-24 num")
-                scan_width = ui.number(label="width (s)",
-                                        value=HUB.config.led_pulse_width,
-                                        step=1e-7,
-                                        format="%.9f").classes("w-32 num")
-            scan_status = ui.label("idle").classes("text-xs text-gray-400")
-
-            async def run_scan():
-                # Stage is mandatory (we move every point).  MUX is only
-                # required if the operator turned it on in the SiPM card.
-                if HUB.elec is None or HUB.stage is None:
-                    log_msg("b2987 or stage not connected"); return
-                if mux_use.value and HUB.mux is None:
-                    log_msg("MUX enabled but mux not connected"); return
-                meter = str(scan_meter.value or "k6485")
-                if meter == "k6485" and HUB.k6485 is None:
-                    log_msg("K6485 not connected"); return
-                if HUB.ks33500b is None:
-                    log_msg("Keysight 33500B not connected — scan needs AWG")
-                    return
-                # Light → AWG channel
-                ks_ch = 1 if str(scan_light.value) == "vuv" else 2
-
-                # MUX select only if enabled.  Scan does its own stage
-                # moves so we skip the stage move here even when Location
-                # is enabled — the per-point loop below will visit
-                # (center_other, position_along_axis) starting from the
-                # first scan point.
-                if mux_use.value:
-                    try:
-                        await _run_in_thread(P.select_channel, HUB.mux,
-                                              int(mux_in.value))
-                    except Exception as e:
-                        log_msg(f"  MUX FAIL: {type(e).__name__}: {e}"); return
-
-                import numpy as np
-                positions = np.arange(
-                    float(scan_start.value),
-                    float(scan_stop.value) + float(scan_step.value) * 0.5,
-                    float(scan_step.value),
-                ).astype(float)
-                axis = str(scan_axis.value)
-                # Resolve the "other axis" position.  If Location is on,
-                # use the operator's center.  If off, default to 0 mm —
-                # the scan still runs along the selected axis, just at
-                # (0, pos_y) or (pos_x, 0).
-                cx = float(cx_in.value) if loc_use.value else 0.0
-                cy = float(cy_in.value) if loc_use.value else 0.0
-                bias = float(scan_bias.value)
-                npt  = int(scan_npt.value or 1)
-                stl  = float(scan_settle.value or 0.0)
-                light_mode = "vuv_beam" if str(scan_light.value) == "vuv" else "laser"
-                sipm_label = (int(sipm_in.value) if sipm_use.value
-                              else "anon")
-                log_msg(f"SCAN {axis} sipm={sipm_label} "
-                        f"meter={meter} light={light_mode} "
-                        f"bias={bias:.2f} {len(positions)} pts × N={npt}")
-                set_activity("L2 scan",
-                             f"sipm {sipm_label} · {axis}-axis · "
-                             f"{len(positions)} pts · {light_mode}")
-
-                means: list[float] = []
-                stds:  list[float] = []
-                raws:  list[float] = []
-                _plot("scan_begin", axis)   # replace this axis, keep the other
-                try:
-                    await _run_in_thread(
-                        _awg_pulse_on, ks_ch,
-                        float(scan_freq.value),
-                        float(scan_amp.value),
-                        float(scan_offs.value),
-                        float(scan_width.value),
-                    )
-                    await _run_in_thread(P.set_bias, HUB.elec, bias,
-                                          0.3)
-                    note_bias(v_set=bias, output_on=True)
-
-                    for i, pos in enumerate(positions):
-                        if axis == "x":
-                            x_target, y_target = float(pos), cy
+                    def _show_proc(which: str):
+                        for p in (panel_iv, panel_pulse, panel_scan):
+                            p.classes(remove="is-active")
+                        for b in (tab_iv, tab_pulse, tab_scan):
+                            b.classes(remove="is-active")
+                        if which == "iv":
+                            panel_iv.classes(add="is-active")
+                            tab_iv.classes(add="is-active")
+                        elif which == "pulse":
+                            panel_pulse.classes(add="is-active")
+                            tab_pulse.classes(add="is-active")
                         else:
-                            x_target, y_target = cx, float(pos)
-                        scan_status.text = (f"pt {i+1}/{len(positions)}: "
-                                            f"({x_target:.3f}, "
-                                            f"{y_target:.3f}) mm")
-                        # move → de-energize after; re-energizes
-                        # automatically on the next move_to()
-                        await _run_in_thread(
-                            P.move_stage, HUB.stage,
-                            x_target, y_target,
-                            True,  # deenergize_after
+                            panel_scan.classes(add="is-active")
+                            tab_scan.classes(add="is-active")
+                    tab_iv.on_click(lambda: _show_proc("iv"))
+                    tab_pulse.on_click(lambda: _show_proc("pulse"))
+                    tab_scan.on_click(lambda: _show_proc("scan"))
+
+                    # ===== Common helpers used by the three panels =====
+                    def _opt_kwargs() -> dict:
+                        return {
+                            "sipm_id":     int(sipm_in.value) if sipm_use.value else None,
+                            "mux_channel": int(mux_in.value)  if mux_use.value  else None,
+                            "center_x_mm": float(cx_in.value) if loc_use.value  else None,
+                            "center_y_mm": float(cy_in.value) if loc_use.value  else None,
+                            "dark_x_mm":   float(dx_in.value) if dark_loc_use.value else None,
+                            "dark_y_mm":   float(dy_in.value) if dark_loc_use.value else None,
+                        }
+
+                    def _out_kwargs() -> dict:
+                        return {
+                            "folder":   (out_folder.value or "").strip() or None,
+                            "basename": None,
+                        }
+
+                    async def _prep_position(bright: bool = False) -> bool:
+                        if mux_use.value:
+                            if HUB.mux is None:
+                                log_msg("MUX enabled but mux not connected — abort")
+                                return False
+                            try:
+                                await _run_in_thread(
+                                    P.select_channel, HUB.mux,
+                                    int(mux_in.value))
+                            except Exception as e:
+                                log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
+                                return False
+                        if bright and loc_use.value:
+                            target_x, target_y = float(cx_in.value), float(cy_in.value)
+                            tag = "bright"
+                        elif (not bright) and dark_loc_use.value:
+                            target_x, target_y = float(dx_in.value), float(dy_in.value)
+                            tag = "dark"
+                        else:
+                            return True
+                        if HUB.stage is None:
+                            log_msg(f"{tag.title()} location enabled but "
+                                    "stage not connected — abort")
+                            return False
+                        try:
+                            await _run_in_thread(
+                                P.move_stage, HUB.stage,
+                                target_x, target_y,
+                                bool(HUB.config.stage_deenergize),
+                            )
+                        except Exception as e:
+                            log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
+                            return False
+                        return True
+
+                    # ============= IV PANEL =============
+                    with panel_iv:
+                        with ui.element("div").classes("pillrow"):
+                            ui.html('<span class="pl">condition</span>')
+                            with ui.element("div").classes("pills"):
+                                iv_illum = ui.toggle(
+                                    {"dark": "dark", "bright": "bright"},
+                                    value="dark",
+                                ).props("dense unelevated")
+                        with ui.element("div").classes("fld") \
+                                .style("margin-bottom:10px"):
+                            ui.html('<label class="fld-lbl">Current meter</label>')
+                            iv_meter = ui.select(
+                                {"k6485": "K6485 picoammeter",
+                                 "b2987": "B2987 (built-in ammeter)"},
+                                value="k6485",
+                            ).props("dense filled hide-bottom-space")
+                        with ui.element("div").classes("g2"):
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Start</label>')
+                                iv_start = ui.number(
+                                    value=HUB.config.iv_voltage_start,
+                                    step=0.1, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="V"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Stop</label>')
+                                iv_stop = ui.number(
+                                    value=HUB.config.iv_voltage_stop,
+                                    step=0.1, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="V"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Step</label>')
+                                iv_step = ui.number(
+                                    value=HUB.config.iv_voltage_step,
+                                    step=0.01, format="%.3f") \
+                                    .props('dense filled hide-bottom-space suffix="V"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">N / V</label>')
+                                iv_npt = ui.number(
+                                    value=HUB.config.iv_n_per_point,
+                                    step=1, format="%d") \
+                                    .props('dense filled hide-bottom-space')
+                        iv_status = ui.html(
+                            '<span class="statuspill">idle</span>'
                         )
-                        if stl > 0:
-                            await asyncio.sleep(stl)
-                        # Sample N readings
-                        def _take(n_=npt, m_=meter):
-                            if m_ == "k6485":
-                                arr, _ts = HUB.k6485.read_n(n_, 0.0)
-                                return np.asarray(arr, dtype=np.float64)
+                        iv_status.set_visibility(False)
+
+                        async def run_iv():
+                            if HUB.elec is None:
+                                log_msg("b2987 not connected"); return
+                            meter = str(iv_meter.value or "k6485")
+                            if meter == "k6485" and HUB.k6485 is None:
+                                log_msg("K6485 not connected"); return
+                            bright = (iv_illum.value == "bright")
+                            if bright and HUB.ks33500b is None:
+                                log_msg("Keysight 33500B not connected — "
+                                        "bright needs AWG"); return
+                            if not await _prep_position(bright=bright): return
+
+                            import numpy as np
+                            voltages = np.arange(
+                                float(iv_start.value),
+                                float(iv_stop.value) + float(iv_step.value) * 0.5,
+                                float(iv_step.value),
+                            ).tolist()
+                            log_msg(f"IV sipm={int(sipm_in.value)} "
+                                    f"{iv_illum.value} {meter} "
+                                    f"{len(voltages)} V, N={int(iv_npt.value)}/V")
+                            set_activity(
+                                "L2 IV",
+                                f"sipm {int(sipm_in.value)} · "
+                                f"{iv_illum.value} · {meter} · "
+                                f"{len(voltages)} V")
+                            iv_slot = "bright" if bright else "dark"
+                            iv_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">running…</span>'
+                            )
+                            _plot("iv_begin", iv_slot)
+                            try:
+                                if bright:
+                                    await _run_in_thread(
+                                        _awg_pulse_on, 1,
+                                        HUB.config.led_frequency_hz,
+                                        HUB.config.led_amplitude_v,
+                                        HUB.config.led_offset_v,
+                                        HUB.config.led_pulse_width,
+                                    )
+                                delay = float(getattr(
+                                    HUB.config, "iv_delay_s", 0.05))
+                                n_total = len(voltages)
+                                def _iv_prog(i, n, v, mean_i, std_i):
+                                    line = (f"  [{i}/{n}] v={v:+.3f} V  "
+                                            f"I={mean_i:+.3e} A "
+                                            f"± {std_i:.2e}")
+                                    try: log_msg(line)
+                                    except Exception: pass
+                                    try: print(f"[L2 IV] {line}", flush=True)
+                                    except Exception: pass
+                                    _plot("iv_point", iv_slot, v, mean_i)
+                                if meter == "k6485":
+                                    result = await _run_in_thread(
+                                        lambda: P.iv_sweep_external_meter(
+                                            HUB.elec, HUB.k6485, voltages,
+                                            n_per_voltage=int(iv_npt.value),
+                                            delay_s=delay,
+                                            progress_cb=_iv_prog,
+                                        )
+                                    )
+                                else:
+                                    print(f"[L2 IV] b2987 sweep starting "
+                                          f"({n_total} voltages, "
+                                          f"{int(iv_npt.value)} pts/V)",
+                                          flush=True)
+                                    log_msg(f"  b2987 sweep starting "
+                                            f"({n_total} V)")
+                                    result = await _run_in_thread(
+                                        P.iv_sweep, HUB.elec, voltages,
+                                        int(iv_npt.value), delay,
+                                    )
+                                    for _v, _i in zip(result.avg_source_v,
+                                                      result.avg_current_a):
+                                        _plot("iv_point", iv_slot, _v, _i)
+                                    _plot("iv_redraw")
+                                log_msg(f"  done: I({result.avg_source_v[-1]:.2f} V) = "
+                                        f"{result.avg_current_a[-1]:.3e} A")
+                                note_bias(v_set=result.avg_source_v[-1],
+                                          i_meas=result.avg_current_a[-1],
+                                          output_on=False)
+                                try:
+                                    p = MSTORE.save_l2_iv_sweep(
+                                        result,
+                                        temperature_K=float(temp_in.value),
+                                        illuminated=bright,
+                                        meter=meter,
+                                        **_opt_kwargs(),
+                                        **_out_kwargs(),
+                                    )
+                                    log_msg(f"  saved: {p}")
+                                except Exception as e:
+                                    log_msg(f"  SAVE FAIL: "
+                                            f"{type(e).__name__}: {e}")
+                                iv_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--ok)">done · '
+                                    f'{iv_illum.value} · '
+                                    f'{len(result.avg_source_v)} pts</span>'
+                                )
+                            except Exception as e:
+                                log_msg(f"  IV FAIL: "
+                                        f"{type(e).__name__}: {e}")
+                                iv_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--bad)">'
+                                    f'failed: {type(e).__name__}</span>'
+                                )
+                            finally:
+                                if bright:
+                                    await _run_in_thread(_awg_off, 1)
+                                try: await _run_in_thread(P.bias_off, HUB.elec)
+                                except Exception: pass
+                                clear_activity()
+
+                        with ui.element("div").classes("runrow"):
+                            ui.button("▶ run iv", on_click=run_iv) \
+                                .props("color=primary")
+                            ui.html('').classes("statuspill"). \
+                                set_visibility(False)
+                            # Attach the status pill we wired above as the
+                            # right-aligned indicator.
+                            iv_status_holder = ui.html("")
+                            iv_status_holder.bind_content_from(
+                                iv_status, "content")
+
+                    # ============= PULSE PANEL =============
+                    with panel_pulse:
+                        with ui.element("div").classes("pillrow"):
+                            ui.html('<span class="pl">condition</span>')
+                            with ui.element("div").classes("pills"):
+                                pc_illum = ui.toggle(
+                                    {"dark": "dark", "bright": "bright"},
+                                    value="dark",
+                                ).props("dense unelevated")
+                        # Mode: single bias (one acquisition) vs bias sweep
+                        # (acquire N waveforms at each bias across a range —
+                        # the GUI form of the bench ov_scan).
+                        with ui.element("div").classes("pillrow"):
+                            ui.html('<span class="pl">mode</span>')
+                            with ui.element("div").classes("pills"):
+                                pc_mode = ui.toggle(
+                                    {"single": "single bias",
+                                     "sweep":  "bias sweep"},
+                                    value="single",
+                                ).props("dense unelevated")
+
+                        # Capture channel + threshold — common to both modes.
+                        with ui.element("div").classes("g3"):
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Capture ch</label>')
+                                pc_ch = ui.number(
+                                    value=0, step=1, min=0, max=63,
+                                    format="%d") \
+                                    .props('dense filled hide-bottom-space')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Self-trig thr</label>')
+                                pc_thr = ui.number(
+                                    value=50, step=10, format="%d") \
+                                    .props('dense filled hide-bottom-space suffix="ADC"')
+
+                        # Single-bias field (visible in "single" mode).
+                        single_block = ui.element("div") \
+                            .style("margin-top:10px")
+                        with single_block:
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Bias</label>')
+                                pc_bias = ui.number(
+                                    value=HUB.config.pulse_bias_v,
+                                    step=0.1, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="V"')
+
+                        # Bias-sweep range (visible in "sweep" mode); same
+                        # start/stop/step semantics as the IV sweep.
+                        sweep_block = ui.element("div") \
+                            .style("margin-top:10px")
+                        with sweep_block:
+                            with ui.element("div").classes("g3"):
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Start</label>')
+                                    pcs_start = ui.number(
+                                        value=HUB.config.iv_voltage_start,
+                                        step=0.1, format="%.2f") \
+                                        .props('dense filled hide-bottom-space suffix="V"')
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Stop</label>')
+                                    pcs_stop = ui.number(
+                                        value=HUB.config.iv_voltage_stop,
+                                        step=0.1, format="%.2f") \
+                                        .props('dense filled hide-bottom-space suffix="V"')
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Step</label>')
+                                    pcs_step = ui.number(
+                                        value=HUB.config.iv_voltage_step,
+                                        step=0.01, format="%.3f") \
+                                        .props('dense filled hide-bottom-space suffix="V"')
+                        sweep_block.set_visibility(False)
+
+                        with ui.row().classes("tgl-row") \
+                                .style("margin-bottom:10px"):
+                            pc_aux_use = ui.switch(value=False) \
+                                .props("dense color=primary")
+                            ui.html('Trigger on another channel')
+                        aux_block = ui.element("div").classes("aux is-off")
+                        with aux_block:
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Aux ch</label>')
+                                pc_aux_ch = ui.number(
+                                    value=4, step=1, min=0, max=63,
+                                    format="%d") \
+                                    .props('dense filled hide-bottom-space')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Aux thr</label>')
+                                pc_aux_thr = ui.number(
+                                    value=50, step=10, format="%d") \
+                                    .props('dense filled hide-bottom-space suffix="ADC"')
+                        def _on_aux_toggle(_e=None):
+                            if bool(pc_aux_use.value):
+                                aux_block.classes(remove="is-off")
                             else:
-                                return np.array([HUB.elec.measure_current()
-                                                  for _ in range(n_)],
-                                                 dtype=np.float64)
-                        arr = await _run_in_thread(_take)
-                        means.append(float(np.mean(arr)))
-                        stds.append(float(np.std(arr, ddof=1))
-                                     if len(arr) > 1 else 0.0)
-                        raws.extend(arr.tolist())
-                        _plot("scan_point", axis, float(pos), means[-1])
-                        log_msg(f"    {axis}={pos:+.3f} mm  "
-                                f"I={means[-1]:+.3e} A ± {stds[-1]:.2e}")
-                    scan_status.text = (f"done — {len(positions)} pts; "
-                                        f"min |I|={min(abs(m) for m in means):.2e}, "
-                                        f"max |I|={max(abs(m) for m in means):.2e}")
-                    log_msg("  scan done")
-                    try:
-                        p = MSTORE.save_l2_scan(
-                            positions_mm  = positions,
-                            mean_current_a= np.array(means, dtype=np.float64),
-                            std_current_a = np.array(stds,  dtype=np.float64),
-                            raw_current_a = np.array(raws,  dtype=np.float64),
-                            temperature_K = float(temp_in.value),
-                            axis          = axis,
-                            bias_v        = bias,
-                            meter         = meter,
-                            light_mode    = light_mode,
-                            light_freq_hz = float(scan_freq.value),
-                            light_amp_v   = float(scan_amp.value),
-                            light_width_s = float(scan_width.value),
-                            n_per_point   = npt,
-                            settle_s      = stl,
-                            **_opt_kwargs(),
+                                aux_block.classes(add="is-off")
+                        pc_aux_use.on_value_change(_on_aux_toggle)
+
+                        with ui.element("div").classes("g3"):
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Pre</label>')
+                                pc_pre = ui.number(
+                                    value=HUB.config.pulse_pre_us,
+                                    step=0.5, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="µs"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Post</label>')
+                                pc_post = ui.number(
+                                    value=HUB.config.pulse_post_us,
+                                    step=0.5, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="µs"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">N waveforms</label>')
+                                pc_n = ui.number(
+                                    value=HUB.config.pulse_n_waveforms,
+                                    step=100, format="%d") \
+                                    .props('dense filled hide-bottom-space suffix="#"')
+
+                        with ui.row().classes("tgl-row") \
+                                .style("margin-bottom:12px"):
+                            pc_store = ui.switch(value=True) \
+                                .props("dense color=primary")
+                            ui.html('Store raw waveforms')
+
+                        pulse_status = ui.html(
+                            '<span class="statuspill">idle</span>'
                         )
-                        log_msg(f"  saved: {p}")
-                    except Exception as e:
-                        log_msg(f"  SAVE FAIL: {type(e).__name__}: {e}")
-                except Exception as e:
-                    log_msg(f"  SCAN FAIL: {type(e).__name__}: {e}")
-                    scan_status.text = f"FAIL: {type(e).__name__}: {e}"
-                finally:
-                    await _run_in_thread(_awg_off, ks_ch)
-                    try: await _run_in_thread(P.bias_off, HUB.elec)
-                    except Exception: pass
-                    note_bias(v_set=0.0, output_on=False)
-                    clear_activity()
+                        pulse_status.set_visibility(False)
 
-            ui.button("run scan", on_click=run_scan).props("color=primary")
+                        async def run_pulse():
+                            if HUB.elec is None or HUB.dig is None:
+                                log_msg("b2987 or digitizer not connected")
+                                return
+                            ctrl = getattr(HUB.dig, "_ctrl", None)
+                            if ctrl is None:
+                                log_msg("digitizer backend has no controller")
+                                return
+                            bright = (pc_illum.value == "bright")
+                            if bright and HUB.ks33500b is None:
+                                log_msg("Keysight 33500B not connected — "
+                                        "bright needs AWG"); return
+                            if not await _prep_position(bright=bright): return
 
-    # ==================================================================
-    # RIGHT-HAND LIVE-PLOT COLUMN
-    # Built after the control cards so the run handlers above can stream
-    # into it via PLOTS[...].  Registers iv/scan/charge/wave callbacks.
-    # ==================================================================
-    with _right:
-        _build_l2_plots(PLOTS, _plot_dirty)
+                            ch  = max(0, min(63, int(pc_ch.value)))
+                            thr = int(pc_thr.value)
+                            n   = int(pc_n.value)
+                            store = bool(pc_store.value)
+                            bias = float(pc_bias.value)
+                            aux_ch  = int(pc_aux_ch.value)  if pc_aux_use.value else None
+                            aux_thr = int(pc_aux_thr.value) if pc_aux_use.value else None
+                            sipm_chs = [ch]
+                            thresholds = {ch: thr}
+                            if aux_ch is not None and aux_ch != ch:
+                                sipm_chs.append(aux_ch)
+                                thresholds[aux_ch] = aux_thr
+                            sipm_label = (int(sipm_in.value) if sipm_use.value
+                                          else "anon")
+                            aux_desc = (f" + trig ch{aux_ch}@{aux_thr}"
+                                        if aux_ch is not None else "")
+                            log_msg(f"PULSE sipm={sipm_label} "
+                                    f"{pc_illum.value} bias={bias:.2f} "
+                                    f"ch{ch} thr={thr}{aux_desc} N={n} "
+                                    f"store={store}")
+                            set_activity(
+                                "L2 pulse",
+                                f"sipm {sipm_label} · {pc_illum.value} "
+                                f"· ch{ch}{aux_desc} · N={n}")
+                            pulse_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">running…</span>'
+                            )
 
+                            def _run_acq():
+                                if bright:
+                                    _awg_pulse_on(1,
+                                                   HUB.config.led_frequency_hz,
+                                                   HUB.config.led_amplitude_v,
+                                                   HUB.config.led_offset_v,
+                                                   HUB.config.led_pulse_width)
+                                try:
+                                    P.set_bias(HUB.elec, bias, settle_s=0.3)
+                                    ctrl.configure_record_window(
+                                        pre_us=float(pc_pre.value),
+                                        post_us=float(pc_post.value))
+                                    ctrl.configure_channels(
+                                        sipm_channels=sipm_chs,
+                                        thresholds=thresholds,
+                                        threshold_mode="per_channel",
+                                        include_pmt=False,
+                                    )
+                                    ctrl.configure_trigger(mode="self")
+                                    return ctrl.run(
+                                        n_waveforms=n,
+                                        batch_size=min(1000, n),
+                                        store_waveforms=store,
+                                        timeout_s=60.0,
+                                    )
+                                finally:
+                                    if bright: _awg_off(1)
+                                    try: P.bias_off(HUB.elec)
+                                    except Exception: pass
+                            try:
+                                note_bias(v_set=bias, output_on=True)
+                                result = await _run_in_thread(_run_acq)
+                                log_msg(f"  done: n_waveforms="
+                                        f"{result.n_waveforms} "
+                                        f"channels={result.channel_ids}")
+                                chg_slot = "bright" if bright else "dark"
+                                _plot("charge_set", chg_slot, result, ch)
+                                _plot("wave_set", result, ch, chg_slot,
+                                      float(pc_pre.value))
+                                try:
+                                    p = MSTORE.save_l2_pulse_run(
+                                        result,
+                                        temperature_K=float(temp_in.value),
+                                        illuminated=bright,
+                                        bias_v=bias,
+                                        capture_ch=ch,
+                                        capture_thr_adc=thr,
+                                        aux_trigger_ch=aux_ch,
+                                        aux_trigger_thr_adc=aux_thr,
+                                        **_opt_kwargs(),
+                                        **_out_kwargs(),
+                                    )
+                                    log_msg(f"  saved: {p}")
+                                except Exception as e:
+                                    log_msg(f"  SAVE FAIL: "
+                                            f"{type(e).__name__}: {e}")
+                                pulse_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--ok)">done · '
+                                    f'{pc_illum.value} · '
+                                    f'{result.n_waveforms} wfs</span>'
+                                )
+                            except Exception as e:
+                                log_msg(f"  PULSE FAIL: "
+                                        f"{type(e).__name__}: {e}")
+                                pulse_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--bad)">'
+                                    f'failed: {type(e).__name__}</span>'
+                                )
+                            finally:
+                                note_bias(v_set=0.0, output_on=False)
+                                clear_activity()
 
-# ===========================================================================
-# Electrometer — embedded b2987 manual-control panel
-# ===========================================================================
+                        async def run_pulse_sweep():
+                            """Acquire N waveforms at each bias across a
+                            start/stop/step range (GUI form of ov_scan).
+                            Streams mean amplitude + trigger rate vs bias
+                            into the pulse-sweep plot, and the per-bias
+                            charge spectrum / waveforms into their views."""
+                            if HUB.elec is None or HUB.dig is None:
+                                log_msg("b2987 or digitizer not connected")
+                                return
+                            ctrl = getattr(HUB.dig, "_ctrl", None)
+                            if ctrl is None:
+                                log_msg("digitizer backend has no controller")
+                                return
+                            bright = (pc_illum.value == "bright")
+                            if bright and HUB.ks33500b is None:
+                                log_msg("Keysight 33500B not connected — "
+                                        "bright needs AWG"); return
+                            if not await _prep_position(bright=bright): return
+
+                            import numpy as np
+                            start = float(pcs_start.value)
+                            stop  = float(pcs_stop.value)
+                            step  = float(pcs_step.value)
+                            if step == 0:
+                                log_msg("pulse sweep: step is 0 — abort"); return
+                            voltages = np.arange(
+                                start, stop + step * 0.5, step,
+                            ).astype(float).tolist()
+                            if not voltages:
+                                log_msg("pulse sweep: empty bias range"); return
+
+                            ch    = max(0, min(63, int(pc_ch.value)))
+                            thr   = int(pc_thr.value)
+                            n     = int(pc_n.value)
+                            store = bool(pc_store.value)
+                            aux_ch  = int(pc_aux_ch.value)  if pc_aux_use.value else None
+                            aux_thr = int(pc_aux_thr.value) if pc_aux_use.value else None
+                            sipm_chs = [ch]; thresholds = {ch: thr}
+                            if aux_ch is not None and aux_ch != ch:
+                                sipm_chs.append(aux_ch)
+                                thresholds[aux_ch] = aux_thr
+                            sipm_label = (int(sipm_in.value) if sipm_use.value
+                                          else "anon")
+                            aux_desc = (f" + trig ch{aux_ch}@{aux_thr}"
+                                        if aux_ch is not None else "")
+                            log_msg(f"PULSE SWEEP sipm={sipm_label} "
+                                    f"{pc_illum.value} {len(voltages)} bias "
+                                    f"{start:.2f}→{stop:.2f} V ch{ch} thr={thr}"
+                                    f"{aux_desc} N={n}/bias store={store}")
+                            set_activity(
+                                "L2 pulse sweep",
+                                f"sipm {sipm_label} · {pc_illum.value} · "
+                                f"{len(voltages)} bias · ch{ch}")
+                            pulse_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">running…</span>'
+                            )
+
+                            chg_slot = "bright" if bright else "dark"
+                            _plot("psweep_begin")
+
+                            biases: list = []; means: list = []
+                            stds:   list = []; npuls: list = []
+                            rates:  list = []; nwfs:  list = []
+                            per_amps: list = []; per_ts: list = []
+
+                            def _cfg():
+                                ctrl.configure_record_window(
+                                    pre_us=float(pc_pre.value),
+                                    post_us=float(pc_post.value))
+                                ctrl.configure_channels(
+                                    sipm_channels=sipm_chs,
+                                    thresholds=thresholds,
+                                    threshold_mode="per_channel",
+                                    include_pmt=False)
+                                ctrl.configure_trigger(mode="self")
+                            try:
+                                if bright:
+                                    await _run_in_thread(
+                                        _awg_pulse_on, 1,
+                                        HUB.config.led_frequency_hz,
+                                        HUB.config.led_amplitude_v,
+                                        HUB.config.led_offset_v,
+                                        HUB.config.led_pulse_width)
+                                await _run_in_thread(_cfg)
+                                for i, bias in enumerate(voltages):
+                                    pulse_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--warn)">bias '
+                                        f'{i + 1}/{len(voltages)} · '
+                                        f'{bias:.2f} V</span>')
+
+                                    def _acq_one(_b=bias):
+                                        P.set_bias(HUB.elec, _b, settle_s=0.3)
+                                        t0 = time.perf_counter()
+                                        r = ctrl.run(
+                                            n_waveforms=n,
+                                            batch_size=min(1000, n),
+                                            store_waveforms=store,
+                                            timeout_s=60.0)
+                                        return r, (time.perf_counter() - t0)
+
+                                    note_bias(v_set=bias, output_on=True)
+                                    try:
+                                        result, elapsed = await _run_in_thread(
+                                            _acq_one)
+                                    except Exception as e:
+                                        log_msg(f"  bias {bias:.2f} V FAIL: "
+                                                f"{type(e).__name__}: {e}")
+                                        biases.append(bias)
+                                        means.append(float("nan"))
+                                        stds.append(float("nan"))
+                                        npuls.append(0)
+                                        rates.append(float("nan"))
+                                        nwfs.append(0)
+                                        per_amps.append(
+                                            np.array([], dtype=np.float32))
+                                        per_ts.append(
+                                            np.array([], dtype=np.float64))
+                                        continue
+                                    amps = np.asarray(
+                                        result.amplitudes.get(ch, np.array([])),
+                                        dtype=np.float64)
+                                    try:
+                                        ts = np.asarray(
+                                            result.timestamps.get(
+                                                ch, np.array([])),
+                                            dtype=np.float64)
+                                    except Exception:
+                                        ts = np.array([], dtype=np.float64)
+                                    npts = int(len(amps))
+                                    mean = (float(np.mean(amps)) if npts
+                                            else float("nan"))
+                                    std  = (float(np.std(amps, ddof=1))
+                                            if npts > 1 else float("nan"))
+                                    rate = (npts / elapsed if elapsed > 0
+                                            else float("nan"))
+                                    biases.append(bias); means.append(mean)
+                                    stds.append(std); npuls.append(npts)
+                                    rates.append(rate)
+                                    nwfs.append(int(result.n_waveforms))
+                                    per_amps.append(amps.astype(np.float32))
+                                    per_ts.append(ts)
+                                    _plot("psweep_point", bias, mean, rate)
+                                    _plot("charge_set", chg_slot, result, ch)
+                                    if store:
+                                        _plot("wave_set", result, ch,
+                                              f"{chg_slot} {bias:.2f}V",
+                                              float(pc_pre.value))
+                                    log_msg(f"  [{i + 1}/{len(voltages)}] "
+                                            f"bias={bias:.2f} V → {npts} pulses,"
+                                            f" mean={mean:.1f} ADC, "
+                                            f"rate={rate:.1f} Hz")
+                                try:
+                                    p = MSTORE.save_l2_pulse_sweep(
+                                        bias_v=biases, mean_amp_adc=means,
+                                        std_amp_adc=stds, n_pulses=npuls,
+                                        rate_hz=rates, n_waveforms=nwfs,
+                                        per_bias_amplitudes_adc=per_amps,
+                                        per_bias_timestamps_s=per_ts,
+                                        temperature_K=float(temp_in.value),
+                                        illuminated=bright,
+                                        capture_ch=ch, capture_thr_adc=thr,
+                                        aux_trigger_ch=aux_ch,
+                                        aux_trigger_thr_adc=aux_thr,
+                                        **_opt_kwargs(),
+                                        **_out_kwargs())
+                                    log_msg(f"  saved: {p}")
+                                except Exception as e:
+                                    log_msg(f"  SAVE FAIL: "
+                                            f"{type(e).__name__}: {e}")
+                                pulse_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--ok)">done · '
+                                    f'{pc_illum.value} · '
+                                    f'{len(biases)} bias</span>')
+                            except Exception as e:
+                                log_msg(f"  PULSE SWEEP FAIL: "
+                                        f"{type(e).__name__}: {e}")
+                                pulse_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--bad)">'
+                                    f'failed: {type(e).__name__}</span>')
+                            finally:
+                                if bright:
+                                    await _run_in_thread(_awg_off, 1)
+                                try: await _run_in_thread(P.bias_off, HUB.elec)
+                                except Exception: pass
+                                note_bias(v_set=0.0, output_on=False)
+                                clear_activity()
+
+                        async def _run_pulse_dispatch():
+                            if str(pc_mode.value) == "sweep":
+                                await run_pulse_sweep()
+                            else:
+                                await run_pulse()
+
+                        with ui.element("div").classes("runrow"):
+                            run_pulse_btn = ui.button(
+                                "▶ run pulse", on_click=_run_pulse_dispatch) \
+                                .props("color=primary")
+                            pulse_status_holder = ui.html("")
+                            pulse_status_holder.bind_content_from(
+                                pulse_status, "content")
+
+                        def _on_pulse_mode(_e=None):
+                            sweep = str(pc_mode.value) == "sweep"
+                            single_block.set_visibility(not sweep)
+                            sweep_block.set_visibility(sweep)
+                            run_pulse_btn.set_text(
+                                "▶ run pulse sweep" if sweep else "▶ run pulse")
+                        pc_mode.on_value_change(_on_pulse_mode)
+
+                    # ============= SCAN PANEL =============
+                    with panel_scan:
+                        with ui.element("div").classes("pillrow"):
+                            ui.html('<span class="pl">axis</span>')
+                            with ui.element("div").classes("pills"):
+                                scan_axis = ui.toggle(
+                                    {"x": "X", "y": "Y"},
+                                    value="x",
+                                ).props("dense unelevated")
+                            ui.html('<span class="pl" '
+                                    'style="margin-left:8px">source</span>')
+                            with ui.element("div").classes("pills"):
+                                scan_light = ui.toggle(
+                                    {"vuv":   "VUV",
+                                     "laser": "Laser"},
+                                    value="vuv",
+                                ).props("dense unelevated")
+
+                        with ui.element("div").classes("fld") \
+                                .style("margin-bottom:10px"):
+                            ui.html('<label class="fld-lbl">Meter</label>')
+                            scan_meter = ui.select(
+                                {"k6485": "K6485", "b2987": "B2987"},
+                                value="k6485",
+                            ).props("dense filled hide-bottom-space")
+
+                        with ui.element("div").classes("g3"):
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Bias</label>')
+                                scan_bias = ui.number(
+                                    value=HUB.config.pulse_bias_v,
+                                    step=0.1, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="V"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Start</label>')
+                                scan_start = ui.number(
+                                    value=-7.5, step=0.1, format="%.3f") \
+                                    .props('dense filled hide-bottom-space suffix="mm"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Stop</label>')
+                                scan_stop = ui.number(
+                                    value=7.5, step=0.1, format="%.3f") \
+                                    .props('dense filled hide-bottom-space suffix="mm"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Step</label>')
+                                scan_step = ui.number(
+                                    value=0.5, step=0.01, format="%.3f") \
+                                    .props('dense filled hide-bottom-space suffix="mm"')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">N / pt</label>')
+                                scan_npt = ui.number(
+                                    value=5, step=1, format="%d") \
+                                    .props('dense filled hide-bottom-space')
+                            with ui.element("div").classes("fld"):
+                                ui.html('<label class="fld-lbl">Settle</label>')
+                                scan_settle = ui.number(
+                                    value=0.1, step=0.01, format="%.2f") \
+                                    .props('dense filled hide-bottom-space suffix="s"')
+
+                        def _fill_range_from_center():
+                            if not loc_use.value:
+                                log_msg("scan range: Location switch is off")
+                                return
+                            center = (float(cx_in.value)
+                                      if str(scan_axis.value) == "x"
+                                      else float(cy_in.value))
+                            scan_start.value = center - 7.5
+                            scan_stop.value  = center + 7.5
+                            log_msg(f"scan range set to "
+                                    f"{scan_start.value:+.3f} → "
+                                    f"{scan_stop.value:+.3f} mm "
+                                    f"({str(scan_axis.value).upper()}-axis)")
+                        ui.button("use ±0.75 cm from center",
+                                  on_click=_fill_range_from_center) \
+                            .props("flat dense") \
+                            .style("margin-bottom:10px")
+
+                        with ui.element("div").classes("subgroup"):
+                            ui.html('<p class="gt">AWG (33500B) '
+                                    'pulse parameters</p>')
+                            with ui.element("div").classes("g2"):
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Freq</label>')
+                                    scan_freq = ui.number(
+                                        value=HUB.config.led_frequency_hz,
+                                        step=10.0, format="%.1f") \
+                                        .props('dense filled hide-bottom-space suffix="Hz"')
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Amp</label>')
+                                    scan_amp = ui.number(
+                                        value=HUB.config.led_amplitude_v,
+                                        step=0.1, format="%.2f") \
+                                        .props('dense filled hide-bottom-space suffix="Vpp"')
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Offset</label>')
+                                    scan_offs = ui.number(
+                                        value=HUB.config.led_offset_v,
+                                        step=0.1, format="%.2f") \
+                                        .props('dense filled hide-bottom-space suffix="V"')
+                                with ui.element("div").classes("fld"):
+                                    ui.html('<label class="fld-lbl">Width</label>')
+                                    scan_width = ui.number(
+                                        value=HUB.config.led_pulse_width,
+                                        step=1e-7, format="%.9f") \
+                                        .props('dense filled hide-bottom-space suffix="s"')
+
+                        scan_status = ui.html(
+                            '<span class="statuspill">idle</span>'
+                        )
+                        scan_status.set_visibility(False)
+
+                        async def run_scan():
+                            if HUB.elec is None or HUB.stage is None:
+                                log_msg("b2987 or stage not connected"); return
+                            if mux_use.value and HUB.mux is None:
+                                log_msg("MUX enabled but mux not connected")
+                                return
+                            meter = str(scan_meter.value or "k6485")
+                            if meter == "k6485" and HUB.k6485 is None:
+                                log_msg("K6485 not connected"); return
+                            if HUB.ks33500b is None:
+                                log_msg("Keysight 33500B not connected — "
+                                        "scan needs AWG"); return
+                            ks_ch = 1 if str(scan_light.value) == "vuv" else 2
+                            if mux_use.value:
+                                try:
+                                    await _run_in_thread(
+                                        P.select_channel, HUB.mux,
+                                        int(mux_in.value))
+                                except Exception as e:
+                                    log_msg(f"  MUX FAIL: "
+                                            f"{type(e).__name__}: {e}"); return
+
+                            import numpy as np
+                            positions = np.arange(
+                                float(scan_start.value),
+                                float(scan_stop.value) + float(scan_step.value) * 0.5,
+                                float(scan_step.value),
+                            ).astype(float)
+                            axis = str(scan_axis.value)
+                            cx = float(cx_in.value) if loc_use.value else 0.0
+                            cy = float(cy_in.value) if loc_use.value else 0.0
+                            bias = float(scan_bias.value)
+                            npt = int(scan_npt.value or 1)
+                            stl = float(scan_settle.value or 0.0)
+                            light_mode = ("vuv_beam"
+                                          if str(scan_light.value) == "vuv"
+                                          else "laser")
+                            sipm_label = (int(sipm_in.value)
+                                          if sipm_use.value else "anon")
+                            log_msg(f"SCAN {axis} sipm={sipm_label} "
+                                    f"meter={meter} light={light_mode} "
+                                    f"bias={bias:.2f} {len(positions)} "
+                                    f"pts × N={npt}")
+                            set_activity(
+                                "L2 scan",
+                                f"sipm {sipm_label} · {axis}-axis · "
+                                f"{len(positions)} pts · {light_mode}")
+                            scan_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">running…</span>'
+                            )
+
+                            means: list[float] = []
+                            stds:  list[float] = []
+                            raws:  list[float] = []
+                            _plot("scan_begin", axis)
+                            try:
+                                await _run_in_thread(
+                                    _awg_pulse_on, ks_ch,
+                                    float(scan_freq.value),
+                                    float(scan_amp.value),
+                                    float(scan_offs.value),
+                                    float(scan_width.value),
+                                )
+                                await _run_in_thread(
+                                    P.set_bias, HUB.elec, bias, 0.3)
+                                note_bias(v_set=bias, output_on=True)
+                                for i, pos in enumerate(positions):
+                                    if axis == "x":
+                                        x_target, y_target = float(pos), cy
+                                    else:
+                                        x_target, y_target = cx, float(pos)
+                                    scan_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--warn)">'
+                                        f'pt {i+1}/{len(positions)}: '
+                                        f'({x_target:.3f}, '
+                                        f'{y_target:.3f}) mm</span>'
+                                    )
+                                    await _run_in_thread(
+                                        P.move_stage, HUB.stage,
+                                        x_target, y_target,
+                                        True,
+                                    )
+                                    if stl > 0:
+                                        await asyncio.sleep(stl)
+                                    def _take(n_=npt, m_=meter):
+                                        if m_ == "k6485":
+                                            arr, _ts = HUB.k6485.read_n(n_, 0.0)
+                                            return np.asarray(arr, dtype=np.float64)
+                                        else:
+                                            return np.array(
+                                                [HUB.elec.measure_current()
+                                                 for _ in range(n_)],
+                                                dtype=np.float64)
+                                    arr = await _run_in_thread(_take)
+                                    means.append(float(np.mean(arr)))
+                                    stds.append(float(np.std(arr, ddof=1))
+                                                if len(arr) > 1 else 0.0)
+                                    raws.extend(arr.tolist())
+                                    _plot("scan_point", axis, float(pos),
+                                          means[-1])
+                                    log_msg(f"    {axis}={pos:+.3f} mm  "
+                                            f"I={means[-1]:+.3e} A "
+                                            f"± {stds[-1]:.2e}")
+                                log_msg("  scan done")
+                                try:
+                                    p = MSTORE.save_l2_scan(
+                                        positions_mm=positions,
+                                        mean_current_a=np.array(
+                                            means, dtype=np.float64),
+                                        std_current_a=np.array(
+                                            stds, dtype=np.float64),
+                                        raw_current_a=np.array(
+                                            raws, dtype=np.float64),
+                                        temperature_K=float(temp_in.value),
+                                        axis=axis,
+                                        bias_v=bias,
+                                        meter=meter,
+                                        light_mode=light_mode,
+                                        light_freq_hz=float(scan_freq.value),
+                                        light_amp_v=float(scan_amp.value),
+                                        light_width_s=float(scan_width.value),
+                                        n_per_point=npt,
+                                        settle_s=stl,
+                                        **_opt_kwargs(),
+                                        **_out_kwargs(),
+                                    )
+                                    log_msg(f"  saved: {p}")
+                                except Exception as e:
+                                    log_msg(f"  SAVE FAIL: "
+                                            f"{type(e).__name__}: {e}")
+                                scan_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--ok)">done · '
+                                    f'{axis.upper()}-axis · '
+                                    f'{len(positions)} pts</span>'
+                                )
+                            except Exception as e:
+                                log_msg(f"  SCAN FAIL: "
+                                        f"{type(e).__name__}: {e}")
+                                scan_status.set_content(
+                                    f'<span class="statuspill" '
+                                    f'style="color:var(--bad)">'
+                                    f'failed: {type(e).__name__}</span>'
+                                )
+                            finally:
+                                await _run_in_thread(_awg_off, ks_ch)
+                                try: await _run_in_thread(P.bias_off, HUB.elec)
+                                except Exception: pass
+                                note_bias(v_set=0.0, output_on=False)
+                                clear_activity()
+
+                        with ui.element("div").classes("runrow"):
+                            ui.button("▶ run scan", on_click=run_scan) \
+                                .props("color=primary")
+                            scan_status_holder = ui.html("")
+                            scan_status_holder.bind_content_from(
+                                scan_status, "content")
+
+            # =============== RIGHT: 2×2 plots ===============
+            _build_l2_plots(PLOTS, _plot_dirty)
+
+    # Small bottom log (preserved from the previous version) for diagnostics.
+    log_lbl = ui.log(max_lines=20).classes("h-32 w-full") \
+        .style("margin-top:14px")
+    def log_msg(s: str):
+        log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+
 
 def _embedded_instr_tab(message: str, getter, build_fn,
                          instrument_key: str | None = None):
@@ -4517,6 +5495,21 @@ def _build_electrometer_tab():
                         step=1e-9, fmt="%.2e")
                     src_ilim_wrap, src_ilim_sw = _field_toggle(
                         "Current-limiting resistor", False)
+                    src_hv_wrap, src_hv_n, _ = _field_number(
+                        "HV interlock threshold", HV_DEFAULT_THRESHOLD, "V",
+                        step=5.0, fmt="%.1f")
+
+                    def _on_hv_threshold(_e=None):
+                        # Applied immediately (not via the block's apply button):
+                        # a safety limit should take effect the moment it changes.
+                        if HUB.elec is None:
+                            return
+                        try:
+                            HUB.elec.hv_threshold = float(src_hv_n.value)
+                            log_msg(f"HV interlock threshold = {HUB.elec.hv_threshold:.1f} V")
+                        except (ValueError, TypeError) as exc:
+                            log_msg(f"  HV threshold invalid: {exc}")
+                    src_hv_n.on_value_change(_on_hv_threshold)
 
             # ===== MEASURE =====
             with ui.card().classes("ep-card block") as measure_block:
@@ -4605,6 +5598,8 @@ def _build_electrometer_tab():
     # ---- Apply handlers --------------------------------------------------
     async def apply_source():
         if HUB.elec is None: log_msg("not connected"); return
+        _arm_hv_guard()
+        _on_hv_threshold()      # carry a pre-connect threshold edit to the driver
         try:
             drv = HUB.elec._driver
             await _run_in_thread(
@@ -6261,42 +7256,52 @@ def _build_data_tab():
 
     Left: every ``*.h5`` under ./data (recursively — bench/elec runs at the
     top level, L1/L2 measurements in per-SiPM/per-T subfolders), newest
-    first, with a name filter. Right: the selected file's group/dataset tree
-    (``ui.tree``) and a detail pane that shows a node's attributes, a value
-    preview + numeric stats, and a quick plot for 1D/2D numeric datasets.
-    Introspection lives in :mod:`daq.h5browse` (pure, no GUI deps).
+    first, with a name filter. Each row has move/delete actions, and the
+    header has a new-folder button, so the operator can organize runs into
+    folders without leaving the browser. Right: the selected file's
+    group/dataset tree (``ui.tree``) and a detail pane that, for a clicked
+    node, shows attributes, the domain analysis plot (e.g. /iv -> the IV
+    curve via ``daq.plotting``), and a raw value preview/plot for datasets.
+    Introspection + file ops live in :mod:`daq.h5browse` (pure, no GUI deps).
     """
-    import numpy as np
+    import inspect
     from pathlib import Path
     from daq import h5browse as HB
     from daq import plotting as P
 
     ui.label(
         "Browse every recorded .h5 under ./data. Pick a file for its "
-        "group/dataset tree; click a node for attributes, a value preview, "
-        "and a quick plot of numeric datasets."
+        "group/dataset tree; click a node (e.g. iv) for its analysis plot, "
+        "attributes, and a raw value preview. Use the file-row icons to move "
+        "or delete a run, and the folder icon to make a new folder."
     ).classes("text-gray-400 text-sm")
 
     state = {"path": None, "files": []}
 
+    def _plot_params(key: str) -> set[str]:
+        return set(inspect.signature(P.PLOTS[key]["fn"]).parameters)
+
     with ui.row().classes("w-full gap-3 no-wrap items-start"):
         # ---- left: file browser ----
         with ui.card().classes("daq-card").style("min-width:330px; max-width:360px"):
-            with ui.row().classes("items-center justify-between w-full"):
+            with ui.row().classes("items-center justify-between w-full no-wrap"):
                 ui.html("<h2>files</h2>")
-                count_lbl = ui.label("").classes("text-gray-400 text-xs")
+                with ui.row().classes("items-center gap-1 no-wrap"):
+                    count_lbl = ui.label("").classes("text-gray-400 text-xs")
+                    ui.button(icon="create_new_folder",
+                              on_click=lambda: open_newfolder()) \
+                        .props("flat dense round size=sm").tooltip("new folder")
+                    ui.button(icon="refresh", on_click=lambda: refresh_files()) \
+                        .props("flat dense round size=sm").tooltip("refresh")
             flt = ui.input(placeholder="filter by name...") \
                 .props("dense clearable").classes("w-full")
-            ui.button("refresh", icon="refresh",
-                      on_click=lambda: refresh_files()).props("flat dense no-caps")
             file_list = ui.column().classes("w-full gap-1") \
                 .style("max-height:62vh; overflow-y:auto")
 
         # ---- right: structure + detail ----
         with ui.column().classes("flex-grow gap-3").style("min-width:0"):
             with ui.card().classes("daq-card w-full"):
-                file_hdr = ui.row().classes("items-center gap-3 w-full")
-                with file_hdr:
+                with ui.row().classes("items-center gap-3 w-full"):
                     ui.html("<h2>structure</h2>")
                     hdr_info = ui.label("no file selected") \
                         .classes("text-gray-400 text-sm")
@@ -6316,10 +7321,211 @@ def _build_data_tab():
                     ui.label("select a node in the tree").classes(
                         "text-gray-500 text-sm")
 
+    # ---- file-management dialogs (built once, reused) --------------------
+    with ui.dialog() as nf_dialog, ui.card().classes("daq-card"):
+        ui.label("new folder").classes("text-sm text-gray-200")
+        nf_name = ui.input(label="folder name") \
+            .props("dense outlined autofocus").classes("w-64")
+        nf_err = ui.label("").classes("text-red-400 text-xs")
+        with ui.row().classes("gap-2 justify-end w-full"):
+            ui.button("cancel", on_click=nf_dialog.close).props("flat dense no-caps")
+            ui.button("create", on_click=lambda: nf_create()) \
+                .props("color=primary dense no-caps")
+
+    mv_state = {"rel": None}
+    with ui.dialog() as mv_dialog, ui.card().classes("daq-card"):
+        mv_title = ui.label("").classes("text-sm text-gray-200")
+        mv_dest = ui.select(options={}, label="destination folder") \
+            .props("dense outlined").classes("w-72")
+        mv_err = ui.label("").classes("text-red-400 text-xs")
+        with ui.row().classes("gap-2 justify-end w-full"):
+            ui.button("cancel", on_click=mv_dialog.close).props("flat dense no-caps")
+            ui.button("move", on_click=lambda: mv_do()) \
+                .props("color=primary dense no-caps")
+
+    del_state = {"rel": None}
+    with ui.dialog() as del_dialog, ui.card().classes("daq-card"):
+        del_title = ui.label("").classes("text-sm text-gray-200")
+        with ui.row().classes("gap-2 justify-end w-full"):
+            ui.button("cancel", on_click=del_dialog.close).props("flat dense no-caps")
+            ui.button("delete", on_click=lambda: del_do()) \
+                .props("color=negative dense no-caps")
+
+    def _reset_active_if(abs_old):
+        """If the file just moved/deleted was the one being viewed, clear the
+        structure + detail panes so we don't dangle on a stale path."""
+        if state["path"] and Path(state["path"]).resolve() == Path(abs_old).resolve():
+            state["path"] = None
+            hdr_info.set_text("no file selected")
+            dl_btn.set_visibility(False)
+            tree_box.clear()
+            with tree_box:
+                ui.label("select a file on the left").classes(
+                    "text-gray-500 text-sm")
+            detail_box.clear()
+            with detail_box:
+                ui.label("select a node in the tree").classes(
+                    "text-gray-500 text-sm")
+
+    def open_newfolder():
+        nf_name.value = ""
+        nf_err.set_text("")
+        nf_dialog.open()
+
+    def nf_create():
+        try:
+            name = HB.make_folder(nf_name.value)
+        except Exception as e:
+            nf_err.set_text(f"{type(e).__name__}: {e}")
+            return
+        nf_dialog.close()
+        ui.notify(f"created folder {name}/", type="positive")
+        refresh_files()
+
+    def open_move(rel):
+        mv_state["rel"] = rel
+        folders = HB.list_folders()
+        mv_dest.options = {f: (f or "(root)") for f in folders}
+        mv_dest.value = folders[0] if folders else ""
+        mv_dest.update()
+        mv_title.set_text(f"move {rel} to:")
+        mv_err.set_text("")
+        mv_dialog.open()
+
+    def mv_do():
+        rel = mv_state["rel"]
+        abs_old = HB.data_root() / rel
+        try:
+            newrel = HB.move_file(rel, mv_dest.value or "")
+        except Exception as e:
+            mv_err.set_text(f"{type(e).__name__}: {e}")
+            return
+        mv_dialog.close()
+        ui.notify(f"moved to {newrel}", type="positive")
+        _reset_active_if(abs_old)
+        refresh_files()
+
+    def open_delete(rel):
+        del_state["rel"] = rel
+        del_title.set_text(f"Delete {rel}? This cannot be undone.")
+        del_dialog.open()
+
+    def del_do():
+        rel = del_state["rel"]
+        abs_old = HB.data_root() / rel
+        try:
+            HB.delete_file(rel)
+        except Exception as e:
+            del_dialog.close()
+            ui.notify(f"delete failed: {e}", type="negative")
+            return
+        del_dialog.close()
+        ui.notify(f"deleted {rel}", type="warning")
+        _reset_active_if(abs_old)
+        refresh_files()
+
     def _download():
         if state["path"]:
             ui.download.file(state["path"], Path(state["path"]).name)
     dl_btn.on_click(_download)
+
+    # ---- detail pane -----------------------------------------------------
+    def _domain_plot(h5path):
+        """Analysis plot(s) for the clicked node's group, via daq.plotting.
+        Plot type + only the knobs that the chosen plot actually accepts;
+        channel / bias / dark-light defaults come from where the user clicked."""
+        keys = HB.domain_plots_for(h5path)
+        if not keys:
+            return
+        hints = HB.context_hints(h5path)
+        with ui.card().classes("daq-card w-full"):
+            ui.html("<h2>analysis plot</h2>")
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ptype = ui.select({k: k for k in keys}, value=keys[0],
+                                  label="plot").classes("w-52")
+                logy = ui.switch("log Y", value=True)
+                chan = ui.number(label="channel", value=hints.get("channel", 0),
+                                 min=0, step=1).classes("w-24 num")
+                idx = ui.number(label="waveform #", value=0, min=0,
+                                step=1).classes("w-28 num")
+                nbins = ui.number(label="bins", value=80, step=10).classes("w-24 num")
+                biasg = ui.select(["above_vbd", "below_vbd"],
+                                  value=hints.get("bias_group", "above_vbd"),
+                                  label="bias").classes("w-36")
+            desc = ui.label("").classes("text-gray-400 text-xs")
+            dfig = ui.matplotlib(figsize=(8.5, 3.6)).classes("w-full")
+            dax = dfig.figure.add_subplot(111)
+            P.apply_dark_style(dfig.figure, dax)
+
+            def sync_knobs():
+                ps = _plot_params(str(ptype.value))
+                logy.set_visibility("log_y" in ps)
+                chan.set_visibility("channel" in ps)
+                idx.set_visibility("index" in ps)
+                nbins.set_visibility("bins" in ps)
+                biasg.set_visibility("bias_group" in ps)
+
+            def render(_=None):
+                key = str(ptype.value)
+                spec = P.PLOTS[key]
+                desc.set_text(spec.get("label", ""))
+                opts = dict(
+                    log_y=bool(logy.value), channel=int(chan.value),
+                    index=int(idx.value), bins=int(nbins.value),
+                    baseline_subtract=True,
+                    bias_group=str(biasg.value),
+                    which=hints.get("which", "dark"),
+                )
+                dax.clear()
+                P.apply_dark_style(dfig.figure, dax)
+                try:
+                    spec["fn"](state["path"], ax=dax, **opts)
+                    dfig.figure.tight_layout()
+                except Exception as e:
+                    dax.text(0.5, 0.5, f"{type(e).__name__}: {e}",
+                             ha="center", va="center", color="#e88",
+                             transform=dax.transAxes, fontsize=8, wrap=True)
+                dfig.update()
+
+            ptype.on_value_change(lambda: (sync_knobs(), render()))
+            for w in (logy, chan, idx, nbins, biasg):
+                w.on_value_change(render)
+            sync_knobs()
+            render()
+
+    def _raw_dataset_plot(info, h5path):
+        """Plot the dataset's own values (1D directly; one row of a 2D set)."""
+        ui.label("raw values").classes("text-gray-400 text-xs mt-1")
+        rfig = ui.matplotlib(figsize=(8.5, 2.8)).classes("w-full")
+        rax = rfig.figure.add_subplot(111)
+        P.apply_dark_style(rfig.figure, rax)
+        is_2d = info["ndim"] == 2
+        row_in = ui.number(label="row", value=0, min=0,
+                           max=max(0, info["shape"][0] - 1), step=1) \
+            .classes("w-28 num")
+        row_in.set_visibility(is_2d)
+
+        def do_plot(_=None, hp=h5path):
+            row = int(row_in.value) if is_2d else None
+            try:
+                y = HB.read_dataset(state["path"], hp, row=row).ravel()
+            except Exception as e:
+                ui.notify(f"plot failed: {e}", type="negative")
+                return
+            rax.clear()
+            P.apply_dark_style(rfig.figure, rax)
+            rax.plot(y, lw=0.8)
+            rax.set_title(hp + (f"  row {row}" if is_2d else ""), fontsize=9)
+            rfig.figure.tight_layout()
+            rfig.update()
+
+        with ui.row().classes("items-center gap-2"):
+            ui.button("plot", icon="show_chart", on_click=do_plot) \
+                .props("dense no-caps")
+            if is_2d:
+                ui.label(f"of {info['shape'][0]} rows").classes(
+                    "text-gray-500 text-xs")
+        do_plot()
 
     def show_detail(h5path: str | None):
         detail_box.clear()
@@ -6337,6 +7543,9 @@ def _build_data_tab():
             ui.html(f"<code>{h5path}</code> &middot; <b>{info['kind']}</b>"
                     + (f" &middot; {info['n_children']} child(ren)"
                        if info["kind"] == "group" else ""))
+
+            # Analysis plot first — it's the point of clicking e.g. "iv".
+            _domain_plot(h5path)
 
             if info["attrs"]:
                 ui.table(
@@ -6369,40 +7578,8 @@ def _build_data_tab():
             ui.label("preview").classes("text-gray-400 text-xs mt-1")
             ui.code(info["preview"]).classes("w-full")
 
-            if not info["plottable"]:
-                return
-
-            plot = ui.matplotlib(figsize=(8.5, 3.2)).classes("w-full")
-            axp = plot.figure.add_subplot(111)
-            P.apply_dark_style(plot.figure, axp)
-            is_2d = info["ndim"] == 2
-            row_in = ui.number(label="row", value=0, min=0,
-                               max=max(0, info["shape"][0] - 1), step=1) \
-                .classes("w-28 num")
-            row_in.set_visibility(is_2d)
-
-            def do_plot(_=None, hp=h5path):
-                row = int(row_in.value) if is_2d else None
-                try:
-                    y = HB.read_dataset(state["path"], hp, row=row).ravel()
-                except Exception as e:
-                    ui.notify(f"plot failed: {e}", type="negative")
-                    return
-                axp.clear()
-                P.apply_dark_style(plot.figure, axp)
-                axp.plot(y, lw=0.8)
-                title = hp + (f"  row {row}" if is_2d else "")
-                axp.set_title(title, fontsize=9)
-                plot.figure.tight_layout()
-                plot.update()
-
-            with ui.row().classes("items-center gap-2"):
-                ui.button("plot", icon="show_chart", on_click=do_plot) \
-                    .props("dense color=primary no-caps")
-                if is_2d:
-                    ui.label(f"of {info['shape'][0]} rows").classes(
-                        "text-gray-500 text-xs")
-            do_plot()
+            if info["plottable"]:
+                _raw_dataset_plot(info, h5path)
 
     def load_file(path: str):
         state["path"] = path
@@ -6424,8 +7601,7 @@ def _build_data_tab():
                 .expand(["/"])
 
     def refresh_files():
-        files = HB.list_data_files()
-        state["files"] = files
+        state["files"] = HB.list_data_files()
         render_file_list()
 
     def render_file_list():
@@ -6440,10 +7616,20 @@ def _build_data_tab():
             for f in files:
                 meta = (f"{HB.human_size(f['size'])} &middot; "
                         f"{time.strftime('%m-%d %H:%M', time.localtime(f['mtime']))}")
-                with ui.element("div").classes("data-file-row").on(
-                        "click", lambda _e=None, p=f["path"]: load_file(p)):
-                    ui.html(f"<div class='df-name'>{f['rel']}</div>"
-                            f"<div class='df-meta'>{meta}</div>")
+                with ui.row().classes(
+                        "data-file-row items-center no-wrap w-full gap-1"):
+                    with ui.element("div").classes("df-click") \
+                            .style("flex:1 1 auto; min-width:0; cursor:pointer") \
+                            .on("click", lambda _e=None, p=f["path"]: load_file(p)):
+                        ui.html(f"<div class='df-name'>{f['rel']}</div>"
+                                f"<div class='df-meta'>{meta}</div>")
+                    ui.button(icon="drive_file_move",
+                              on_click=lambda _e=None, r=f["rel"]: open_move(r)) \
+                        .props("flat dense round size=sm").tooltip("move")
+                    ui.button(icon="delete",
+                              on_click=lambda _e=None, r=f["rel"]: open_delete(r)) \
+                        .props("flat dense round size=sm color=negative") \
+                        .tooltip("delete")
 
     flt.on("update:model-value", lambda _e: render_file_list())
     refresh_files()
@@ -7266,106 +8452,343 @@ def _build_digitizer_tab():
         ui.timer(1.5, _refresh_conn)
 
 def _build_level3_tab():
-    ui.label("Run an IV sweep or pulse acquisition across the whole tile (all SiPMs). Results saved to HDF5.").classes("text-gray-400 text-sm")
+    ui.label("Build a list of per-SiPM measurement specs and run them in order. "
+             "Each entry runs the checked measurements for one SiPM; add the same "
+             "SiPM twice to repeat it. Results go to one run.h5.").classes(
+                 "text-gray-400 text-sm")
 
-    log_lbl  = ui.log(max_lines=24).classes("h-48 w-full")
-    progress = ui.linear_progress(value=0).props("instant-feedback").classes("w-full")
-    prog_lbl = ui.label("0 / 0 SiPMs").classes("num text-sm")
+    from daq.sequence import (MeasurementSpec, SequenceFile,
+                              save_sequence, load_sequence,
+                              build_sequence_steps, run_sequence as _run_seq)
+
+    specs:   list = []           # list[MeasurementSpec]
+    editing = {"i": None}        # index being edited, or None (add mode)
+    abort   = {"flag": False}
+
     def log_msg(s: str): log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
 
+    def _parse_floats(text: str) -> list:
+        out = []
+        for tok in str(text or "").replace(",", " ").split():
+            try: out.append(float(tok))
+            except ValueError: pass
+        return out
+
+    # ---------------- builder ----------------
     with ui.row().classes("w-full gap-3 items-start"):
         with ui.card().classes("daq-card"):
-            ui.html("<h2>output</h2>")
+            ui.html("<h2>spec builder</h2>")
+            with ui.row().classes("gap-3"):
+                en_iv    = ui.checkbox("IV sweep", value=True)
+                en_pulse = ui.checkbox("pulse",    value=False)
+                en_scan  = ui.checkbox("1-D scan", value=False)
+
+            with ui.row().classes("gap-2"):
+                b_sipm = ui.number(label="SiPM #", value=1, step=1, format="%d").classes("w-24 num")
+                b_mux  = ui.number(label="MUX ch", value=1, step=1, format="%d").classes("w-24 num")
+                b_cond = ui.toggle({"dark": "dark", "bright": "bright", "both": "both"},
+                                   value="dark")
+            with ui.row().classes("gap-2"):
+                b_cx = ui.number(label="bright x (mm)", value=0.0, step=0.1, format="%.3f").classes("w-28 num")
+                b_cy = ui.number(label="bright y (mm)", value=0.0, step=0.1, format="%.3f").classes("w-28 num")
+                b_dx = ui.number(label="dark x (mm)",   value=0.0, step=0.1, format="%.3f").classes("w-28 num")
+                b_dy = ui.number(label="dark y (mm)",   value=0.0, step=0.1, format="%.3f").classes("w-28 num")
+            with ui.row().classes("gap-2"):
+                b_temp  = ui.number(label="T (K)", value=298.0, step=0.1, format="%.2f").classes("w-28 num")
+                b_label = ui.input(label="label").classes("w-48")
+
+            with ui.element("div") as sec_iv:
+                ui.html("<h2 style='margin-top:.5rem'>IV sweep</h2>")
+                with ui.row().classes("gap-2"):
+                    b_iv_meter = ui.select({"k6485": "K6485", "b2987": "B2987"},
+                                           value="k6485", label="meter").classes("w-28")
+                    b_iv_start = ui.number(label="start (V)", value=HUB.config.iv_voltage_start, step=0.1).classes("w-24 num")
+                    b_iv_stop  = ui.number(label="stop (V)",  value=HUB.config.iv_voltage_stop,  step=0.1).classes("w-24 num")
+                    b_iv_step  = ui.number(label="step (V)",  value=HUB.config.iv_voltage_step,  step=0.01).classes("w-24 num")
+                with ui.row().classes("gap-2"):
+                    b_iv_n_dark  = ui.number(label="n IV samp (dark)",  value=HUB.config.iv_n_per_point, step=1, format="%d").classes("w-32 num")
+                    b_iv_n_illum = ui.number(label="n IV samp (illum)", value=HUB.config.iv_n_per_point, step=1, format="%d").classes("w-32 num")
+
+            with ui.element("div") as sec_pulse:
+                ui.html("<h2 style='margin-top:.5rem'>pulse</h2>")
+                with ui.row().classes("gap-2"):
+                    b_pc_ch  = ui.number(label="capture ch", value=0, step=1, format="%d").classes("w-24 num")
+                    b_pc_thr = ui.number(label="thr (ADC)",  value=50, step=10, format="%d").classes("w-24 num")
+                    b_pc_pre  = ui.number(label="pre (µs)",  value=HUB.config.pulse_pre_us,  step=0.5).classes("w-24 num")
+                    b_pc_post = ui.number(label="post (µs)", value=HUB.config.pulse_post_us, step=0.5).classes("w-24 num")
+                with ui.row().classes("gap-2 items-center"):
+                    b_pc_aux_use = ui.switch("aux trig", value=False)
+                    b_pc_aux_ch  = ui.number(label="aux ch",  value=4,  step=1, format="%d").classes("w-24 num")
+                    b_pc_aux_thr = ui.number(label="aux thr", value=50, step=10, format="%d").classes("w-24 num")
+                b_pc_bias = ui.input(label="bias points (V, comma-sep)",
+                                     value=f"{HUB.config.pulse_bias_v:.2f}").classes("w-full")
+                with ui.row().classes("gap-2 items-center"):
+                    b_pc_nwf_dark  = ui.number(label="n wfm (dark)",  value=HUB.config.pulse_n_waveforms, step=100, format="%d").classes("w-32 num")
+                    b_pc_nwf_illum = ui.number(label="n wfm (illum)", value=HUB.config.pulse_n_waveforms, step=100, format="%d").classes("w-32 num")
+                    b_pc_store = ui.switch("store raw", value=False)
+
+            with ui.element("div") as sec_scan:
+                ui.html("<h2 style='margin-top:.5rem'>1-D scan</h2>")
+                with ui.row().classes("gap-2 items-center"):
+                    b_scan_axis  = ui.toggle({"x": "X", "y": "Y"}, value="x")
+                    b_scan_light = ui.toggle({"vuv": "VUV (ch1)", "laser": "Laser (ch2)"}, value="vuv")
+                    b_scan_meter = ui.select({"k6485": "K6485", "b2987": "B2987"}, value="k6485", label="meter").classes("w-28")
+                    b_scan_illum = ui.checkbox("illuminated", value=True)
+                with ui.row().classes("gap-2"):
+                    b_scan_bias  = ui.number(label="bias (V)",   value=HUB.config.pulse_bias_v, step=0.1).classes("w-24 num")
+                    b_scan_start = ui.number(label="start (mm)", value=-7.5, step=0.1).classes("w-24 num")
+                    b_scan_stop  = ui.number(label="stop (mm)",  value=7.5,  step=0.1).classes("w-24 num")
+                    b_scan_step  = ui.number(label="step (mm)",  value=0.5,  step=0.01).classes("w-24 num")
+                    b_scan_n     = ui.number(label="n samp",     value=5, step=1, format="%d").classes("w-20 num")
+                    b_scan_settle = ui.number(label="settle (s)", value=0.1, step=0.01).classes("w-24 num")
+                with ui.row().classes("gap-2"):
+                    b_scan_freq  = ui.number(label="AWG freq (Hz)",  value=HUB.config.led_frequency_hz, step=10.0).classes("w-28 num")
+                    b_scan_amp   = ui.number(label="AWG amp (Vpp)",  value=HUB.config.led_amplitude_v,  step=0.1).classes("w-28 num")
+                    b_scan_offs  = ui.number(label="AWG offset (V)", value=HUB.config.led_offset_v,     step=0.1).classes("w-28 num")
+                    b_scan_width = ui.number(label="AWG width (s)",  value=HUB.config.led_pulse_width,  step=1e-7, format="%.9f").classes("w-32 num")
+
+            def _gate():
+                sec_iv.set_visibility(bool(en_iv.value))
+                sec_pulse.set_visibility(bool(en_pulse.value))
+                sec_scan.set_visibility(bool(en_scan.value))
+            en_iv.on_value_change(lambda _e: _gate())
+            en_pulse.on_value_change(lambda _e: _gate())
+            en_scan.on_value_change(lambda _e: _gate())
+            _gate()
+
+            with ui.row().classes("gap-2 mt-2"):
+                add_btn    = ui.button("add to list ▶").props("color=primary")
+                update_btn = ui.button("update row")
+                reset_btn  = ui.button("clear form").props("flat")
+            update_btn.set_visibility(False)
+
+        with ui.card().classes("daq-card flex-1"):
+            ui.html("<h2>entry list</h2>")
+            list_box = ui.column().classes("w-full")
+            ui.button("clear all",
+                      on_click=lambda: (specs.clear(), refresh_list(), log_msg("cleared"))) \
+                .props("color=negative flat").classes("mt-1")
+
+    # ---------------- run / save / load ----------------
+    with ui.card().classes("daq-card w-full"):
+        ui.html("<h2>run</h2>")
+        with ui.row().classes("gap-2 items-end"):
             run_dir = ui.input(label="run directory", value=HUB.config.data_dir).classes("w-72")
             run_id  = ui.input(label="run id",        value="run_001").classes("w-40")
+            resume_sw = ui.switch("resume", value=True)
+        seq_path = ui.input(label="sequence YAML",
+                            value=os.path.join(HUB.config.data_dir, "l3_sequence.yaml")).classes("w-full")
+        with ui.row().classes("gap-2"):
+            ui.button("save list", on_click=lambda: save_list())
+            ui.button("load list", on_click=lambda: load_list()).props("color=primary")
 
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>sweep options</h2>")
-            temp_k     = ui.number(label="temperature (K)", value=300.0, step=1).classes("w-40 num")
-            illum_chk  = ui.switch("illuminated", value=False)
-            flux_int   = ui.number(label="flux check every N", value=HUB.config.flux_check_interval, step=1).classes("w-40 num")
+        log_lbl    = ui.log(max_lines=24).classes("h-48 w-full")
+        entry_prog = ui.linear_progress(value=0).classes("w-full")
+        entry_lbl  = ui.label("entry 0 / 0").classes("num text-sm")
+        step_prog  = ui.linear_progress(value=0).classes("w-full")
+        step_lbl   = ui.label("step —").classes("num text-sm")
+        with ui.row().classes("gap-2 mt-1"):
+            ui.button("run sequence", on_click=lambda: run_seq()).props("color=primary")
+            ui.button("⛔ abort", on_click=lambda: request_abort()).props("color=negative")
 
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>iv sweep</h2>")
-            iv_start = ui.number(label="start (V)", value=HUB.config.iv_voltage_start, step=0.1).classes("w-32 num")
-            iv_stop  = ui.number(label="stop (V)",  value=HUB.config.iv_voltage_stop,  step=0.1).classes("w-32 num")
-            iv_step  = ui.number(label="step (V)",  value=HUB.config.iv_voltage_step,  step=0.01).classes("w-32 num")
-            iv_npt   = ui.number(label="pts / V",   value=HUB.config.iv_n_per_point,   step=1).classes("w-32 num")
-
-        with ui.card().classes("daq-card"):
-            ui.html("<h2>pulse acquisition</h2>")
-            p_bias = ui.number(label="bias (V)",  value=HUB.config.pulse_bias_v,      step=0.1).classes("w-32 num")
-            p_nwfm = ui.number(label="waveforms", value=HUB.config.pulse_n_waveforms, step=100).classes("w-32 num")
-
-    def _check_ready() -> bool:
-        if not HUB.config.sipm_list():
-            log_msg("no channel map loaded — go to Config tab and load yaml"); return False
-        if not run_dir.value.strip():
-            log_msg("run directory is empty"); return False
-        return True
-
-    def _on_progress(done, total, sipm_id):
-        progress.value = (done / total) if total else 0
-        prog_lbl.text  = f"{done} / {total} SiPMs"
-        log_msg(f"  [{done}/{total}] SiPM {sipm_id} done")
-
-    async def run_tile_iv():
-        if not _check_ready(): return
+    # ---------------- form <-> spec ----------------
+    def _collect_form() -> MeasurementSpec:
         import numpy as np
-        from daq.tile     import tile_iv_sweep
-        from daq.storage  import RunFile, run_filename
-        from daq.resume   import RunManifest
-        voltages = list(np.arange(float(iv_start.value),
-                                  float(iv_stop.value) + float(iv_step.value)*0.5,
-                                  float(iv_step.value)))
-        sipms = [s.sipm_id for s in HUB.config.sipm_list()]
-        log_msg(f"tile IV — {len(sipms)} SiPMs × {len(voltages)} voltages")
-        progress.value, prog_lbl.text = 0, f"0 / {len(sipms)} SiPMs"
+        cond = str(b_cond.value)
+        start, stop, step = float(b_iv_start.value), float(b_iv_stop.value), float(b_iv_step.value)
+        ivv = (np.arange(start, stop + step * 0.5, step).round(6).tolist()
+               if step > 0 else [start])
+        return MeasurementSpec(
+            sipm_id=int(b_sipm.value), mux_channel=int(b_mux.value),
+            x_mm=float(b_cx.value), y_mm=float(b_cy.value),
+            dark_x_mm=float(b_dx.value), dark_y_mm=float(b_dy.value),
+            temperature_K=float(b_temp.value), label=b_label.value.strip(),
+            dark=(cond in ("dark", "both")), illuminated=(cond in ("bright", "both")),
+            do_iv=bool(en_iv.value), do_pulse=bool(en_pulse.value), do_scan=bool(en_scan.value),
+            iv_voltages=ivv, iv_meter=str(b_iv_meter.value),
+            n_iv_samples_dark=int(b_iv_n_dark.value), n_iv_samples_illum=int(b_iv_n_illum.value),
+            pulse_bias_v=_parse_floats(b_pc_bias.value),
+            pulse_capture_ch=int(b_pc_ch.value), pulse_threshold_adc=int(b_pc_thr.value),
+            pulse_aux_ch=(int(b_pc_aux_ch.value) if b_pc_aux_use.value else None),
+            pulse_aux_thr_adc=(int(b_pc_aux_thr.value) if b_pc_aux_use.value else None),
+            pulse_pre_us=float(b_pc_pre.value), pulse_post_us=float(b_pc_post.value),
+            pulse_store_waveforms=bool(b_pc_store.value),
+            n_waveforms_dark=int(b_pc_nwf_dark.value), n_waveforms_illum=int(b_pc_nwf_illum.value),
+            scan_axis=str(b_scan_axis.value), scan_light=str(b_scan_light.value),
+            scan_meter=str(b_scan_meter.value), scan_bias_v=float(b_scan_bias.value),
+            scan_start_mm=float(b_scan_start.value), scan_stop_mm=float(b_scan_stop.value),
+            scan_step_mm=float(b_scan_step.value), n_scan_samples=int(b_scan_n.value),
+            scan_settle_s=float(b_scan_settle.value), scan_illuminated=bool(b_scan_illum.value),
+            scan_freq_hz=float(b_scan_freq.value), scan_amp_v=float(b_scan_amp.value),
+            scan_offset_v=float(b_scan_offs.value), scan_width_s=float(b_scan_width.value),
+        )
 
-        mdir = os.path.join(run_dir.value.strip(), run_id.value.strip())
-        os.makedirs(mdir, exist_ok=True)
-        manifest = RunManifest(mdir); manifest.generate(HUB.config); manifest.save()
-        rf = RunFile(run_filename(run_dir.value.strip(), run_id.value.strip()))
+    def _load_into_form(s: MeasurementSpec):
+        b_sipm.value, b_mux.value = s.sipm_id, s.mux_channel
+        b_cx.value, b_cy.value = s.x_mm, s.y_mm
+        b_dx.value = s.dark_x_mm if s.dark_x_mm is not None else s.x_mm
+        b_dy.value = s.dark_y_mm if s.dark_y_mm is not None else s.y_mm
+        b_temp.value, b_label.value = s.temperature_K, s.label
+        b_cond.value = ("both" if (s.dark and s.illuminated)
+                        else "bright" if s.illuminated else "dark")
+        en_iv.value, en_pulse.value, en_scan.value = s.do_iv, s.do_pulse, s.do_scan
+        b_iv_meter.value = s.iv_meter
+        if s.iv_voltages:
+            b_iv_start.value, b_iv_stop.value = s.iv_voltages[0], s.iv_voltages[-1]
+            if len(s.iv_voltages) > 1:
+                b_iv_step.value = round(s.iv_voltages[1] - s.iv_voltages[0], 6)
+        b_iv_n_dark.value, b_iv_n_illum.value = s.n_iv_samples_dark, s.n_iv_samples_illum
+        b_pc_ch.value, b_pc_thr.value = s.pulse_capture_ch, s.pulse_threshold_adc
+        b_pc_aux_use.value = s.pulse_aux_ch is not None
+        if s.pulse_aux_ch is not None: b_pc_aux_ch.value = s.pulse_aux_ch
+        if s.pulse_aux_thr_adc is not None: b_pc_aux_thr.value = s.pulse_aux_thr_adc
+        b_pc_pre.value, b_pc_post.value = s.pulse_pre_us, s.pulse_post_us
+        b_pc_bias.value = ", ".join(f"{v:.2f}" for v in s.pulse_bias_v)
+        b_pc_nwf_dark.value, b_pc_nwf_illum.value = s.n_waveforms_dark, s.n_waveforms_illum
+        b_pc_store.value = s.pulse_store_waveforms
+        b_scan_axis.value, b_scan_light.value = s.scan_axis, s.scan_light
+        b_scan_meter.value, b_scan_bias.value = s.scan_meter, s.scan_bias_v
+        b_scan_start.value, b_scan_stop.value, b_scan_step.value = s.scan_start_mm, s.scan_stop_mm, s.scan_step_mm
+        b_scan_n.value, b_scan_settle.value = s.n_scan_samples, s.scan_settle_s
+        b_scan_illum.value = s.scan_illuminated
+        b_scan_freq.value, b_scan_amp.value = s.scan_freq_hz, s.scan_amp_v
+        b_scan_offs.value, b_scan_width.value = s.scan_offset_v, s.scan_width_s
+        _gate()
+
+    def _summary(s: MeasurementSpec) -> str:
+        conds = ("dark+bright" if (s.dark and s.illuminated)
+                 else "bright" if s.illuminated else "dark")
+        parts = [f"#{s.sipm_id} mux{s.mux_channel} T{s.temperature_K:.1f}K [{conds}]"]
+        if s.do_iv and s.iv_voltages:
+            parts.append(f"IV[{s.iv_voltages[0]:g}-{s.iv_voltages[-1]:g} {s.iv_meter}]")
+        if s.do_pulse:
+            parts.append(f"pulse[bias {','.join(f'{v:g}' for v in s.pulse_bias_v)}]")
+        if s.do_scan:
+            parts.append(f"scan[{s.scan_axis} {s.scan_start_mm:g}..{s.scan_stop_mm:g}]")
+        lbl = f"  ({s.label})" if s.label else ""
+        return " ".join(parts) + lbl
+
+    # ---------------- list ops ----------------
+    def refresh_list():
+        list_box.clear()
+        with list_box:
+            if not specs:
+                ui.html("<em>no entries yet</em>")
+            else:
+                for i, s in enumerate(specs):
+                    with ui.row().classes("items-center gap-1 w-full"):
+                        ui.html(f'<span class="num">{i+1}.</span> {_summary(s)}') \
+                            .classes("text-sm flex-1")
+                        ui.button(icon="content_copy", on_click=lambda _e, i=i: dup_entry(i)).props("flat dense")
+                        ui.button(icon="edit",          on_click=lambda _e, i=i: edit_entry(i)).props("flat dense")
+                        ui.button(icon="arrow_upward",  on_click=lambda _e, i=i: move(i, -1)).props("flat dense")
+                        ui.button(icon="arrow_downward",on_click=lambda _e, i=i: move(i, +1)).props("flat dense")
+                        ui.button(icon="delete",        on_click=lambda _e, i=i: rm_entry(i)).props("flat dense color=negative")
+        entry_lbl.text = f"entry 0 / {len(specs)}"
+
+    def add_entry():
         try:
-            await _run_in_thread(
-                tile_iv_sweep,
-                sipms, HUB.instruments, HUB.config,
-                float(temp_k.value), bool(illum_chk.value),
-                voltages, int(iv_npt.value), int(flux_int.value),
-                manifest, rf, _on_progress,
-            )
-            log_msg(f"tile IV complete — {len(sipms)} SiPMs")
+            specs.append(_collect_form())
         except Exception as e:
-            log_msg(f"FAIL: {type(e).__name__}: {e}")
+            log_msg(f"bad form: {type(e).__name__}: {e}"); return
+        refresh_list(); log_msg(f"added entry {len(specs)}")
 
-    async def run_tile_pulse():
-        if not _check_ready(): return
-        from daq.tile    import tile_pulse_run
+    def update_entry():
+        i = editing["i"]
+        if i is None: return
+        specs[i] = _collect_form()
+        editing["i"] = None
+        update_btn.set_visibility(False); add_btn.set_visibility(True)
+        refresh_list(); log_msg(f"updated row {i+1}")
+
+    def edit_entry(i):
+        editing["i"] = i
+        _load_into_form(specs[i])
+        update_btn.set_visibility(True); add_btn.set_visibility(False)
+
+    def dup_entry(i):
+        import copy
+        specs.insert(i + 1, copy.deepcopy(specs[i])); refresh_list()
+
+    def rm_entry(i):
+        specs.pop(i); refresh_list()
+
+    def move(i, d):
+        j = i + d
+        if 0 <= j < len(specs):
+            specs[i], specs[j] = specs[j], specs[i]; refresh_list()
+
+    def reset_form():
+        editing["i"] = None
+        update_btn.set_visibility(False); add_btn.set_visibility(True)
+
+    add_btn.on_click(lambda: add_entry())
+    update_btn.on_click(lambda: update_entry())
+    reset_btn.on_click(lambda: reset_form())
+
+    # ---------------- save / load ----------------
+    def save_list():
+        if not specs: log_msg("nothing to save"); return
+        try:
+            save_sequence(SequenceFile(entries=list(specs)), seq_path.value.strip())
+            log_msg(f"saved {len(specs)} entries → {seq_path.value.strip()}")
+        except Exception as e:
+            log_msg(f"save failed: {type(e).__name__}: {e}")
+
+    def load_list():
+        try:
+            seq = load_sequence(seq_path.value.strip())
+            specs.clear(); specs.extend(seq.entries); refresh_list()
+            log_msg(f"loaded {len(specs)} entries from {seq_path.value.strip()}")
+        except Exception as e:
+            log_msg(f"load failed: {type(e).__name__}: {e}")
+
+    # ---------------- run ----------------
+    def request_abort():
+        abort["flag"] = True; log_msg("ABORT requested — finishing current step")
+
+    def _on_progress(entry_idx, n_entries, step_name, done, total):
+        entry_prog.value = ((entry_idx + (done / total if total else 0)) / n_entries) if n_entries else 0
+        entry_lbl.text   = f"entry {entry_idx+1} / {n_entries}"
+        step_prog.value  = (done / total) if total else 0
+        step_lbl.text    = f"{step_name}: {done} / {total}"
+
+    async def run_seq():
+        if not specs: log_msg("no entries"); return
+        if HUB.elec is None: log_msg("electrometer not connected"); return
+        if not run_dir.value.strip(): log_msg("run directory is empty"); return
+        abort["flag"] = False
         from daq.storage import RunFile, run_filename
         from daq.resume  import RunManifest
-        sipms = [s.sipm_id for s in HUB.config.sipm_list()]
-        log_msg(f"tile pulse — {len(sipms)} SiPMs × {int(p_nwfm.value)} waveforms")
-        progress.value, prog_lbl.text = 0, f"0 / {len(sipms)} SiPMs"
-
         mdir = os.path.join(run_dir.value.strip(), run_id.value.strip())
         os.makedirs(mdir, exist_ok=True)
-        manifest = RunManifest(mdir); manifest.generate(HUB.config); manifest.save()
-        rf = RunFile(run_filename(run_dir.value.strip(), run_id.value.strip()))
+        steps = build_sequence_steps(specs)
+        manifest = RunManifest(mdir)
+        if manifest.exists() and resume_sw.value:
+            manifest.load()
+        else:
+            manifest.set_steps(steps); manifest.save()
+        rf = RunFile(run_filename(run_dir.value.strip(), run_id.value.strip()),
+                     config=HUB.config)
+        set_activity("L3 sequence", f"{len(specs)} entries")
+        log_msg(f"running {len(specs)} entries ({len(steps)} steps)…")
         try:
-            await _run_in_thread(
-                tile_pulse_run,
-                sipms, HUB.instruments, HUB.config,
-                float(temp_k.value), bool(illum_chk.value),
-                float(p_bias.value), int(p_nwfm.value), int(flux_int.value),
-                manifest, rf, _on_progress,
+            rf.open()
+            summary = await _run_in_thread(
+                _run_seq, list(specs), HUB.instruments, HUB.config,
+                rf, manifest, _on_progress, abort,
             )
-            log_msg(f"tile pulse complete — {len(sipms)} SiPMs")
+            log_msg(f"done — {summary}")
         except Exception as e:
             log_msg(f"FAIL: {type(e).__name__}: {e}")
+        finally:
+            try: rf.close()
+            except Exception: pass
+            try: await _run_in_thread(P.bias_off, HUB.elec)
+            except Exception: pass
+            clear_activity()
 
-    with ui.row().classes("mt-2 gap-2"):
-        ui.button("run tile iv sweep", on_click=run_tile_iv).props("color=primary")
-        ui.button("run tile pulse",    on_click=run_tile_pulse).props("color=primary")
+    refresh_list()
 
 
 # ===========================================================================
@@ -7946,7 +9369,7 @@ def index():
         t_lab    = ui.tab("lab book")
         t_l1     = ui.tab("L1 — primitives")
         t_l2     = ui.tab("L2 — single SiPM")
-        t_l3     = ui.tab("L3 — tile sweep")
+        t_l3     = ui.tab("L3 — sequence")
         t_l4     = ui.tab("L4 — temp point")
         t_l5     = ui.tab("L5 — full run")
         t_rast   = ui.tab("raster")
@@ -7969,7 +9392,7 @@ def index():
         # button — it's the most-clicked destination, so it doesn't
         # belong two levels deep.
         "measurements": [("L1 — primitives", t_l1), ("L2 — single SiPM", t_l2),
-                         ("L3 — tile sweep", t_l3), ("L4 — temp point", t_l4),
+                         ("L3 — sequence", t_l3), ("L4 — temp point", t_l4),
                          ("L5 — full run", t_l5), ("raster", t_rast),
                          ("alignment", t_align)],
     }
