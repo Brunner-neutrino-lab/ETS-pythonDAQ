@@ -3459,12 +3459,42 @@ def _build_level2_tab():
                             HUB.config.led_pulse_width,
                         )
                     delay = float(getattr(HUB.config, "iv_delay_s", 0.05))
+                    # Per-voltage progress feedback.  The cb fires inside
+                    # the worker thread, so it goes to BOTH the page log
+                    # (NiceGUI queues UI updates from any thread) and
+                    # stdout (guaranteed real-time in the systemd journal
+                    # via `journalctl --user -fu daq-webapp -f`).  The
+                    # journal path is the reliable one — the page log
+                    # may batch.
+                    n_total = len(voltages)
+                    def _iv_prog(i, n, v, mean_i, std_i):
+                        line = (f"  [{i}/{n}] v={v:+.3f} V  "
+                                f"I={mean_i:+.3e} A ± {std_i:.2e}")
+                        try: log_msg(line)
+                        except Exception: pass
+                        try: print(f"[L2 IV] {line}", flush=True)
+                        except Exception: pass
                     if meter == "k6485":
                         result = await _run_in_thread(
-                            P.iv_sweep_external_meter, HUB.elec, HUB.k6485,
-                            voltages, int(iv_npt.value), delay,
+                            lambda: P.iv_sweep_external_meter(
+                                HUB.elec, HUB.k6485, voltages,
+                                n_per_voltage=int(iv_npt.value),
+                                delay_s=delay,
+                                progress_cb=_iv_prog,
+                            )
                         )
                     else:
+                        # The B2987's on-instrument sweep doesn't support
+                        # progress callbacks — it returns one block.
+                        # Heartbeat once at the start so the user sees
+                        # something.
+                        print(f"[L2 IV] b2987 sweep starting "
+                              f"({n_total} voltages, "
+                              f"{int(iv_npt.value)} pts/V) — "
+                              "no per-point progress on this meter",
+                              flush=True)
+                        log_msg(f"  b2987 sweep starting "
+                                f"({n_total} V, no per-pt updates)")
                         result = await _run_in_thread(
                             P.iv_sweep, HUB.elec, voltages,
                             int(iv_npt.value), delay,

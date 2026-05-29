@@ -150,7 +150,8 @@ def iv_sweep(elec, voltages, n_per_voltage: int = 5,
 def iv_sweep_external_meter(elec, meter, voltages,
                             n_per_voltage: int = 5,
                             delay_s: float = 0.1,
-                            first_point_settle_s: float = 0.5):
+                            first_point_settle_s: float = 0.5,
+                            progress_cb=None):
     """
     Run an IV sweep where `elec` sources voltage and `meter` measures current.
 
@@ -170,6 +171,11 @@ def iv_sweep_external_meter(elec, meter, voltages,
                            previous bias state was avalanche current; the
                            discharge transient otherwise inflates the first
                            reading.
+    progress_cb          : Optional callable(i, n_total, v, mean_i, std_i).
+                           Called once per voltage point AFTER its samples
+                           are in.  Exceptions inside the callback are
+                           swallowed (cb is for UI feedback — must never
+                           abort the sweep).
 
     Returns
     -------
@@ -185,6 +191,7 @@ def iv_sweep_external_meter(elec, meter, voltages,
     raw_s, raw_i, raw_t = [], [], []
     run_ts = time.time()
 
+    n_total = len(voltages)
     for ix, v in enumerate(voltages):
         settle = first_point_settle_s if ix == 0 else delay_s
         elec.set_bias(float(v), settle_s=settle)
@@ -197,6 +204,15 @@ def iv_sweep_external_meter(elec, meter, voltages,
         raw_s.extend([float(v)] * len(currents))
         raw_i.extend(np.asarray(currents, dtype=np.float64).tolist())
         raw_t.extend(np.asarray(timestamps, dtype=np.float64).tolist())
+        if progress_cb is not None:
+            try:
+                arr = np.asarray(currents, dtype=np.float64)
+                mean_i = float(arr.mean()) if arr.size else float("nan")
+                std_i  = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+                progress_cb(ix + 1, n_total, float(v), mean_i, std_i)
+            except Exception:
+                # UI callback: never let it abort the sweep
+                pass
 
     source_v  = np.asarray(raw_s, dtype=np.float64)
     current_a = np.asarray(raw_i, dtype=np.float64)
