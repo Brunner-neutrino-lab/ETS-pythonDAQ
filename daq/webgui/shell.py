@@ -3241,9 +3241,12 @@ def _build_level2_tab():
                     .classes("w-24 num")
                 mux_in.bind_enabled_from(mux_use, "value")
 
-            # ---- Location (optional — gates whether stage moves) ----
+            # ---- Bright-measurement location ----
+            # When on, the stage moves the LIGHT SOURCE to (x, y) for any
+            # bright measurement (IV bright, pulse bright, scan center).
+            # Dark measurements use the dark-location row below instead.
             with ui.row().classes("gap-2 items-end"):
-                loc_use = ui.switch("Location", value=False) \
+                loc_use = ui.switch("Bright location", value=False) \
                     .props("dense")
                 cx_in = ui.number(label="x (mm)", value=0.0,
                                    step=0.1, format="%.3f") \
@@ -3253,6 +3256,23 @@ def _build_level2_tab():
                     .classes("w-24 num")
                 cx_in.bind_enabled_from(loc_use, "value")
                 cy_in.bind_enabled_from(loc_use, "value")
+
+            # ---- Dark-measurement location ----
+            # When on, the stage moves the LIGHT SOURCE to (dx, dy) for
+            # any dark measurement (typically a spot well away from the
+            # SiPM so the LED's residual light can't bias the result).
+            # When off, the stage doesn't move for dark measurements.
+            with ui.row().classes("gap-2 items-end"):
+                dark_loc_use = ui.switch("Dark location", value=False) \
+                    .props("dense")
+                dx_in = ui.number(label="x (mm)", value=0.0,
+                                   step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                dy_in = ui.number(label="y (mm)", value=0.0,
+                                   step=0.1, format="%.3f") \
+                    .classes("w-24 num")
+                dx_in.bind_enabled_from(dark_loc_use, "value")
+                dy_in.bind_enabled_from(dark_loc_use, "value")
 
             # ---- Temperature (always required) ----
             with ui.row().classes("gap-2 items-end"):
@@ -3312,12 +3332,21 @@ def _build_level2_tab():
         # ---- helpers shared by all measurement cards ----
         def _opt_kwargs() -> dict:
             """Pack the optional identifier fields (None when their switch
-            is off).  Pass directly to MSTORE.save_l2_* via **_opt_kwargs()."""
+            is off).  Pass directly to MSTORE.save_l2_* via **_opt_kwargs().
+
+            Both bright (`center_x_mm`/`center_y_mm`) and dark
+            (`dark_x_mm`/`dark_y_mm`) coordinates are included
+            whenever their respective switches are on, regardless of
+            which one the current measurement actually used — the
+            file then records the full position setup for both.
+            """
             return {
                 "sipm_id":     int(sipm_in.value) if sipm_use.value else None,
                 "mux_channel": int(mux_in.value)  if mux_use.value  else None,
                 "center_x_mm": float(cx_in.value) if loc_use.value  else None,
                 "center_y_mm": float(cy_in.value) if loc_use.value  else None,
+                "dark_x_mm":   float(dx_in.value) if dark_loc_use.value else None,
+                "dark_y_mm":   float(dy_in.value) if dark_loc_use.value else None,
             }
 
         async def _prep_position(bright: bool = False) -> bool:
@@ -3325,14 +3354,18 @@ def _build_level2_tab():
 
             MUX:  selected whenever the MUX switch is on (wiring,
                   independent of light state).
-            Stage: only moves when BOTH the Location switch is on AND
-                  the measurement is bright — the stage carries the
-                  light source, so for dark measurements the location
-                  is irrelevant.
+            Stage: bright measurement → moves to (cx, cy) if the
+                  Bright-location switch is on.
+                  dark measurement   → moves to (dx, dy) if the
+                  Dark-location switch is on.  Otherwise no move.
+                  The stage carries the light source, so:
+                    - bright + bright-loc on  → light goes over SiPM
+                    - dark   + dark-loc   on  → light parks away
+                    - either + corresponding switch off → no move
 
-            Returns True if everything that was requested succeeded;
-            True also when nothing was requested.  Logs + returns
-            False on any failure.
+            Returns True if everything requested succeeded (True also
+            when nothing was requested).  Logs + returns False on any
+            failure.
             """
             if mux_use.value:
                 if HUB.mux is None:
@@ -3344,19 +3377,28 @@ def _build_level2_tab():
                 except Exception as e:
                     log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
                     return False
-            if loc_use.value and bright:
-                if HUB.stage is None:
-                    log_msg("Location enabled (bright) but stage not "
-                            "connected — abort")
-                    return False
-                try:
-                    await _run_in_thread(
-                        P.move_stage, HUB.stage,
-                        float(cx_in.value), float(cy_in.value),
-                        bool(HUB.config.stage_deenergize),
-                    )
-                except Exception as e:
-                    log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
+            # Choose which coord pair (if any) to move to based on
+            # bright vs dark + which Location switch is on.
+            if bright and loc_use.value:
+                target_x, target_y = float(cx_in.value), float(cy_in.value)
+                tag = "bright"
+            elif (not bright) and dark_loc_use.value:
+                target_x, target_y = float(dx_in.value), float(dy_in.value)
+                tag = "dark"
+            else:
+                return True   # no stage move requested
+            if HUB.stage is None:
+                log_msg(f"{tag.title()} location enabled but stage not "
+                        "connected — abort")
+                return False
+            try:
+                await _run_in_thread(
+                    P.move_stage, HUB.stage,
+                    target_x, target_y,
+                    bool(HUB.config.stage_deenergize),
+                )
+            except Exception as e:
+                log_msg(f"  stage FAIL: {type(e).__name__}: {e}")
                     return False
             return True
 

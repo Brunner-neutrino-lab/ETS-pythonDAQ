@@ -85,6 +85,7 @@ def _write_optional_attrs(group, **kw) -> None:
 def save_l2_iv_sweep(result, *, temperature_K, illuminated, meter,
                      sipm_id=None, mux_channel=None,
                      center_x_mm=None, center_y_mm=None,
+                     dark_x_mm=None, dark_y_mm=None,
                      base_dir="data") -> Path:
     """Persist an IV sweep SweepResult.
 
@@ -107,7 +108,9 @@ def save_l2_iv_sweep(result, *, temperature_K, illuminated, meter,
         _write_optional_attrs(f,
                               mux_channel=mux_channel,
                               center_x_mm=center_x_mm,
-                              center_y_mm=center_y_mm)
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
         g = f.create_group(f"iv/{_illum(illuminated)}/{ms}")
         h5io.write_sweep_result(g, result, attrs={"meter": str(meter)})
     log.info("L2 IV saved to %s", path)
@@ -117,6 +120,7 @@ def save_l2_iv_sweep(result, *, temperature_K, illuminated, meter,
 def save_l2_current_measure(result, *, temperature_K, illuminated, meter,
                             sipm_id=None, mux_channel=None,
                             center_x_mm=None, center_y_mm=None,
+                     dark_x_mm=None, dark_y_mm=None,
                             base_dir="data") -> Path:
     """Persist a current_measure SweepResult (single averaged point)."""
     ms = _now_ms()
@@ -132,7 +136,9 @@ def save_l2_current_measure(result, *, temperature_K, illuminated, meter,
         _write_optional_attrs(f,
                               mux_channel=mux_channel,
                               center_x_mm=center_x_mm,
-                              center_y_mm=center_y_mm)
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
         g = f.create_group(f"current_measure/{_illum(illuminated)}/{ms}")
         h5io.write_sweep_result(g, result, attrs={
             "meter":    str(meter),
@@ -146,6 +152,7 @@ def save_l2_current_measure(result, *, temperature_K, illuminated, meter,
 def save_l2_pulse_run(result, *, temperature_K, illuminated, bias_v,
                       sipm_id=None, mux_channel=None,
                       center_x_mm=None, center_y_mm=None,
+                     dark_x_mm=None, dark_y_mm=None,
                       capture_ch=None, capture_thr_adc=None,
                       aux_trigger_ch=None, aux_trigger_thr_adc=None,
                       base_dir="data") -> Path:
@@ -168,7 +175,9 @@ def save_l2_pulse_run(result, *, temperature_K, illuminated, bias_v,
         _write_optional_attrs(f,
                               mux_channel=mux_channel,
                               center_x_mm=center_x_mm,
-                              center_y_mm=center_y_mm)
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
         g = f.create_group(f"pulse/{_illum(illuminated)}/{ms}")
         h5io.write_pulse_multichannel(g, result,
                                       attrs={"bias_v": float(bias_v)})
@@ -188,6 +197,7 @@ def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
                   n_per_point, settle_s,
                   sipm_id=None, mux_channel=None,
                   center_x_mm=None, center_y_mm=None,
+                  dark_x_mm=None, dark_y_mm=None,
                   base_dir="data") -> Path:
     """Persist a 1D line scan along X or Y.
 
@@ -210,7 +220,9 @@ def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
         _write_optional_attrs(f,
                               mux_channel=mux_channel,
                               center_x_mm=center_x_mm,
-                              center_y_mm=center_y_mm)
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
         g = f.create_group(f"scan/{str(axis).lower()}/{ms}")
         g.create_dataset("position_mm",    data=positions, compression="gzip")
         g.create_dataset("mean_current_a", data=means,     compression="gzip")
@@ -236,7 +248,9 @@ def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
         _write_optional_attrs(g,
                               mux_channel=mux_channel,
                               center_x_mm=center_x_mm,
-                              center_y_mm=center_y_mm)
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
     log.info("L2 scan saved to %s", path)
     return path
 
