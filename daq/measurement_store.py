@@ -58,6 +58,49 @@ def _l1_dir(base_dir) -> Path:
     return Path(base_dir) / "L1"
 
 
+def _safe_subdir(base_dir, subdir) -> Path:
+    """Resolve an operator-supplied subfolder under base_dir, rejecting any
+    value that escapes it (the name comes from the L2 page, so a "../.."
+    must not write outside the data dir)."""
+    root = Path(base_dir).resolve()
+    target = (root / subdir).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"folder escapes data dir: {subdir!r}")
+    return target
+
+
+def _safe_stem(basename: str) -> str:
+    """Filename stem from operator input: drop any directory parts and a
+    trailing .h5 so a typed "run1.h5" or "a/b" can't redirect the write."""
+    stem = Path(str(basename)).name
+    if stem.lower().endswith(".h5"):
+        stem = stem[:-3]
+    return stem.strip()
+
+
+def _l2_path(base_dir, sipm_id, temperature_K, *, folder, basename, ms) -> Path:
+    """Resolve where an L2 measurement file is written.
+
+    folder   — operator-chosen subfolder under base_dir; falls back to the
+               per-(sipm, T) auto folder when blank.
+    basename — operator-chosen filename stem; falls back to the unix-ms
+               stamp. If a chosen basename collides with an existing file the
+               ms stamp is appended, so a run never silently overwrites
+               another.
+    """
+    out_dir = (_safe_subdir(base_dir, folder) if folder
+               else _l2_dir(base_dir, sipm_id, temperature_K))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(basename) if basename else ""
+    if stem:
+        path = out_dir / f"{stem}.h5"
+        if path.exists():
+            path = out_dir / f"{stem}_{ms}.h5"
+    else:
+        path = out_dir / f"{ms}.h5"
+    return path
+
+
 def _illum(illuminated: bool) -> str:
     return "illuminated" if illuminated else "dark"
 
@@ -86,6 +129,7 @@ def save_l2_iv_sweep(result, *, temperature_K, illuminated, meter,
                      sipm_id=None, mux_channel=None,
                      center_x_mm=None, center_y_mm=None,
                      dark_x_mm=None, dark_y_mm=None,
+                     folder=None, basename=None,
                      base_dir="data") -> Path:
     """Persist an IV sweep SweepResult.
 
@@ -96,9 +140,8 @@ def save_l2_iv_sweep(result, *, temperature_K, illuminated, meter,
     them blank.
     """
     ms = _now_ms()
-    folder = _l2_dir(base_dir, sipm_id, temperature_K)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{ms}.h5"
+    path = _l2_path(base_dir, sipm_id, temperature_K,
+                    folder=folder, basename=basename, ms=ms)
     with h5py.File(path, "w") as f:
         h5io.write_top_attrs(f,
                              measurement_type="iv",
@@ -121,12 +164,12 @@ def save_l2_current_measure(result, *, temperature_K, illuminated, meter,
                             sipm_id=None, mux_channel=None,
                             center_x_mm=None, center_y_mm=None,
                      dark_x_mm=None, dark_y_mm=None,
+                            folder=None, basename=None,
                             base_dir="data") -> Path:
     """Persist a current_measure SweepResult (single averaged point)."""
     ms = _now_ms()
-    folder = _l2_dir(base_dir, sipm_id, temperature_K)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{ms}.h5"
+    path = _l2_path(base_dir, sipm_id, temperature_K,
+                    folder=folder, basename=basename, ms=ms)
     with h5py.File(path, "w") as f:
         h5io.write_top_attrs(f,
                              measurement_type="current_measure",
@@ -155,6 +198,7 @@ def save_l2_pulse_run(result, *, temperature_K, illuminated, bias_v,
                      dark_x_mm=None, dark_y_mm=None,
                       capture_ch=None, capture_thr_adc=None,
                       aux_trigger_ch=None, aux_trigger_thr_adc=None,
+                      folder=None, basename=None,
                       base_dir="data") -> Path:
     """Persist a pulse_run DigitizerResult.
 
@@ -163,9 +207,8 @@ def save_l2_pulse_run(result, *, temperature_K, illuminated, bias_v,
     chain was set up — the VX2740 results don't carry that on their own.
     """
     ms = _now_ms()
-    folder = _l2_dir(base_dir, sipm_id, temperature_K)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{ms}.h5"
+    path = _l2_path(base_dir, sipm_id, temperature_K,
+                    folder=folder, basename=basename, ms=ms)
     with h5py.File(path, "w") as f:
         h5io.write_top_attrs(f,
                              measurement_type="pulse",
@@ -190,6 +233,81 @@ def save_l2_pulse_run(result, *, temperature_K, illuminated, bias_v,
     return path
 
 
+def save_l2_pulse_sweep(*, bias_v, mean_amp_adc, std_amp_adc,
+                        n_pulses, rate_hz, n_waveforms,
+                        per_bias_amplitudes_adc=None,
+                        per_bias_timestamps_s=None,
+                        temperature_K, illuminated,
+                        capture_ch, capture_thr_adc,
+                        aux_trigger_ch=None, aux_trigger_thr_adc=None,
+                        sipm_id=None, mux_channel=None,
+                        center_x_mm=None, center_y_mm=None,
+                        dark_x_mm=None, dark_y_mm=None,
+                        folder=None, basename=None,
+                        base_dir="data") -> Path:
+    """Persist a pulse-vs-bias sweep (the GUI form of the bench ov_scan).
+
+    At each bias the digitizer self-triggers N waveforms; the per-bias
+    amplitude spectrum is reduced to mean/std/count plus a trigger rate.
+    The summary arrays are datasets on the sweep group; the full per-bias
+    amplitude arrays (if supplied) are kept in `point_NNN/` subgroups so
+    the spectra stay recoverable for offline gain/DCR fits.
+    """
+    ms = _now_ms()
+    path = _l2_path(base_dir, sipm_id, temperature_K,
+                    folder=folder, basename=basename, ms=ms)
+    bias = np.asarray(bias_v,       dtype=np.float64)
+    mean = np.asarray(mean_amp_adc, dtype=np.float64)
+    std  = np.asarray(std_amp_adc,  dtype=np.float64)
+    npul = np.asarray(n_pulses,     dtype=np.int64)
+    rate = np.asarray(rate_hz,      dtype=np.float64)
+    nwfs = np.asarray(n_waveforms,  dtype=np.int64)
+    with h5py.File(path, "w") as f:
+        h5io.write_top_attrs(f,
+                             measurement_type="pulse_sweep",
+                             sipm_id=sipm_id,
+                             temperature_K=temperature_K,
+                             illuminated=illuminated)
+        _write_optional_attrs(f,
+                              mux_channel=mux_channel,
+                              center_x_mm=center_x_mm,
+                              center_y_mm=center_y_mm,
+                              dark_x_mm=dark_x_mm,
+                              dark_y_mm=dark_y_mm)
+        g = f.create_group(f"pulse_sweep/{_illum(illuminated)}/{ms}")
+        g.create_dataset("bias_v",       data=bias, compression="gzip")
+        g.create_dataset("mean_amp_adc", data=mean, compression="gzip")
+        g.create_dataset("std_amp_adc",  data=std,  compression="gzip")
+        g.create_dataset("n_pulses",     data=npul, compression="gzip")
+        g.create_dataset("rate_hz",      data=rate, compression="gzip")
+        g.create_dataset("n_waveforms",  data=nwfs, compression="gzip")
+        g.attrs["n_points"] = int(len(bias))
+        _write_optional_attrs(g,
+                              capture_ch=capture_ch,
+                              capture_thr_adc=capture_thr_adc,
+                              aux_trigger_ch=aux_trigger_ch,
+                              aux_trigger_thr_adc=aux_trigger_thr_adc)
+        if per_bias_amplitudes_adc is not None:
+            for i, amps in enumerate(per_bias_amplitudes_adc):
+                pg = g.create_group(f"point_{i:03d}")
+                ts = None
+                if (per_bias_timestamps_s is not None
+                        and i < len(per_bias_timestamps_s)):
+                    ts = per_bias_timestamps_s[i]
+                h5io.write_pulse(
+                    pg,
+                    amplitudes_adc=np.asarray(amps, dtype=np.float32),
+                    timestamps_s=(np.asarray(ts, dtype=np.float64)
+                                  if ts is not None else None),
+                    channel=(int(capture_ch)
+                             if capture_ch is not None else None),
+                    attrs={"bias_v":   float(bias[i]),
+                           "mean_amp_adc": float(mean[i]),
+                           "n_pulses": int(npul[i])})
+    log.info("L2 pulse sweep saved to %s", path)
+    return path
+
+
 def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
                   raw_current_a=None,
                   temperature_K, axis, bias_v, meter,
@@ -198,6 +316,7 @@ def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
                   sipm_id=None, mux_channel=None,
                   center_x_mm=None, center_y_mm=None,
                   dark_x_mm=None, dark_y_mm=None,
+                  folder=None, basename=None,
                   base_dir="data") -> Path:
     """Persist a 1D line scan along X or Y.
 
@@ -205,9 +324,8 @@ def save_l2_scan(*, positions_mm, mean_current_a, std_current_a,
     mux_channel, center_{x,y}_mm are only written if not None.
     """
     ms = _now_ms()
-    folder = _l2_dir(base_dir, sipm_id, temperature_K)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{ms}.h5"
+    path = _l2_path(base_dir, sipm_id, temperature_K,
+                    folder=folder, basename=basename, ms=ms)
     positions = np.asarray(positions_mm, dtype=np.float64)
     means     = np.asarray(mean_current_a, dtype=np.float64)
     stds      = np.asarray(std_current_a,  dtype=np.float64)

@@ -56,6 +56,26 @@ from ks33500b         import KS33500BController
 from daq              import h5io
 
 
+def _make_hv_confirm(allow: bool):
+    """Build the electrometer high-voltage confirmer for a bench run.
+
+    With --allow-high-voltage the operator has pre-approved the run, so any
+    command above the limit passes (logged loudly). Otherwise prompt on an
+    interactive terminal; a non-interactive run (cron, redirected stdin)
+    denies, leaving the interlock's deny-by-default intact.
+    """
+    def confirm(vmax: float) -> bool:
+        if allow:
+            log.warning("HIGH VOLTAGE: %.1f V approved via --allow-high-voltage", vmax)
+            return True
+        if not sys.stdin.isatty():
+            log.error("HIGH VOLTAGE: %.1f V denied (no TTY; pass --allow-high-voltage)", vmax)
+            return False
+        reply = input(f"\n!! High voltage {vmax:.1f} V exceeds the 60 V limit. Proceed? [y/N] ")
+        return reply.strip().lower() in ("y", "yes")
+    return confirm
+
+
 # ---------------------------------------------------------------------------
 # Configuration — defaults for this bench. Override on the command line.
 # ---------------------------------------------------------------------------
@@ -285,6 +305,7 @@ def test_connect_all(cfg: dict, results: StepResult) -> dict:
     with step(results, "B2987 connect"):
         e = B2987BController(visa=cfg["b2987_visa"], mode="hardware")
         e.connect()
+        e.set_hv_confirm(_make_hv_confirm(allow=cfg.get("allow_high_voltage", False)))
         log.info("  B2987 IDN: %s", e.identify())
         e.configure_sweep(
             source_range          = 1000,
@@ -1684,6 +1705,10 @@ def main():
                     help="override V_BD (V); skips IV and the cache.")
     ap.add_argument("--no-plot", action="store_true",
                     help="don't auto-write PNGs into plots/ at the end.")
+    ap.add_argument("--allow-high-voltage", action="store_true",
+                    help="auto-approve the electrometer high-voltage interlock "
+                         "(commands above the 60 V limit). Without this, a "
+                         "non-interactive run denies them.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -1717,6 +1742,7 @@ def main():
     log.info("tests to run: %s", ",".join(run_tests))
 
     cfg = dict(DEFAULT_CFG)
+    cfg["allow_high_voltage"] = bool(args.allow_high_voltage)
     results = StepResult()
 
     with h5py.File(h5_path, "w") as h5:

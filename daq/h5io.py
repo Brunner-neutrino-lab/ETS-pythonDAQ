@@ -21,6 +21,7 @@ Pulse            amplitudes_v, amplitudes_adc, timestamps_s,
                  waveforms, time_axis_s         (inside ch{N}/ subgroups
                                                  when multi-channel)
 Current samples  current_a, timestamp_s, source_v, voltage_v
+Scan             positions_mm, mean_current_a, std_current_a, raw_current_a
 
 Locked top-level attrs
 ----------------------
@@ -244,6 +245,26 @@ def write_current_samples(grp, *,
     grp.attrs["mean_a"] = float(arr.mean()) if arr.size else float("nan")
     grp.attrs["std_a"]  = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
 
+    _apply_attrs(grp, attrs)
+
+
+# ---------------------------------------------------------------------------
+# 1-D scans (current vs stage position)
+# ---------------------------------------------------------------------------
+
+def write_scan(grp, *,
+               positions_mm,
+               mean_current_a,
+               std_current_a=None,
+               raw_current_a=None,
+               attrs: Optional[dict] = None) -> None:
+    """Write a 1-D position scan into `grp` using canonical dataset names."""
+    _ds(grp, "positions_mm",   positions_mm,   dtype=np.float64)
+    _ds(grp, "mean_current_a", mean_current_a, dtype=np.float64)
+    _ds(grp, "std_current_a",  std_current_a,  dtype=np.float64)
+    _ds(grp, "raw_current_a",  raw_current_a,  dtype=np.float64)
+
+    grp.attrs["timestamp"] = time.time()
     _apply_attrs(grp, attrs)
 
 

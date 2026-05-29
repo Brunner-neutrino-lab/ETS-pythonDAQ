@@ -74,6 +74,7 @@ class InstrumentHub:
             "lamp_stage":  None,   # future
             "slowcontrol": self.sc,
             "wfg":         self.wfg,
+            "ks33500b":    self.ks33500b,
             "nge100":      self.nge100,
         }
 

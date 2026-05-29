@@ -33,6 +33,17 @@ One HDF5 file per run (opened once, kept open throughout).
     └── flux/
         └── <timestamp_s>    float64 scalar (one dataset per flux reading)
 
+L3 sequence runs use a parallel `/seq/<entry_index>/...` layout so that the
+same SiPM can appear more than once in a list (repeats) without colliding:
+
+    /seq/<idx>/<sipm_id>/<temperature_K>K/<dark|illuminated>/iv/
+    /seq/<idx>/<sipm_id>/<temperature_K>K/<dark|illuminated>/pulse/<bias_mV>/ch{N}/
+    /seq/<idx>/<sipm_id>/<temperature_K>K/scan/<axis>/
+
+The entry index disambiguates repeats; the pulse bias-sweep gets one subgroup
+per bias point (keyed by integer millivolts). The serialized sequence is stored
+at /meta/sequence. The tile-mode write_iv/write_pulse layout above is unchanged.
+
 Usage
 -----
     from daq.storage import RunFile
@@ -228,6 +239,51 @@ class RunFile:
         log.debug("Flux written: %.3e A", flux_a)
 
     # ------------------------------------------------------------------
+    # L3 sequence data  (/seq/<idx>/... — repeat-safe)
+    # ------------------------------------------------------------------
+
+    def write_iv_seq(self, idx, sipm_id, temperature_K, illuminated,
+                     result, attrs: Optional[dict] = None):
+        """Write an IV SweepResult for sequence entry `idx`."""
+        grp = self._seq_iv_group(idx, sipm_id, temperature_K, illuminated)
+        h5io.write_sweep_result(grp, result,
+                                attrs=self._seq_attrs(idx, sipm_id, temperature_K,
+                                                      illuminated, attrs))
+        self._file.flush()
+
+    def write_pulse_seq(self, idx, sipm_id, temperature_K, illuminated,
+                        bias_v, result, attrs: Optional[dict] = None):
+        """Write a pulse DigitizerResult for one bias point of entry `idx`."""
+        grp = self._seq_pulse_group(idx, sipm_id, temperature_K, illuminated, bias_v)
+        merged = self._seq_attrs(idx, sipm_id, temperature_K, illuminated, attrs)
+        merged["bias_v"] = float(bias_v)
+        h5io.write_pulse_multichannel(grp, result, attrs=merged)
+        self._file.flush()
+
+    def write_scan_seq(self, idx, sipm_id, temperature_K, axis,
+                       positions_mm, mean_current_a, std_current_a=None,
+                       raw_current_a=None, attrs: Optional[dict] = None):
+        """Write a 1-D scan for sequence entry `idx`."""
+        grp = self._seq_scan_group(idx, sipm_id, temperature_K, axis)
+        merged = self._seq_attrs(idx, sipm_id, temperature_K, None, attrs)
+        merged["axis"] = str(axis)
+        h5io.write_scan(grp,
+                        positions_mm   = positions_mm,
+                        mean_current_a = mean_current_a,
+                        std_current_a  = std_current_a,
+                        raw_current_a  = raw_current_a,
+                        attrs          = merged)
+        self._file.flush()
+
+    def write_sequence_meta(self, seq_dict: dict):
+        """Store the serialized sequence at /meta/sequence (self-describing file)."""
+        meta = self._file.require_group("meta")
+        if "sequence" in meta:
+            del meta["sequence"]
+        meta.create_dataset("sequence", data=json.dumps(seq_dict))
+        self._file.flush()
+
+    # ------------------------------------------------------------------
     # Group helpers
     # ------------------------------------------------------------------
 
@@ -236,6 +292,43 @@ class RunFile:
 
     def _cond_key(self, illuminated: bool) -> str:
         return "illuminated" if illuminated else "dark"
+
+    def _bias_key(self, bias_v: float) -> str:
+        return f"{int(round(bias_v * 1000))}mV"
+
+    def _seq_attrs(self, idx, sipm_id, temperature_K, illuminated, attrs):
+        merged = {
+            "seq_index":     int(idx),
+            "sipm_id":       int(sipm_id),
+            "temperature_K": float(temperature_K),
+        }
+        if illuminated is not None:
+            merged["illuminated"] = int(bool(illuminated))
+        if attrs:
+            merged.update(attrs)
+        return merged
+
+    def _seq_require(self, path: str):
+        if path in self._file:
+            raise RuntimeError(
+                f"Sequence data already exists at {path} in {self._path}. "
+                "This would overwrite existing data."
+            )
+        return self._file.require_group(path)
+
+    def _seq_iv_group(self, idx, sipm_id, temperature_K, illuminated):
+        return self._seq_require(
+            f"seq/{int(idx)}/{sipm_id}/{self._temp_key(temperature_K)}/"
+            f"{self._cond_key(illuminated)}/iv")
+
+    def _seq_pulse_group(self, idx, sipm_id, temperature_K, illuminated, bias_v):
+        return self._seq_require(
+            f"seq/{int(idx)}/{sipm_id}/{self._temp_key(temperature_K)}/"
+            f"{self._cond_key(illuminated)}/pulse/{self._bias_key(bias_v)}")
+
+    def _seq_scan_group(self, idx, sipm_id, temperature_K, axis):
+        return self._seq_require(
+            f"seq/{int(idx)}/{sipm_id}/{self._temp_key(temperature_K)}/scan/{axis}")
 
     def _iv_group(self, sipm_id: int, temperature_K: float, illuminated: bool):
         path = f"{sipm_id}/{self._temp_key(temperature_K)}/{self._cond_key(illuminated)}/iv"

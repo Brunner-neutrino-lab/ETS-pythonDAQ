@@ -62,11 +62,15 @@ LOG_FILENAME      = "run_log.jsonl"
 @dataclass
 class Step:
     step_id:     str
-    kind:        str    # "iv", "pulse", "flux"
+    kind:        str    # "iv", "pulse", "flux", "scan"
     illuminated: bool
     sipm_id:     Optional[int]   # None for flux steps
     temperature_K: float
     mux_channel: Optional[int]   # None for flux steps
+    # L3 sequence steps carry these; None for the config-driven tile stack.
+    seq_index:   Optional[int]   = None
+    bias_v:      Optional[float] = None   # pulse bias point
+    axis:        Optional[str]   = None   # scan axis
 
 
 class RunManifest:
@@ -173,6 +177,12 @@ class RunManifest:
         log.info("Manifest generated: %d steps", len(steps))
         return steps
 
+    def set_steps(self, steps: list) -> None:
+        """Install a pre-built step list (used by the L3 sequence runner, whose
+        steps come from a spec list rather than from config)."""
+        self._steps = list(steps)
+        log.info("Manifest steps set: %d steps", len(self._steps))
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -187,6 +197,9 @@ class RunManifest:
                 "sipm_id":       s.sipm_id,
                 "temperature_K": s.temperature_K,
                 "mux_channel":   s.mux_channel,
+                "seq_index":     s.seq_index,
+                "bias_v":        s.bias_v,
+                "axis":          s.axis,
             }
             for s in self._steps
         ]
@@ -207,6 +220,9 @@ class RunManifest:
                 sipm_id       = d.get("sipm_id"),
                 temperature_K = d["temperature_K"],
                 mux_channel   = d.get("mux_channel"),
+                seq_index     = d.get("seq_index"),
+                bias_v        = d.get("bias_v"),
+                axis          = d.get("axis"),
             )
             for d in data
         ]
