@@ -12,6 +12,38 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-06-02 — config.py untracked; template + first-run bootstrap; stop buttons
+
+### What changed
+- **`daq/config.py` is no longer tracked** (gitignored as a per-machine user
+  setting — instrument addresses + measurement defaults change too often to
+  live in version control). The local file (with this bench's LED tweak,
+  1.8 Vpp / 80 ns) stays on disk.
+- **`daq/config.example.py`** (tracked) is the canonical template — seeded from
+  the last committed `config.py` (370c89f), so it carries the shipped lab
+  defaults (3 Vpp / 400 ns LED, `ivmux_port`, etc.), **not** the local tweak.
+- **First-run bootstrap** at the top of `daq/__init__.py`: if `config.py` is
+  absent (fresh checkout), copy `config.example.py` -> `config.py` before any
+  `.config` import. Existing `config.py` is left untouched. Must stay above the
+  `from .digitizer/.config` imports (digitizer pulls in config transitively).
+- Committed the L2 IV/pulse + L3 run/stop control buttons that were WIP in the
+  tree (separate commit, not mine).
+
+### Decisions (user)
+config.py = local user setting -> untrack + gitignore + template/bootstrap so
+fresh machines still start. Keep the run/stop buttons.
+
+### Verified (simulation)
+Moved config.py aside -> `import daq` recreated it from the template (led=3.0);
+restored local (led=1.8 preserved). Template + __init__ compile.
+
+### Open threads
+- If the **template's** defaults drift from what new machines should start with
+  (e.g. someone changes addresses on the bench), remember to update
+  `config.example.py` deliberately — it no longer tracks `config.py`.
+
+---
+
 ## 2026-06-02 — IV MUX added; channel switching moved off the pulse MUX
 
 ### What changed
