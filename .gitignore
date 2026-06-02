@@ -37,6 +37,13 @@ run_config.yaml
 secrets.yaml
 .env.local
 
+# ── Per-machine experiment config ─────────────────────────────────────────
+# daq/config.py holds this bench's instrument addresses and measurement
+# defaults — effectively a local user setting that changes often.  Tracked
+# history (incl. lab defaults) is preserved in git; going forward it's
+# untracked so per-machine edits don't show up as repo changes.
+daq/config.py
+
 # ── OS / editor ───────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
