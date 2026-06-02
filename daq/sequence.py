@@ -260,7 +260,7 @@ def _awg_off(awg, ks_ch):
 def _move_for_condition(instruments, spec: MeasurementSpec, illuminated: bool,
                         config):
     stage = instruments.get("stage")
-    mux   = instruments.get("mux")
+    ivmux = instruments.get("ivmux")
     if illuminated:
         x, y = spec.x_mm, spec.y_mm
     else:
@@ -269,8 +269,8 @@ def _move_for_condition(instruments, spec: MeasurementSpec, illuminated: bool,
     if stage is not None:
         P.move_stage(stage, float(x), float(y),
                      deenergize_after=getattr(config, "stage_deenergize", True))
-    if mux is not None:
-        P.select_channel(mux, int(spec.mux_channel))
+    if ivmux is not None:
+        P.select_channel(ivmux, int(spec.mux_channel))
 
 
 def _exec_iv(spec, instruments, config, illuminated):
@@ -350,7 +350,7 @@ def _exec_scan(spec, instruments, config):
     """Mirror L2 run_scan: AWG on, set bias, step positions, read N per point."""
     elec  = instruments.get("elec")
     stage = instruments.get("stage")
-    mux   = instruments.get("mux")
+    ivmux = instruments.get("ivmux")
     if elec is None or stage is None:
         raise RuntimeError("electrometer or stage not connected")
     meter_name = spec.scan_meter or "k6485"
@@ -370,8 +370,8 @@ def _exec_scan(spec, instruments, config):
     n = max(1, int(spec.n_scan_samples))
     means, stds, raws = [], [], []
 
-    if mux is not None:
-        P.select_channel(mux, int(spec.mux_channel))
+    if ivmux is not None:
+        P.select_channel(ivmux, int(spec.mux_channel))
     try:
         _awg_pulse_on(awg, ks_ch, spec.scan_freq_hz, spec.scan_amp_v,
                       spec.scan_offset_v, spec.scan_width_s)

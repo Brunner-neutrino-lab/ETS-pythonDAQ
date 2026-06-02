@@ -123,6 +123,10 @@ class ExperimentConfig:
     # USB-port changes and reboots.  Plain /dev/ttyUSB1 is fragile because
     # numbering depends on enumeration order.
     mux_port:           str = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_ec8db4c99972ef11ae387a4f8fcc3fa0-if00-port0"
+    # 90-channel IV MUX — Arduino Nano Every over USB-UART, 9600 baud. The
+    # Nano Every enumerates as /dev/ttyACM*; swap in the stable by-id path
+    # once the device is plugged in (numbering is enumeration-order dependent).
+    ivmux_port:         str = "/dev/ttyACM0"
     k6485_port:         str = "/dev/ttyUSB0"
     # K6485 serial framing — overrideable per instrument.
     # Lab default: 9600 / CR / CR; driver default: 57600 / CR+LF / LF.

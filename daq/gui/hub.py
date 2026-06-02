@@ -42,6 +42,7 @@ class InstrumentHub:
         self.elec     = None
         self.dig      = None
         self.mux      = None
+        self.ivmux    = None
         self.k6485    = None
         self.stage    = None
         self.sc       = None
@@ -54,6 +55,7 @@ class InstrumentHub:
             "elec":     "disconnected",
             "dig":      "disconnected",
             "mux":      "disconnected",
+            "ivmux":    "disconnected",
             "k6485":    "disconnected",
             "stage":    "disconnected",
             "sc":       "disconnected",
@@ -69,6 +71,7 @@ class InstrumentHub:
             "elec":        self.elec,
             "digitizer":   self.dig,
             "mux":         self.mux,
+            "ivmux":       self.ivmux,
             "k6485":       self.k6485,
             "stage":       self.stage,
             "lamp_stage":  None,   # future
@@ -146,6 +149,22 @@ class InstrumentHub:
             self.mux.disconnect()
             self.mux = None
         self.status["mux"] = "disconnected"
+
+    def connect_ivmux(self):
+        if self.ivmux is not None:
+            self.status["ivmux"] = f"OK — IV MUX on {self.config.ivmux_port}"
+            return
+        from iv_mux import MuxController
+        c = MuxController(port=self.config.ivmux_port, mode="hardware")
+        c.connect()
+        self.ivmux = c
+        self.status["ivmux"] = f"OK — IV MUX on {self.config.ivmux_port}"
+
+    def disconnect_ivmux(self):
+        if self.ivmux:
+            self.ivmux.disconnect()
+            self.ivmux = None
+        self.status["ivmux"] = "disconnected"
 
     def connect_k6485(self):
         if self.k6485 is not None:

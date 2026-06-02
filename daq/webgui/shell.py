@@ -26,7 +26,7 @@ from nicegui import app, ui, Client
 # Make instrument submodules importable when running from the repo root
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 for _pkg in ("keysight2987b-python", "keithley6485-python", "phidget-stage-python",
-             "pulse-mux-python", "RTO2024-python", "vx2740-python",
+             "pulse-mux-python", "ivmux-python", "RTO2024-python", "vx2740-python",
              "rigoldg1022-python", "r-snge100-python", "keysight33500b-python"):
     _p = os.path.join(_REPO, _pkg)
     if os.path.isdir(_p) and _p not in sys.path:
@@ -197,6 +197,8 @@ _INSTRUMENT_SPECS = [
     {"key": "mux",   "name": "mux",       "addr_attr": "mux_port",
      "addr_label": "port", "connect": "connect_mux",   "disconnect": "disconnect_mux",
      "hidden": True},
+    {"key": "ivmux", "name": "iv-mux",    "addr_attr": "ivmux_port",
+     "addr_label": "port", "connect": "connect_ivmux", "disconnect": "disconnect_ivmux"},
     {"key": "k6485", "name": "k6485",     "addr_attr": "k6485_port",
      "addr_label": "VISA", "connect": "connect_k6485", "disconnect": "disconnect_k6485"},
     # Keysight 33500B = the visible WFG in the header / connect-all.
@@ -2104,6 +2106,11 @@ def _build_status_tab():
             mux_sub = ui.html('<span class="sub" style="color:var(--mut)">mux not connected</span>')
 
         with ui.card().classes("daq-card status-card"):
+            ui.html('<span class="lbl">iv-mux channel</span>')
+            ivmux_val = ui.html('<span class="num big">—</span>')
+            ivmux_sub = ui.html('<span class="sub" style="color:var(--mut)">iv-mux not connected</span>')
+
+        with ui.card().classes("daq-card status-card"):
             ui.html('<span class="lbl">connected users</span>')
             users_val = ui.html('<span class="big">0</span>')
             users_sub = ui.html('<span class="sub" style="color:var(--mut)">—</span>')
@@ -2210,6 +2217,20 @@ def _build_status_tab():
         else:
             mux_val.set_content('<span class="num big">—</span>')
             mux_sub.set_content('<span class="sub" style="color:var(--mut)">mux not connected</span>')
+
+        # IV MUX
+        if HUB.ivmux is not None:
+            try:
+                ch = HUB.ivmux.active_channel()
+                stxt = f"ch {ch}" if ch is not None else "none"
+                ivmux_val.set_content(f'<span class="num big">{stxt}</span>')
+                ivmux_sub.set_content('<span class="sub" style="color:var(--mut)">active channel</span>')
+            except Exception as e:
+                ivmux_val.set_content('<span class="num big">err</span>')
+                ivmux_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(e).__name__}</span>')
+        else:
+            ivmux_val.set_content('<span class="num big">—</span>')
+            ivmux_sub.set_content('<span class="sub" style="color:var(--mut)">iv-mux not connected</span>')
 
         # Users
         users = SESSIONS.unique_users()
@@ -3116,26 +3137,26 @@ def _build_level1_tab():
                     ui.button("▶ run all", on_click=run_all) \
                         .props("color=primary")
 
-            # =========== MUX CHANNEL ===========
+            # =========== IV-MUX CHANNEL ===========
             with ui.element("div").classes("l1-card"):
-                ui.html('<p class="eyebrow">MUX channel</p>')
+                ui.html('<p class="eyebrow">IV-MUX channel</p>')
                 with ui.element("div").classes("fld") \
                         .style("margin-bottom:12px"):
-                    ui.html('<label class="fld-lbl">Channel (1–96)</label>')
+                    ui.html('<label class="fld-lbl">Channel (1–90)</label>')
                     mux_ch_in = ui.number(value=1, step=1,
-                                          min=1, max=96, format="%d") \
+                                          min=1, max=90, format="%d") \
                         .props('dense filled hide-bottom-space')
 
                 mux_active = ui.html('<span class="result">active: '
                                      '<b><span class="muted">—</span></b></span>')
 
                 async def select_ch():
-                    if HUB.mux is None:
-                        log_msg("mux not connected"); return
+                    if HUB.ivmux is None:
+                        log_msg("iv-mux not connected"); return
                     ch = int(mux_ch_in.value or 1)
-                    log_msg(f"mux → ch {ch}")
+                    log_msg(f"iv-mux → ch {ch}")
                     try:
-                        await _run_in_thread(P.select_channel, HUB.mux, ch)
+                        await _run_in_thread(P.select_channel, HUB.ivmux, ch)
                         log_msg(f"  ch {ch} active")
                         mux_active.set_content(
                             f'<span class="result">active: <b>ch{ch}</b></span>'
@@ -3144,11 +3165,11 @@ def _build_level1_tab():
                         log_msg(f"  select FAIL: {type(e).__name__}: {e}")
 
                 async def zero_mux():
-                    if HUB.mux is None:
-                        log_msg("mux not connected"); return
+                    if HUB.ivmux is None:
+                        log_msg("iv-mux not connected"); return
                     try:
-                        await _run_in_thread(P.zero_channels, HUB.mux)
-                        log_msg("mux zeroed")
+                        await _run_in_thread(P.zero_channels, HUB.ivmux)
+                        log_msg("iv-mux zeroed")
                         mux_active.set_content(
                             '<span class="result">active: <b><span class="muted">none</span></b></span>'
                         )
@@ -4021,8 +4042,8 @@ def _build_level2_tab():
                     with ui.element("div").classes("lbl"):
                         mux_use = ui.switch(value=False) \
                             .props("dense color=primary").classes("inc-toggle")
-                        ui.html('<span>MUX ch</span>')
-                    mux_in = ui.number(value=1, step=1, min=1, max=96,
+                        ui.html('<span>IV-MUX ch</span>')
+                    mux_in = ui.number(value=1, step=1, min=1, max=90,
                                        format="%d") \
                         .props('dense filled hide-bottom-space') \
                         .style("width:70px")
@@ -4060,17 +4081,17 @@ def _build_level2_tab():
 
                 async def _go_to_sipm():
                     if not (mux_use.value or loc_use.value):
-                        log_msg("go-to: neither MUX nor Bright location enabled")
+                        log_msg("go-to: neither IV-MUX nor Bright location enabled")
                         return
                     if mux_use.value:
-                        if HUB.mux is None:
-                            log_msg("MUX enabled but mux not connected"); return
+                        if HUB.ivmux is None:
+                            log_msg("IV-MUX enabled but iv-mux not connected"); return
                         try:
                             await _run_in_thread(
-                                P.select_channel, HUB.mux, int(mux_in.value))
-                            log_msg(f"  MUX → ch {int(mux_in.value)}")
+                                P.select_channel, HUB.ivmux, int(mux_in.value))
+                            log_msg(f"  IV-MUX → ch {int(mux_in.value)}")
                         except Exception as e:
-                            log_msg(f"  MUX FAIL: {e}"); return
+                            log_msg(f"  IV-MUX FAIL: {e}"); return
                     if loc_use.value:
                         if HUB.stage is None:
                             log_msg("Bright location enabled but stage not "
@@ -4224,15 +4245,15 @@ def _build_level2_tab():
 
                     async def _prep_position(bright: bool = False) -> bool:
                         if mux_use.value:
-                            if HUB.mux is None:
-                                log_msg("MUX enabled but mux not connected — abort")
+                            if HUB.ivmux is None:
+                                log_msg("IV-MUX enabled but iv-mux not connected — abort")
                                 return False
                             try:
                                 await _run_in_thread(
-                                    P.select_channel, HUB.mux,
+                                    P.select_channel, HUB.ivmux,
                                     int(mux_in.value))
                             except Exception as e:
-                                log_msg(f"  MUX FAIL: {type(e).__name__}: {e}")
+                                log_msg(f"  IV-MUX FAIL: {type(e).__name__}: {e}")
                                 return False
                         if bright and loc_use.value:
                             target_x, target_y = float(cx_in.value), float(cy_in.value)
@@ -5003,8 +5024,8 @@ def _build_level2_tab():
                         async def run_scan():
                             if HUB.elec is None or HUB.stage is None:
                                 log_msg("b2987 or stage not connected"); return
-                            if mux_use.value and HUB.mux is None:
-                                log_msg("MUX enabled but mux not connected")
+                            if mux_use.value and HUB.ivmux is None:
+                                log_msg("IV-MUX enabled but iv-mux not connected")
                                 return
                             meter = str(scan_meter.value or "k6485")
                             if meter == "k6485" and HUB.k6485 is None:
@@ -5016,10 +5037,10 @@ def _build_level2_tab():
                             if mux_use.value:
                                 try:
                                     await _run_in_thread(
-                                        P.select_channel, HUB.mux,
+                                        P.select_channel, HUB.ivmux,
                                         int(mux_in.value))
                                 except Exception as e:
-                                    log_msg(f"  MUX FAIL: "
+                                    log_msg(f"  IV-MUX FAIL: "
                                             f"{type(e).__name__}: {e}"); return
 
                             import numpy as np
@@ -6113,6 +6134,242 @@ def _build_mux_tab():
         connect_btn.set_visibility(False)
         try:
             ch = HUB.mux.active_channel()
+        except Exception:
+            ch = None
+        if ch is None:
+            active_ch.set_content('<span class="v" '
+                                  'style="color:var(--mut)">none</span>')
+        else:
+            active_ch.set_content(f'<span class="v">ch{ch}</span>')
+
+    _refresh_state()
+    ui.timer(1.5, _refresh_state)
+
+
+def _build_ivmux_tab():
+    """90-channel IV MUX front panel.
+
+    Mirrors the pulse-MUX panel (reuses its `.mux-panel` CSS scope) but
+    targets HUB.ivmux and the 1–90 channel range.  The IV MUX has no bypass
+    relay, so the right column carries only the Arduino die-temperature card.
+
+    Layout:
+        [connect strip]
+        [TOP grid 1.5fr | 1fr]
+          [LEFT — Channel select: hero readout + channel/settle fields +
+                   select / zero / refresh buttons]
+          [RIGHT side column — Arduino die temperature]
+        [Channel sweep card — start/stop/dwell + run + status pill]
+    """
+    with ui.element("div").classes("mux-panel w-full"):
+
+        # ---- Connect strip ----
+        with ui.row().classes("connstrip w-full") as connstrip:
+            ui.html('<span class="dot"></span>')
+            conn_lbl = ui.html(
+                '<span class="lbl">Not connected — 90-channel IV MUX</span>'
+            )
+            async def _do_connect():
+                ok = await _quick_connect("ivmux")
+                ui.notify("iv-mux: " + ("connected" if ok else "connect failed"),
+                          type="positive" if ok else "negative",
+                          position="top", timeout=2500)
+            connect_btn = ui.button("connect", on_click=_do_connect) \
+                .props("color=primary dense") \
+                .style("margin-left:auto")
+
+        # ---- Top grid: Channel select | Temperature ----
+        with ui.element("div").classes("top-grid w-full"):
+
+            # ----- LEFT: Channel select -----
+            with ui.card().classes("card-mux"):
+                ui.html('<p class="eyebrow">Channel select</p>')
+
+                # Hero readout — active channel
+                with ui.element("div").classes("hero"):
+                    ui.html('<span class="k">active</span>')
+                    active_ch = ui.html('<span class="v">—</span>')
+
+                # 2-col field row: channel + settle
+                with ui.element("div") \
+                        .style("display:grid; grid-template-columns:1fr 1fr; "
+                               "gap:14px; margin-bottom:16px"):
+                    with ui.element("div").classes("fld"):
+                        ui.html('<label class="fld-lbl">Channel (1–90)</label>')
+                        ch_n = ui.number(value=1, step=1, format="%d",
+                                         min=1, max=90) \
+                            .props("dense filled hide-bottom-space")
+                    with ui.element("div").classes("fld"):
+                        ui.html('<label class="fld-lbl">Settle</label>')
+                        settle_n = ui.number(value=0.050, step=0.01, format="%.3f") \
+                            .props('dense filled hide-bottom-space suffix="s"')
+
+                async def do_select():
+                    if HUB.ivmux is None:
+                        ui.notify("iv-mux not connected",
+                                  type="warning", position="top", timeout=2000)
+                        return
+                    ch = int(ch_n.value or 0)
+                    if ch < 1 or ch > 90:
+                        ui.notify("channel must be 1–90",
+                                  type="warning", position="top", timeout=2000)
+                        return
+                    try:
+                        await _run_in_thread(HUB.ivmux.select, ch,
+                                             float(settle_n.value or 0))
+                        log.info("iv-mux: ch %d selected", ch)
+                    except Exception as e:
+                        ui.notify(f"select FAIL: {type(e).__name__}: {e}",
+                                  type="negative", position="top", timeout=4000)
+
+                async def do_zero():
+                    if HUB.ivmux is None:
+                        ui.notify("iv-mux not connected",
+                                  type="warning", position="top", timeout=2000)
+                        return
+                    try:
+                        await _run_in_thread(HUB.ivmux.zero)
+                        log.info("iv-mux: zeroed")
+                    except Exception as e:
+                        ui.notify(f"zero FAIL: {type(e).__name__}: {e}",
+                                  type="negative", position="top", timeout=4000)
+
+                async def do_refresh():
+                    _refresh_state()
+
+                with ui.row().classes("gap-2"):
+                    ui.button("select", on_click=do_select).props("color=primary")
+                    ui.button("zero", on_click=do_zero).props("flat")
+                    ui.button("refresh", on_click=do_refresh).props("flat")
+
+            # ----- RIGHT side column -----
+            with ui.element("div").classes("side-col"):
+
+                # ---- Arduino die temperature card ----
+                with ui.card().classes("card-mux"):
+                    ui.html('<p class="eyebrow">Arduino die temperature</p>')
+                    with ui.row().classes("items-end w-full").style("gap:12px"):
+                        with ui.element("div").classes("fld").style("width:120px"):
+                            ui.html('<label class="fld-lbl">N samples</label>')
+                            nsamp_n = ui.number(value=3, step=1, format="%d") \
+                                .props('dense filled hide-bottom-space suffix="#"')
+                        temp_html = ui.html(
+                            '<p class="readline">'
+                            'T = <span class="muted">—</span> K</p>'
+                        ).style("margin-left:.2rem; flex:1")
+
+                        async def do_read_temp():
+                            if HUB.ivmux is None:
+                                ui.notify("iv-mux not connected", type="warning",
+                                          position="top", timeout=2000)
+                                return
+                            try:
+                                samples = await _run_in_thread(
+                                    HUB.ivmux.read_temperature,
+                                    int(nsamp_n.value or 3),
+                                )
+                                if samples is None or len(samples) == 0:
+                                    temp_html.set_content(
+                                        '<p class="readline">'
+                                        'T = <span class="muted">—</span> K</p>'
+                                    )
+                                    return
+                                avg = sum(samples) / len(samples)
+                                temp_html.set_content(
+                                    f'<p class="readline">'
+                                    f'T = <span>{avg:.2f}</span> K '
+                                    f'<span class="muted">(n={len(samples)})</span></p>'
+                                )
+                                log.info("iv-mux temperature: %.2f K (n=%d)",
+                                         avg, len(samples))
+                            except Exception as e:
+                                ui.notify(
+                                    f"read T FAIL: {type(e).__name__}: {e}",
+                                    type="negative", position="top", timeout=4000,
+                                )
+                        ui.button("read", on_click=do_read_temp) \
+                            .props("flat") \
+                            .style("margin-left:auto")
+
+        # ---- Channel sweep card ----
+        with ui.card().classes("card-mux w-full"):
+            ui.html('<p class="eyebrow">Channel sweep · no measurement callback</p>')
+            ui.html('<p class="desc">Walks the IV MUX through a contiguous range '
+                    'with a delay at each step. Use this for relay-click testing '
+                    '— no measurement is taken.</p>')
+            with ui.row().classes("items-end w-full").style("gap:12px; flex-wrap:wrap"):
+                with ui.element("div").classes("fld").style("width:130px"):
+                    ui.html('<label class="fld-lbl">Start ch</label>')
+                    sw_start_n = ui.number(value=1, step=1, format="%d",
+                                           min=1, max=90) \
+                        .props("dense filled hide-bottom-space")
+                with ui.element("div").classes("fld").style("width:130px"):
+                    ui.html('<label class="fld-lbl">Stop ch</label>')
+                    sw_stop_n = ui.number(value=90, step=1, format="%d",
+                                          min=1, max=90) \
+                        .props("dense filled hide-bottom-space")
+                with ui.element("div").classes("fld").style("width:140px"):
+                    ui.html('<label class="fld-lbl">Dwell</label>')
+                    sw_dwell_n = ui.number(value=0.100, step=0.05, format="%.3f") \
+                        .props('dense filled hide-bottom-space suffix="s"')
+                sweep_btn = ui.button("▶ run sweep").props("color=primary")
+                sweep_status_html = ui.html('<span class="statuspill">idle</span>') \
+                    .style("margin-left:auto")
+
+                async def do_ivmux_sweep():
+                    if HUB.ivmux is None:
+                        ui.notify("iv-mux not connected", type="warning",
+                                  position="top", timeout=2000)
+                        return
+                    a = int(sw_start_n.value or 1)
+                    b = int(sw_stop_n.value or 90)
+                    a = max(1, min(90, a)); b = max(1, min(90, b))
+                    chans = list(range(a, b + 1)) if a <= b else list(range(a, b - 1, -1))
+                    dwell = float(sw_dwell_n.value or 0)
+                    sweep_status_html.set_content(
+                        f'<span class="statuspill" style="color:var(--warn)">'
+                        f'running… {chans[0]}→{chans[-1]} ({len(chans)} steps)</span>'
+                    )
+                    sweep_btn.props("disable")
+                    set_activity("iv-mux channel sweep",
+                                 f"{chans[0]}→{chans[-1]} · dwell={dwell}s")
+                    try:
+                        await _run_in_thread(
+                            HUB.ivmux.sweep, chans, lambda _ch: None, dwell, True,
+                        )
+                        sweep_status_html.set_content(
+                            f'<span class="statuspill" style="color:var(--ok)">'
+                            f'done · {len(chans)} steps</span>'
+                        )
+                        log.info("iv-mux sweep done: %d steps", len(chans))
+                    except Exception as e:
+                        sweep_status_html.set_content(
+                            f'<span class="statuspill" style="color:var(--bad)">'
+                            f'failed: {type(e).__name__}</span>'
+                        )
+                        log.exception("iv-mux sweep failed: %s", e)
+                    finally:
+                        clear_activity()
+                        sweep_btn.props(remove="disable")
+                sweep_btn.on_click(do_ivmux_sweep)
+
+    # ---- Periodic refresh (state + connect strip + active channel) ----
+    def _refresh_state():
+        if HUB.ivmux is None:
+            connstrip.classes(remove="is-connected")
+            conn_lbl.set_content(
+                '<span class="lbl">Not connected — 90-channel IV MUX</span>'
+            )
+            connect_btn.set_visibility(True)
+            active_ch.set_content('<span class="v">—</span>')
+            return
+        connstrip.classes(add="is-connected")
+        conn_lbl.set_content(
+            '<span class="lbl">Connected — 90-channel IV MUX</span>'
+        )
+        connect_btn.set_visibility(False)
+        try:
+            ch = HUB.ivmux.active_channel()
         except Exception:
             ch = None
         if ch is None:
@@ -9039,13 +9296,13 @@ def _build_raster_tab():
         async def run_all():
             nonlocal results
             if not specs: log_msg("no specs"); return
-            if HUB.stage is None or HUB.mux is None or HUB.elec is None:
-                log_msg("stage/mux/elec must be connected"); return
+            if HUB.stage is None or HUB.ivmux is None or HUB.elec is None:
+                log_msg("stage/iv-mux/elec must be connected"); return
             from daq.raster import multi_raster
             log_msg(f"running {len(specs)} spec(s)…")
             try:
                 results = await _run_in_thread(
-                    multi_raster, HUB.stage, HUB.mux, HUB.elec, list(specs), _on_progress,
+                    multi_raster, HUB.stage, HUB.ivmux, HUB.elec, list(specs), _on_progress,
                 )
                 log_msg(f"done — {len(results)} scan(s)")
                 for r in results:
@@ -9126,8 +9383,8 @@ def _build_alignment_tab():
 
             async def run_scan():
                 sid = int(sipm_in.value)
-                if HUB.stage is None or HUB.mux is None or HUB.elec is None:
-                    log_msg("stage/mux/elec must be connected"); return
+                if HUB.stage is None or HUB.ivmux is None or HUB.elec is None:
+                    log_msg("stage/iv-mux/elec must be connected"); return
                 if not HUB.config.sipm_list():
                     log_msg("no channel map loaded"); return
                 try:
@@ -9155,7 +9412,7 @@ def _build_alignment_tab():
                                                 label=f"align_box_SiPM{sid}")
                 log_msg(f"{t} scan on SiPM {sid} @ ({cx:.3f}, {cy:.3f}) mm  width={float(scan_w.value):.2f} mm")
                 try:
-                    result = await _run_in_thread(raster_scan, HUB.stage, HUB.mux, HUB.elec, spec, None)
+                    result = await _run_in_thread(raster_scan, HUB.stage, HUB.ivmux, HUB.elec, spec, None)
                     cx_found, cy_found = centroid_1d(result)
                     state["centroid"] = (cx_found, cy_found)
                     cent_x.text = f"centroid x: {cx_found:+.4f} mm"
@@ -9360,6 +9617,7 @@ def index():
         t_elec   = ui.tab("electrometer")
         t_dig    = ui.tab("digitizer")
         t_mux    = ui.tab("mux")
+        t_ivmux  = ui.tab("iv-mux")
         t_stage  = ui.tab("stage")
         t_k6485  = ui.tab("k6485")
         t_wfg    = ui.tab("wfg (dg1022)")    # Rigol — hidden from header
@@ -9401,6 +9659,7 @@ def index():
     # 'sc' has no dedicated tab, so its pill jumps to Connections.
     _pill_tabs = {
         "elec":   t_elec,  "dig":   t_dig,   "mux":   t_mux,
+        "ivmux":  t_ivmux,
         "stage":  t_stage, "k6485": t_k6485,
         "wfg":     t_wfg,        # Rigol — hidden, but mapped for completeness
         "ks33500b": t_ks,        # Keysight WFG — the visible pill
@@ -9531,6 +9790,7 @@ def index():
         with ui.tab_panel(t_elec):   _build_electrometer_tab()
         with ui.tab_panel(t_dig):    _build_digitizer_tab()
         with ui.tab_panel(t_mux):    _build_mux_tab()
+        with ui.tab_panel(t_ivmux):  _build_ivmux_tab()
         with ui.tab_panel(t_stage):  _build_stage_tab()
         with ui.tab_panel(t_k6485):  _build_k6485_tab()
         with ui.tab_panel(t_wfg):    _build_wfg_tab()

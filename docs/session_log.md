@@ -12,6 +12,65 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-06-02 — IV MUX added; channel switching moved off the pulse MUX
+
+### What changed
+
+Replaced the pulse MUX with the **IV MUX** as the bench's channel selector.
+New submodule `ivmux-python/` (Brunner-neutrino-lab/ivmux-python) — package
+`iv_mux`, class `MuxController`. API mirrors `pulse_mux` (select/zero/sweep/
+read_temperature/active_channel) **but**: 90 channels (not 96), no bypass relay,
+plus a firmware-side `sequence()`. Arduino Nano Every over USB-UART, 9600 baud.
+
+- `daq/config.py`: new `ivmux_port` (default `/dev/ttyACM0` — placeholder; the
+  Nano Every wasn't plugged in at the time, so no stable by-id path yet — swap
+  one in once it's on the bench).
+- `daq/gui/hub.py`: `self.ivmux`, status key `ivmux`, `instruments["ivmux"]`,
+  `connect_ivmux`/`disconnect_ivmux` (mode="hardware", same build-then-assign
+  pattern as the rest).
+- `daq/webgui/shell.py`: `_INSTRUMENT_SPECS` entry `ivmux` (name "iv-mux"),
+  **not hidden** — so it gets a header pill and is part of "connect all"
+  (the pulse `mux` stays `hidden: True`). New `_build_ivmux_tab()` mirrors
+  `_build_mux_tab` and **reuses the `.mux-panel` CSS scope** (no CSS dup);
+  bypass card dropped, channel range 1-90. Registered tab `t_ivmux`, panel,
+  and `_pill_tabs["ivmux"]`. Status tab gained an "iv-mux channel" card.
+- **sys.path**: added `ivmux-python` to all three submodule-path blocks
+  (`daq/app.py`, `daq/run.py`, `daq/webgui/shell.py`).
+
+### Channel switching repointed to the IV MUX (per user: "for now we are not
+using the pulse mux")
+- Automation: `daq/measurement.py` `_move_to_sipm`, `daq/sequence.py`
+  `_move_for_condition`/`_exec_scan` now read `instruments.get("ivmux")`.
+- `daq/run.py`: added an IV MUX connect block (`instruments["ivmux"]`); kept
+  the pulse-MUX block (relabeled legacy).
+- Webapp tabs: L1 "MUX channel" card -> "IV-MUX channel" (1-90, HUB.ivmux);
+  L2 SiPM/MUX go-to + IV/pulse `_prep_position` + scan handler; raster + 
+  alignment `run_all`/`run_scan` now pass `HUB.ivmux` to `raster_scan`/
+  `multi_raster`. The pulse-MUX **instrument tab** and its status card still
+  target `HUB.mux` on purpose.
+
+### Decisions
+- IV MUX visible in header + connect-all; pulse MUX stays hidden (still
+  reachable from its own tab). Both controllers coexist in the hub.
+- `select_channel` primitive is generic (any controller with `.select()`),
+  so repointing was just swapping which controller object is passed.
+
+### Verified (simulation)
+py_compile of all touched files; `iv_mux` sim select/zero round-trip;
+`daq.gui.hub` + `daq.webgui.shell` import with ivmux in specs/instruments/
+visible; `daq.run`/`measurement`/`sequence`/`raster` import clean.
+
+### Open threads
+- **`ivmux_port` is a guess** (`/dev/ttyACM0`). Confirm the real device path
+  on the bench and capture a stable `/dev/serial/by-id/...` symlink.
+- Not yet exercised on a live webapp/browser or real hardware.
+- The IV MUX firmware `sequence()` (hardware-timed walk) isn't surfaced in the
+  GUI — only the software `sweep` is, matching the pulse-MUX panel.
+- `daq/gui/level1_tab.py` (legacy PyQt) still references `HUB.mux`; left as-is
+  since the webapp doesn't use it.
+
+---
+
 ## 2026-05-29 — L3 rebuilt as a per-SiPM measurement sequence
 
 ### What changed

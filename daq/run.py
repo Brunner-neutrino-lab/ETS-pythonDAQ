@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 # Add sibling package directories to sys.path so instrument packages are importable
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _pkg in ("keysight2987b-python", "keithley6485-python", "phidget-stage-python",
-             "pulse-mux-python", "RTO2024-python", "vx2740-python",
+             "pulse-mux-python", "ivmux-python", "RTO2024-python", "vx2740-python",
              "rigoldg1022-python", "r-snge100-python"):
     _p = os.path.join(_ROOT, _pkg)
     if _p not in sys.path:
@@ -210,7 +210,7 @@ def _connect_instruments(config) -> dict:
         log.warning("Digitizer connection failed: %s", e)
         instruments["digitizer"] = None
 
-    # MUX
+    # Pulse MUX (legacy; channel switching now goes through the IV MUX below)
     try:
         from pulse_mux import MuxController
         mux = MuxController(port=config.mux_port, mode="hardware")
@@ -220,6 +220,17 @@ def _connect_instruments(config) -> dict:
     except Exception as e:
         log.warning("MUX connection failed: %s", e)
         instruments["mux"] = None
+
+    # IV MUX -- the channel selector used by the measurement automation.
+    try:
+        from iv_mux import MuxController as IVMuxController
+        ivmux = IVMuxController(port=config.ivmux_port, mode="hardware")
+        ivmux.connect()
+        instruments["ivmux"] = ivmux
+        log.info("IV MUX connected on %s", config.ivmux_port)
+    except Exception as e:
+        log.warning("IV MUX connection failed: %s", e)
+        instruments["ivmux"] = None
 
     # K6485 flux monitor
     try:

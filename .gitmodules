@@ -26,3 +26,6 @@
 [submodule "keysight33500b-python"]
 	path = keysight33500b-python
 	url = https://github.com/Brunner-neutrino-lab/keysight33500b-python.git
+[submodule "ivmux-python"]
+	path = ivmux-python
+	url = https://github.com/Brunner-neutrino-lab/ivmux-python.git

@@ -64,15 +64,15 @@ def _move_lamp(instruments: dict, illuminated: bool, config):
 def _move_to_sipm(instruments: dict, sipm_id: int, config):
     """Move main XY stage to a SiPM's position and select its MUX channel."""
     stage = instruments.get("stage")
-    mux   = instruments.get("mux")
+    ivmux = instruments.get("ivmux")
     x, y  = config.sipm_position(sipm_id)
     ch    = config.sipm_channel(sipm_id)
     if stage is not None:
         log.debug("Stage → SiPM %d @ (%.1f, %.1f) mm", sipm_id, x, y)
         P.move_stage(stage, x_mm=x, y_mm=y,
                      deenergize_after=config.stage_deenergize)
-    if mux is not None:
-        P.select_channel(mux, ch)
+    if ivmux is not None:
+        P.select_channel(ivmux, ch)
 
 
 # ---------------------------------------------------------------------------
