@@ -4280,6 +4280,42 @@ def _build_level2_tab():
 
                     # ============= IV PANEL =============
                     with panel_iv:
+                        iv_run = {"active": False, "stop_requested": False}
+
+                        def _iv_run_begin() -> None:
+                            iv_run["active"] = True
+                            iv_run["stop_requested"] = False
+                            run_iv_btn.props("disable")
+                            stop_iv_btn.props(remove="disable")
+                            stop_iv_btn.props("color=negative")
+
+                        def _iv_run_finish() -> None:
+                            iv_run["active"] = False
+                            run_iv_btn.props(remove="disable")
+                            if iv_run["stop_requested"]:
+                                stop_iv_btn.props(remove="disable")
+                                stop_iv_btn.props("color=positive")
+                            else:
+                                stop_iv_btn.props("disable")
+                                stop_iv_btn.props("color=negative")
+
+                        async def _request_iv_stop() -> None:
+                            if not iv_run["active"]:
+                                return
+                            iv_run["stop_requested"] = True
+                            iv_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">stopping…</span>'
+                            )
+                            try:
+                                if HUB.elec is not None:
+                                    await _run_in_thread(HUB.elec._driver.abort)
+                                stop_iv_btn.props("color=positive")
+                                log_msg("IV stop requested — finishing current point")
+                            except Exception as e:
+                                stop_iv_btn.props("color=negative")
+                                log_msg(f"IV stop FAIL: {type(e).__name__}: {e}")
+
                         with ui.element("div").classes("pillrow"):
                             ui.html('<span class="pl">condition</span>')
                             with ui.element("div").classes("pills"):
@@ -4356,6 +4392,7 @@ def _build_level2_tab():
                                 '<span class="statuspill" '
                                 'style="color:var(--warn)">running…</span>'
                             )
+                            _iv_run_begin()
                             _plot("iv_begin", iv_slot)
                             try:
                                 if bright:
@@ -4378,10 +4415,20 @@ def _build_level2_tab():
                                     try: print(f"[L2 IV] {line}", flush=True)
                                     except Exception: pass
                                     _plot("iv_point", iv_slot, v, mean_i)
+
+                                ext_voltages = voltages
+                                if meter == "k6485":
+                                    ext_voltages = []
+                                    for v in voltages:
+                                        if iv_run["stop_requested"]:
+                                            break
+                                        ext_voltages.append(v)
+                                    if not ext_voltages:
+                                        raise RuntimeError("IV stopped before first point")
                                 if meter == "k6485":
                                     result = await _run_in_thread(
                                         lambda: P.iv_sweep_external_meter(
-                                            HUB.elec, HUB.k6485, voltages,
+                                            HUB.elec, HUB.k6485, ext_voltages,
                                             n_per_voltage=int(iv_npt.value),
                                             delay_s=delay,
                                             progress_cb=_iv_prog,
@@ -4402,6 +4449,7 @@ def _build_level2_tab():
                                                       result.avg_current_a):
                                         _plot("iv_point", iv_slot, _v, _i)
                                     _plot("iv_redraw")
+                                was_stopped = bool(iv_run["stop_requested"])
                                 log_msg(f"  done: I({result.avg_source_v[-1]:.2f} V) = "
                                         f"{result.avg_current_a[-1]:.3e} A")
                                 note_bias(v_set=result.avg_source_v[-1],
@@ -4420,12 +4468,20 @@ def _build_level2_tab():
                                 except Exception as e:
                                     log_msg(f"  SAVE FAIL: "
                                             f"{type(e).__name__}: {e}")
-                                iv_status.set_content(
-                                    f'<span class="statuspill" '
-                                    f'style="color:var(--ok)">done · '
-                                    f'{iv_illum.value} · '
-                                    f'{len(result.avg_source_v)} pts</span>'
-                                )
+                                if was_stopped:
+                                    iv_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">stopped · '
+                                        f'{iv_illum.value} · '
+                                        f'{len(result.avg_source_v)} pts</span>'
+                                    )
+                                else:
+                                    iv_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">done · '
+                                        f'{iv_illum.value} · '
+                                        f'{len(result.avg_source_v)} pts</span>'
+                                    )
                             except Exception as e:
                                 log_msg(f"  IV FAIL: "
                                         f"{type(e).__name__}: {e}")
@@ -4440,10 +4496,14 @@ def _build_level2_tab():
                                 try: await _run_in_thread(P.bias_off, HUB.elec)
                                 except Exception: pass
                                 clear_activity()
+                                _iv_run_finish()
 
                         with ui.element("div").classes("runrow"):
-                            ui.button("▶ run iv", on_click=run_iv) \
+                            run_iv_btn = ui.button("▶ run iv", on_click=run_iv) \
                                 .props("color=primary")
+                            stop_iv_btn = ui.button(
+                                "■ stop", on_click=_request_iv_stop) \
+                                .props("color=negative dense disable")
                             ui.html('').classes("statuspill"). \
                                 set_visibility(False)
                             # Attach the status pill we wired above as the
@@ -4454,6 +4514,45 @@ def _build_level2_tab():
 
                     # ============= PULSE PANEL =============
                     with panel_pulse:
+                        pulse_run = {"active": False, "stop_requested": False}
+
+                        def _pulse_run_begin() -> None:
+                            pulse_run["active"] = True
+                            pulse_run["stop_requested"] = False
+                            run_pulse_btn.props("disable")
+                            stop_pulse_btn.props(remove="disable")
+                            stop_pulse_btn.props("color=negative")
+
+                        def _pulse_run_finish() -> None:
+                            pulse_run["active"] = False
+                            run_pulse_btn.props(remove="disable")
+                            if pulse_run["stop_requested"]:
+                                stop_pulse_btn.props(remove="disable")
+                                stop_pulse_btn.props("color=positive")
+                            else:
+                                stop_pulse_btn.props("disable")
+                                stop_pulse_btn.props("color=negative")
+
+                        async def _request_pulse_stop() -> None:
+                            if not pulse_run["active"]:
+                                return
+                            pulse_run["stop_requested"] = True
+                            pulse_status.set_content(
+                                '<span class="statuspill" '
+                                'style="color:var(--warn)">stopping…</span>'
+                            )
+                            ctrl = getattr(HUB.dig, "_ctrl", None) if HUB.dig else None
+                            if ctrl is None:
+                                log_msg("stop requested — digitizer controller unavailable")
+                                return
+                            try:
+                                await _run_in_thread(ctrl.disarm)
+                                stop_pulse_btn.props("color=positive")
+                                log_msg("pulse stop requested — finishing current acquisition")
+                            except Exception as e:
+                                stop_pulse_btn.props("color=negative")
+                                log_msg(f"stop FAIL: {type(e).__name__}: {e}")
+
                         with ui.element("div").classes("pillrow"):
                             ui.html('<span class="pl">condition</span>')
                             with ui.element("div").classes("pills"):
@@ -4622,6 +4721,7 @@ def _build_level2_tab():
                                 '<span class="statuspill" '
                                 'style="color:var(--warn)">running…</span>'
                             )
+                            _pulse_run_begin()
 
                             def _run_acq():
                                 if bright:
@@ -4655,6 +4755,7 @@ def _build_level2_tab():
                             try:
                                 note_bias(v_set=bias, output_on=True)
                                 result = await _run_in_thread(_run_acq)
+                                was_stopped = bool(pulse_run["stop_requested"])
                                 log_msg(f"  done: n_waveforms="
                                         f"{result.n_waveforms} "
                                         f"channels={result.channel_ids}")
@@ -4679,12 +4780,20 @@ def _build_level2_tab():
                                 except Exception as e:
                                     log_msg(f"  SAVE FAIL: "
                                             f"{type(e).__name__}: {e}")
-                                pulse_status.set_content(
-                                    f'<span class="statuspill" '
-                                    f'style="color:var(--ok)">done · '
-                                    f'{pc_illum.value} · '
-                                    f'{result.n_waveforms} wfs</span>'
-                                )
+                                if was_stopped:
+                                    pulse_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">stopped · '
+                                        f'{pc_illum.value} · '
+                                        f'{result.n_waveforms} wfs</span>'
+                                    )
+                                else:
+                                    pulse_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">done · '
+                                        f'{pc_illum.value} · '
+                                        f'{result.n_waveforms} wfs</span>'
+                                    )
                             except Exception as e:
                                 log_msg(f"  PULSE FAIL: "
                                         f"{type(e).__name__}: {e}")
@@ -4696,6 +4805,7 @@ def _build_level2_tab():
                             finally:
                                 note_bias(v_set=0.0, output_on=False)
                                 clear_activity()
+                                _pulse_run_finish()
 
                         async def run_pulse_sweep():
                             """Acquire N waveforms at each bias across a
@@ -4754,6 +4864,7 @@ def _build_level2_tab():
                                 '<span class="statuspill" '
                                 'style="color:var(--warn)">running…</span>'
                             )
+                            _pulse_run_begin()
 
                             chg_slot = "bright" if bright else "dark"
                             _plot("psweep_begin")
@@ -4783,6 +4894,9 @@ def _build_level2_tab():
                                         HUB.config.led_pulse_width)
                                 await _run_in_thread(_cfg)
                                 for i, bias in enumerate(voltages):
+                                    if pulse_run["stop_requested"]:
+                                        log_msg("pulse sweep stop acknowledged before next bias")
+                                        break
                                     pulse_status.set_content(
                                         f'<span class="statuspill" '
                                         f'style="color:var(--warn)">bias '
@@ -4850,6 +4964,9 @@ def _build_level2_tab():
                                             f"bias={bias:.2f} V → {npts} pulses,"
                                             f" mean={mean:.1f} ADC, "
                                             f"rate={rate:.1f} Hz")
+                                    if pulse_run["stop_requested"]:
+                                        log_msg("pulse sweep stop acknowledged after current bias")
+                                        break
                                 try:
                                     p = MSTORE.save_l2_pulse_sweep(
                                         bias_v=biases, mean_amp_adc=means,
@@ -4868,11 +4985,18 @@ def _build_level2_tab():
                                 except Exception as e:
                                     log_msg(f"  SAVE FAIL: "
                                             f"{type(e).__name__}: {e}")
-                                pulse_status.set_content(
-                                    f'<span class="statuspill" '
-                                    f'style="color:var(--ok)">done · '
-                                    f'{pc_illum.value} · '
-                                    f'{len(biases)} bias</span>')
+                                if pulse_run["stop_requested"]:
+                                    pulse_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">stopped · '
+                                        f'{pc_illum.value} · '
+                                        f'{len(biases)} bias</span>')
+                                else:
+                                    pulse_status.set_content(
+                                        f'<span class="statuspill" '
+                                        f'style="color:var(--ok)">done · '
+                                        f'{pc_illum.value} · '
+                                        f'{len(biases)} bias</span>')
                             except Exception as e:
                                 log_msg(f"  PULSE SWEEP FAIL: "
                                         f"{type(e).__name__}: {e}")
@@ -4887,6 +5011,7 @@ def _build_level2_tab():
                                 except Exception: pass
                                 note_bias(v_set=0.0, output_on=False)
                                 clear_activity()
+                                _pulse_run_finish()
 
                         async def _run_pulse_dispatch():
                             if str(pc_mode.value) == "sweep":
@@ -4898,6 +5023,9 @@ def _build_level2_tab():
                             run_pulse_btn = ui.button(
                                 "▶ run pulse", on_click=_run_pulse_dispatch) \
                                 .props("color=primary")
+                            stop_pulse_btn = ui.button(
+                                "■ stop", on_click=_request_pulse_stop) \
+                                .props("color=negative dense disable")
                             pulse_status_holder = ui.html("")
                             pulse_status_holder.bind_content_from(
                                 pulse_status, "content")
@@ -8846,7 +8974,8 @@ def _build_level3_tab():
         step_lbl   = ui.label("step —").classes("num text-sm")
         with ui.row().classes("gap-2 mt-1"):
             ui.button("run sequence", on_click=lambda: run_seq()).props("color=primary")
-            ui.button("⛔ abort", on_click=lambda: request_abort()).props("color=negative")
+            ui.button("finish step", on_click=lambda: request_finish_step()).props("color=warning")
+            ui.button("■ stop now", on_click=lambda: request_stop_now()).props("color=negative")
 
     # ---------------- form <-> spec ----------------
     def _collect_form() -> MeasurementSpec:
@@ -9001,8 +9130,41 @@ def _build_level3_tab():
             log_msg(f"load failed: {type(e).__name__}: {e}")
 
     # ---------------- run ----------------
-    def request_abort():
-        abort["flag"] = True; log_msg("ABORT requested — finishing current step")
+    def request_finish_step():
+        abort["flag"] = True
+        log_msg("Finish Step requested — stopping after current step")
+
+    async def request_stop_now():
+        abort["flag"] = True
+        log_msg("Stop Now requested — stopping current measurement and sequence")
+        stop_errors = []
+
+        ctrl = getattr(HUB.dig, "_ctrl", None) if HUB.dig else None
+        if ctrl is not None:
+            try:
+                await _run_in_thread(ctrl.disarm)
+            except Exception as e:
+                stop_errors.append(f"digitizer disarm: {type(e).__name__}: {e}")
+
+        driver = getattr(HUB.elec, "_driver", None) if HUB.elec else None
+        abort_fn = getattr(driver, "abort", None)
+        if callable(abort_fn):
+            try:
+                await _run_in_thread(abort_fn)
+            except Exception as e:
+                stop_errors.append(f"electrometer abort: {type(e).__name__}: {e}")
+
+        awg = HUB.ks33500b
+        if awg is not None:
+            for ch in (1, 2):
+                try:
+                    await _run_in_thread(lambda ch=ch: awg.output_off(ch))
+                except Exception:
+                    pass
+
+        if stop_errors:
+            for msg in stop_errors:
+                log_msg(f"stop note: {msg}")
 
     def _on_progress(entry_idx, n_entries, step_name, done, total):
         entry_prog.value = ((entry_idx + (done / total if total else 0)) / n_entries) if n_entries else 0
