@@ -73,11 +73,12 @@ file.
 | Instrument | Address | Notes |
 |---|---|---|
 | B2987B electrometer | `TCPIP::172.16.0.11::5025::SOCKET` | **NEVER use `::INSTR` (VXI-11)** — leaks session slots, requires power-cycle. SOCKET is stateless. See "Lessons" below. |
-| K6485 picoammeter | `/dev/ttyUSB0`, 9600 baud, `\r`/`\r` term | Reads SiPM low-side current. NOT the B2987's built-in ammeter — that's wired to the (unbiased) photodiode. |
+| K6485 picoammeter | `/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0`, 9600 baud, `\r`/`\r` term | Prolific PL2303 adapter. **Not `/dev/ttyUSB0`**: that is whichever adapter enumerates first, usually the IV MUX's CP2102. Reads SiPM low-side current. NOT the B2987's built-in ammeter — that's wired to the (unbiased) photodiode. |
+| IV MUX (30 ch) | `/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0` | CP2102 USB-UART to the Arduino's Serial1, 9600 8N1. Firmware addresses 6 boards × 15 = 90 and always dumps 6 words; only channels 1–30 (two boards) are fitted — `config.ivmux_channels`, enforced by `daq/ivmux.py` `IVMux`. Serial `0001` is the CP2102 factory default — a second stock CP2102 would collide; use `/dev/serial/by-path/` then. Connect sends `d` and requires a firmware reply. Serial monitor on the iv-mux tab. |
 | CAEN VX2740 digitizer | `172.16.0.51` | 125 MS/s, **64 channels** (full set exposed in the GUI). |
 | Keysight 33510B (WFG) | `TCPIP0::172.16.0.46::5025::SOCKET` | **The visible WFG in the shell.** Agilent 33510B, S/N MY57200344. SOCKET, not `::INSTR` — same VXI-11-avoidance reasoning as the B2987. |
 | Rigol DG1022 (WFG, hidden) | `/dev/usbtmc0` | Still in the codebase (bench scripts use `HUB.wfg`). Hidden from the header pills + "connect all" via `hidden: True` on its `_INSTRUMENT_SPECS` entry. Reachable through the Settings menu → "wfg (dg1022, hidden)". |
-| R&S NGE100 PSU | `TCPIP0::172.16.0.19::INSTR` | Powers the Cremat CSP+shaper. |
+| R&S NGE100 PSU | `TCPIP0::172.16.0.19::INSTR` | Powers the Cremat CSP+shaper (ch1, ch2: 6 V / 600 mA) and the IV MUX board (ch3: 12 V / 200 mA). Channel→device mapping is edited on the nge100 tab (defaults `config.nge100_rails`, saved edits `.nge100_rails.json`); device power buttons on the nge100, iv-mux and cremat tabs (`daq/rails.py`). |
 | Pulse MUX | `/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_ec8db4c99972ef11ae387a4f8fcc3fa0-if00-port0` | CP2102N USB-serial, 9600 baud. by-id symlink is stable across replug. |
 | Phidget stage | three serial numbers in config | Not always plugged in. |
 | Logitech C525 webcam | `/dev/video0` | Lab-view feed, streamed at `http://<host>:8765/webcam.mjpeg`. |
@@ -148,6 +149,10 @@ scripted bench run can claim the same instruments.
   exception during shutdown, pyvisa-py bug), and once it's full the only
   recovery is a power-cycle. SOCKET is stateless on the instrument side
   — no session table.
+- **B2987 ammeter reads use `:INIT:ACQ`, never `:INIT:ALL`.** `INIT:ALL` also
+  starts the source's transient action; with the output off the instrument
+  answers `+212 "Output relay must be on"` and FETC returns 9.91e+37. The
+  ammeter itself works with the output off (e.g. the unbiased photodiode).
 - **Coarse-then-fine IV needs a settle between passes.** Going from
   high bias (avalanche, ~µA) to low bias (just below V_BD) produces a
   discharge transient the K6485 sees as a spurious large reading. We

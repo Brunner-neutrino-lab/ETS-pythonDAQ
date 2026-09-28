@@ -123,11 +123,18 @@ class ExperimentConfig:
     # USB-port changes and reboots.  Plain /dev/ttyUSB1 is fragile because
     # numbering depends on enumeration order.
     mux_port:           str = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_ec8db4c99972ef11ae387a4f8fcc3fa0-if00-port0"
-    # 90-channel IV MUX — Arduino Nano Every over USB-UART, 9600 baud. The
-    # Nano Every enumerates as /dev/ttyACM*; swap in the stable by-id path
-    # once the device is plugged in (numbering is enumeration-order dependent).
-    ivmux_port:         str = "/dev/ttyACM0"
-    k6485_port:         str = "/dev/ttyUSB0"
+    # IV MUX — the Arduino's Serial1 behind a Silicon Labs CP2102 USB-UART,
+    # 9600 8N1. Its USB serial is the factory default "0001": if a second
+    # stock CP2102 is ever plugged in, by-id names collide and the
+    # /dev/serial/by-path/ name (tied to the physical USB port) is needed.
+    ivmux_port:         str = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
+    # Channels fitted: the firmware addresses 6 boards x 15 (1-90), this bench
+    # has the first two boards, channels 1-30.
+    ivmux_channels:     int = 30
+    # K6485 is on a Prolific PL2303 ("USB-Serial Controller D", no serial
+    # number). Plain /dev/ttyUSB0 is whichever adapter enumerated first, which
+    # is the IV MUX when the PL2303 isn't plugged in.
+    k6485_port:         str = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0"
     # K6485 serial framing — overrideable per instrument.
     # Lab default: 9600 / CR / CR; driver default: 57600 / CR+LF / LF.
     k6485_baud_rate:        int = 9600
@@ -152,6 +159,13 @@ class ExperimentConfig:
     ks33500b_visa:      str = "TCPIP0::172.16.0.46::5025::SOCKET"
     # R&S NGE103 power supply for MUX rail (and other lab gear).
     nge100_resource:    str = "TCPIP0::172.16.0.19::INSTR"
+    # NGE100 channel -> bench device, voltage (V), current limit (A). Edited on
+    # the nge100 tab; saved edits (.nge100_rails.json) override these.
+    nge100_rails: dict = field(default_factory=lambda: {
+        1: {"device": "cremat", "voltage": 6.0,  "current": 0.6},
+        2: {"device": "cremat", "voltage": 6.0,  "current": 0.6},
+        3: {"device": "ivmux",  "voltage": 12.0, "current": 0.2},
+    })
     stage_serial_x:     int = 523267
     stage_serial_y:     int = 523253
     stage_serial_limit: int = 527475

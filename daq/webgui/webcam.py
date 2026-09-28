@@ -18,10 +18,11 @@ stream + a couple of controls).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
-from typing import Iterator
+from typing import AsyncIterator
 
 import cv2
 from fastapi.responses import Response, StreamingResponse
@@ -81,6 +82,9 @@ class _WebcamGrabber:
     def last_error(self) -> str | None:
         return self._last_error
 
+    def is_running(self) -> bool:
+        return self._started
+
     def _run(self) -> None:
         # cv2.CAP_V4L2 forces the V4L2 backend on Linux (avoids GStreamer
         # falling back to a slower path).
@@ -135,25 +139,46 @@ _CAM = _WebcamGrabber()
 # MJPEG generator + FastAPI routes
 # ---------------------------------------------------------------------------
 
-def _mjpeg_iter(target_fps: int = 25) -> Iterator[bytes]:
-    """Yield multipart-MJPEG chunks until the client disconnects."""
+# The routes below are async on purpose. Starlette runs sync handlers and sync
+# generators in anyio worker threads that cannot be cancelled, so a stream
+# waiting on a missing camera held its thread forever -- and that 40-thread
+# pool also serves NiceGUI's static JS/CSS, which stopped loading for every
+# browser once it ran out. It also kept uvicorn from ever finishing a stop.
+
+async def _first_frame(timeout_s: float = 3.0) -> bytes | None:
+    """Start the grabber and wait up to timeout_s for a frame."""
     _CAM.start()
-    boundary = b"--frame"
-    period_s = 1.0 / max(1, target_fps)
-    # Wait briefly for the first frame so the browser doesn't see an empty body
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + timeout_s
     while _CAM.latest_jpeg() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    while True:
+        await asyncio.sleep(0.05)
+        if not _CAM.is_running():
+            break   # grabber exited: no camera to wait for
+    return _CAM.latest_jpeg()
+
+
+def _part(jpeg: bytes) -> bytes:
+    return (b"--frame\r\n"
+            + b"Content-Type: image/jpeg\r\n"
+            + b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+            + jpeg + b"\r\n")
+
+
+async def _mjpeg_iter(first: bytes) -> AsyncIterator[bytes]:
+    """Yield each grabbed frame once until the client disconnects (Starlette
+    cancels us at the next await) or the grabber stops."""
+    jpeg, sent = first, None
+    while jpeg is not None:
+        if jpeg is not sent:
+            yield _part(jpeg)
+            sent = jpeg
+        await asyncio.sleep(0.02)
         jpeg = _CAM.latest_jpeg()
-        if jpeg is None:
-            time.sleep(0.1)
-            continue
-        yield (boundary + b"\r\n"
-               + b"Content-Type: image/jpeg\r\n"
-               + b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-               + jpeg + b"\r\n")
-        time.sleep(period_s)
+
+
+def _unavailable() -> Response:
+    msg = (_CAM.last_error() or "webcam not available").encode()
+    return Response(content=msg, status_code=503, media_type="text/plain",
+                    headers={"Cache-Control": "no-store"})
 
 
 _routes_registered = False
@@ -177,29 +202,33 @@ def register_routes() -> None:
             return False
 
     @app.get("/webcam.mjpeg")
-    def webcam_stream():
+    async def webcam_stream():
         if not _authed():
             return Response(b"login required", status_code=401,
                             media_type="text/plain")
+        # Without a first frame, answer 503 now: an open stream with no body
+        # never even gets its headers out (GZipMiddleware waits for the first
+        # chunk), so the <img> never finishes and the browser's page-load
+        # spinner never stops.
+        first = await _first_frame()
+        if first is None:
+            return _unavailable()
         return StreamingResponse(
-            _mjpeg_iter(),
+            _mjpeg_iter(first),
             media_type="multipart/x-mixed-replace; boundary=frame",
+            # An explicit Content-Encoding makes GZipMiddleware pass the
+            # stream through instead of holding frames inside zlib.
+            headers={"Cache-Control": "no-store", "Content-Encoding": "identity"},
         )
 
     @app.get("/webcam.jpg")
-    def webcam_snapshot():
+    async def webcam_snapshot():
         if not _authed():
             return Response(b"login required", status_code=401,
                             media_type="text/plain")
-        _CAM.start()
-        # Wait briefly for the first frame in case the user just opened the page
-        deadline = time.monotonic() + 3.0
-        while _CAM.latest_jpeg() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        jpeg = _CAM.latest_jpeg()
+        jpeg = await _first_frame()
         if jpeg is None:
-            msg = (_CAM.last_error() or "webcam not available").encode()
-            return Response(content=msg, status_code=503, media_type="text/plain")
+            return _unavailable()
         return Response(content=jpeg, media_type="image/jpeg")
 
 

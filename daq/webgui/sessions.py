@@ -30,6 +30,11 @@ def unregister(client_id: str) -> None:
     _SESSIONS.pop(client_id, None)
 
 
+def is_registered(client_id: str) -> bool:
+    """True for pages built by the authenticated index()."""
+    return client_id in _SESSIONS
+
+
 def set_name(client_id: str, name: str) -> None:
     s = _SESSIONS.get(client_id)
     if s is not None:

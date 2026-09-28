@@ -223,8 +223,8 @@ def _connect_instruments(config) -> dict:
 
     # IV MUX -- the channel selector used by the measurement automation.
     try:
-        from iv_mux import MuxController as IVMuxController
-        ivmux = IVMuxController(port=config.ivmux_port, mode="hardware")
+        from daq.ivmux import IVMux
+        ivmux = IVMux(config.ivmux_port, config.ivmux_channels)
         ivmux.connect()
         instruments["ivmux"] = ivmux
         log.info("IV MUX connected on %s", config.ivmux_port)

@@ -87,7 +87,9 @@ DEFAULT_CFG = dict(
     # listener locks up after a few crashes, requiring a power-cycle.
     # SOCKET is stateless on the instrument side.
     b2987_visa      = "TCPIP::172.16.0.11::5025::SOCKET",
-    k6485_port      = "/dev/ttyUSB0",
+    # PL2303 by-id: bare /dev/ttyUSB0 is the IV MUX's CP2102 when the PL2303
+    # isn't plugged in (or enumerates second).
+    k6485_port      = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0",
     k6485_baud      = 9600,
     k6485_read_term = "\r",
     k6485_wr_term   = "\r",

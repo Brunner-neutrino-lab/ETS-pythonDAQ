@@ -474,6 +474,8 @@ def run_sequence(specs, instruments, config,
     dict summary {n_entries, n_done, n_skipped, aborted}.
     """
     elec = instruments.get("elec")
+    from b2987b.driver import check_bias_lock
+    check_bias_lock(_max_commanded_voltage(specs))     # before any hardware moves
     registered_hv = _ensure_hv_confirmer(instruments, specs, hv_confirmer)
 
     n_entries = len(specs)

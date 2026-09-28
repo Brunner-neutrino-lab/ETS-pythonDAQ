@@ -63,6 +63,7 @@ htmlcov/
 # Cookie store + per-instrument last-seen address cache — written by the
 # webapp at runtime, populated from defaults if absent.
 .last_connections.json
+.nge100_rails.json
 # NiceGUI's transient cache (uploads, etc.) — never source.
 .nicegui/
 

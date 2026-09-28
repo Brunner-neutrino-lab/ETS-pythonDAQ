@@ -15,13 +15,17 @@ Entry point: `python -m daq.webapp` (see daq/webapp.py).
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import threading
+from types import SimpleNamespace
 import os
 import sys
 import time
 from typing import Callable
 
-from nicegui import app, ui, Client
+from fastapi.responses import RedirectResponse
+from nicegui import app, background_tasks, ui, Client
 
 # Make instrument submodules importable when running from the repo root
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +46,8 @@ from daq.webgui import sessions as SESSIONS
 from daq import connection_state
 from daq import labbook
 from daq import port_recovery
+from daq import ivmux as IVM
+from daq import rails as RAILS
 
 log = logging.getLogger("daq.webgui")
 
@@ -77,15 +83,19 @@ def set_activity(name: str, detail: str = "") -> None:
 # Closing the dialog, a timeout, or no connected client all deny (fail-safe).
 # ---------------------------------------------------------------------------
 
-from b2987b.driver import HV_DEFAULT_THRESHOLD
+from b2987b.driver import (HV_DEFAULT_THRESHOLD, AcquisitionStopped, BiasLockExceeded,
+                           check_bias_lock, read_bias_lock, write_bias_lock)
 
 _HV_LOOP = None                 # GUI event loop, captured on first arm
 _HV_CONFIRM_TIMEOUT_S = 120.0
 
 
 async def _hv_dialog(vmax: float, threshold: float) -> bool:
+    # Only logged-in control pages: /login pages have sockets too, and a
+    # click there must not approve high voltage.
     clients = [c for c in list(Client.instances.values())
-               if getattr(c, "has_socket_connection", False)]
+               if getattr(c, "has_socket_connection", False)
+               and SESSIONS.is_registered(c.id)]
     if not clients:
         return False
 
@@ -166,14 +176,17 @@ def note_bias(v_set: float | None = None,
 # Ring buffer of recent log records so the status page can show a tail of
 # what's happening across the app. A custom logging.Handler appended once
 # at import time captures records from all daq.* loggers.
-_LOG_RING: list[tuple[float, str, str, str]] = []  # (ts, level, name, msg)
+_LOG_RING: list[tuple[int, float, str, str, str]] = []  # (seq, ts, level, name, msg)
 _LOG_RING_MAX = 200
+# Readers track a sequence number, not a list index: once the ring is full
+# and trimming, its length stops changing and index-based tails freeze.
+_LOG_SEQ = itertools.count(1)
 
 
 class _RingHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            _LOG_RING.append((record.created, record.levelname,
+            _LOG_RING.append((next(_LOG_SEQ), record.created, record.levelname,
                               record.name, record.getMessage()))
             if len(_LOG_RING) > _LOG_RING_MAX:
                 del _LOG_RING[: len(_LOG_RING) - _LOG_RING_MAX]
@@ -599,6 +612,12 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
 .elec-panel .sweep-fields {
   display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:12px;
 }
+.elec-panel .stats {
+  display:block; margin-top:8px;
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--fg);
+}
+.elec-panel .hint { font-size:11.5px; line-height:1.4; color:var(--mut); margin:0; }
+.elec-panel .preset-row { display:flex; gap:6px; flex-wrap:wrap; }
 @media (max-width:600px) {
   .elec-panel .sweep-fields { grid-template-columns:repeat(2,1fr); }
 }
@@ -1134,6 +1153,31 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
 .psu-panel .chgrid {
   display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
   gap:14px;
+}
+
+/* NGE100 channel -> device mapping editor */
+.psu-panel .railmap {
+  display:grid; grid-template-columns:60px minmax(140px, 1fr) 130px 130px;
+  gap:8px 12px; align-items:center; margin-top:8px;
+}
+.psu-panel .railmap .hdr {
+  font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--mut);
+}
+.psu-panel .railmap .title { font-size:14px; font-weight:500; color:var(--acc); }
+.psu-panel .rail-list {
+  display:flex; flex-direction:column; gap:14px; margin:10px 0 18px;
+}
+
+/* Device power widget (nge100, iv-mux and cremat tabs) */
+.rail-power .rail-name { font-size:14px; font-weight:500; color:var(--fg); }
+.rail-power .rail-state {
+  font-size:12px; padding:1px 8px; border-radius:10px;
+  border:1px solid var(--line); color:var(--mut);
+}
+.rail-power .rail-state.on { color:var(--bad); border-color:rgba(248,81,73,.55); }
+.rail-power .rail-state.warn { color:var(--warn); }
+.rail-power .rail-setpt, .rail-power .rail-detail {
+  font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--mut);
 }
 
 .psu-panel .ch-head {
@@ -1967,6 +2011,57 @@ async def _run_in_thread(fn: Callable, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Shared instrument readback for periodic UI refresh
+#
+# ui.timer callbacks run once per open browser, on the event loop. A query
+# inside one is multiplied by the number of clients, and when the instrument
+# stops answering it freezes every page for the full timeout (the IV MUX
+# waits 10 s per command) -- browsers then drop their websockets and
+# reconnect in a loop. Timers therefore render what _reading() returns: the
+# cached result of a query that runs in a worker thread, at most one per key
+# in flight however many clients ask.
+# ---------------------------------------------------------------------------
+
+READINGS: dict = {}            # key -> last value, or the exception it raised
+_PENDING = object()            # no read has completed yet
+_READ_IN_FLIGHT: set = set()
+_READ_DONE_AT: dict = {}       # key -> monotonic time the last read finished
+_READ_GEN: dict = {}           # key -> bumped by _invalidate_reading()
+
+
+def _reading(key: str, fn: Callable, min_interval_s: float = 0.8):
+    """Start a background read of `fn()` if it's due, and return the cached
+    result: _PENDING, the value, or the exception the last read raised."""
+    if (key not in _READ_IN_FLIGHT
+            and time.monotonic() - _READ_DONE_AT.get(key, 0.0) >= min_interval_s):
+        _READ_IN_FLIGHT.add(key)
+        background_tasks.create(_do_reading(key, fn), name=f"reading:{key}")
+    return READINGS.get(key, _PENDING)
+
+
+async def _do_reading(key: str, fn: Callable) -> None:
+    gen = _READ_GEN.get(key, 0)
+    try:
+        value = await _run_in_thread(fn)
+    except Exception as e:
+        value = e
+    finally:
+        _READ_IN_FLIGHT.discard(key)
+        _READ_DONE_AT[key] = time.monotonic()
+    if _READ_GEN.get(key, 0) == gen:
+        READINGS[key] = value
+
+
+def _invalidate_reading(key: str) -> None:
+    """Forget the cached value and discard any read already in flight. Call
+    after a command changes instrument state, so a read that started before
+    the command can't be rendered after it."""
+    _READ_GEN[key] = _READ_GEN.get(key, 0) + 1
+    READINGS.pop(key, None)
+    _READ_DONE_AT.pop(key, None)
+
+
 async def _quick_connect(instrument_key: str) -> bool:
     """Connect one instrument by key using whatever address is currently in
     HUB.config (populated at startup from .last_connections.json).
@@ -2148,7 +2243,7 @@ def _build_status_tab():
     with ui.card().classes("daq-card status-card w-full"):
         ui.html("<h2>activity log</h2>")
         log_box = ui.log(max_lines=200).classes("h-48 w-full")
-    _log_last_idx = {"n": 0}
+    _log_last_seq = {"n": 0}
 
     # --- Periodic refresh -------------------------------------------------
     def _refresh():
@@ -2180,13 +2275,13 @@ def _build_status_tab():
 
         # Temperature
         if HUB.sc is not None:
-            try:
-                T = HUB.sc.temperature_K()
+            T = _reading("sc_temp_K", HUB.sc.temperature_K)
+            if isinstance(T, Exception):
+                temp_val.set_content('<span class="num big">err</span>')
+                temp_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(T).__name__}</span>')
+            elif T is not _PENDING:
                 temp_val.set_content(f'<span class="num big">{T:.2f} K</span>')
                 temp_sub.set_content('<span class="sub" style="color:var(--mut)">slow-control InfluxDB</span>')
-            except Exception as e:
-                temp_val.set_content('<span class="num big">err</span>')
-                temp_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(e).__name__}</span>')
         else:
             temp_val.set_content('<span class="num big">—</span>')
             temp_sub.set_content('<span class="sub" style="color:var(--mut)">connect slow control</span>')
@@ -2206,28 +2301,28 @@ def _build_status_tab():
 
         # Mux
         if HUB.mux is not None:
-            try:
-                ch = HUB.mux.active_channel()
+            ch = _reading("mux_ch", HUB.mux.active_channel)
+            if isinstance(ch, Exception):
+                mux_val.set_content('<span class="num big">err</span>')
+                mux_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(ch).__name__}</span>')
+            elif ch is not _PENDING:
                 stxt = f"ch {ch}" if ch is not None else "none"
                 mux_val.set_content(f'<span class="num big">{stxt}</span>')
                 mux_sub.set_content('<span class="sub" style="color:var(--mut)">active channel</span>')
-            except Exception as e:
-                mux_val.set_content('<span class="num big">err</span>')
-                mux_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(e).__name__}</span>')
         else:
             mux_val.set_content('<span class="num big">—</span>')
             mux_sub.set_content('<span class="sub" style="color:var(--mut)">mux not connected</span>')
 
         # IV MUX
         if HUB.ivmux is not None:
-            try:
-                ch = HUB.ivmux.active_channel()
+            ch = _reading("ivmux_ch", HUB.ivmux.poll_active_channel)
+            if isinstance(ch, Exception):
+                ivmux_val.set_content('<span class="num big">err</span>')
+                ivmux_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(ch).__name__}</span>')
+            elif ch is not _PENDING:
                 stxt = f"ch {ch}" if ch is not None else "none"
                 ivmux_val.set_content(f'<span class="num big">{stxt}</span>')
                 ivmux_sub.set_content('<span class="sub" style="color:var(--mut)">active channel</span>')
-            except Exception as e:
-                ivmux_val.set_content('<span class="num big">err</span>')
-                ivmux_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(e).__name__}</span>')
         else:
             ivmux_val.set_content('<span class="num big">—</span>')
             ivmux_sub.set_content('<span class="sub" style="color:var(--mut)">iv-mux not connected</span>')
@@ -2267,11 +2362,13 @@ def _build_status_tab():
                 thumbs.set_content('<span class="sub" style="color:var(--mut)">no plots yet</span>')
 
         # Log tail
-        new = _LOG_RING[_log_last_idx["n"]:]
-        for ts, level, name, msg in new:
-            log_box.push(f"{time.strftime('%H:%M:%S', time.localtime(ts))}  "
-                         f"{level:<5} {name:<22} {msg}")
-        _log_last_idx["n"] = len(_LOG_RING)
+        snap = _LOG_RING[:]   # the handler appends from worker threads
+        for seq, ts, level, name, msg in snap:
+            if seq > _log_last_seq["n"]:
+                log_box.push(f"{time.strftime('%H:%M:%S', time.localtime(ts))}  "
+                             f"{level:<5} {name:<22} {msg}")
+        if snap:
+            _log_last_seq["n"] = snap[-1][0]
 
     _refresh()
     ui.timer(1.0, _refresh)
@@ -2660,6 +2757,10 @@ def _build_labbook_tab():
         """)
 
         def _drain_pasted():
+            # The queue is global: a tab whose socket is down (kept for up to
+            # reconnect_timeout) must not take another tab's paste.
+            if not ui.context.client.has_socket_connection:
+                return
             new = labbook.pop_pasted()
             if not new:
                 return
@@ -3142,9 +3243,11 @@ def _build_level1_tab():
                 ui.html('<p class="eyebrow">IV-MUX channel</p>')
                 with ui.element("div").classes("fld") \
                         .style("margin-bottom:12px"):
-                    ui.html('<label class="fld-lbl">Channel (1–90)</label>')
-                    mux_ch_in = ui.number(value=1, step=1,
-                                          min=1, max=90, format="%d") \
+                    ui.html('<label class="fld-lbl">Channel '
+                            f'(1–{HUB.config.ivmux_channels})</label>')
+                    mux_ch_in = ui.number(value=1, step=1, min=1,
+                                          max=HUB.config.ivmux_channels,
+                                          format="%d") \
                         .props('dense filled hide-bottom-space')
 
                 mux_active = ui.html('<span class="result">active: '
@@ -3210,6 +3313,8 @@ def _build_level1_tab():
                         log_msg("electrometer not connected"); return
                     _arm_hv_guard()
                     v = float(bias_v_in.value or 0)
+                    if _bias_lock_refuses(v, "set bias"):
+                        return
                     log_msg(f"set_bias {v:.3f} V")
                     try:
                         await _run_in_thread(P.set_bias, HUB.elec, v, 0.2)
@@ -3232,6 +3337,9 @@ def _build_level1_tab():
                     try:
                         if on:
                             v = float(bias_v_in.value or 0)
+                            if _bias_lock_refuses(v, "bias on"):
+                                bias_sw.value = False
+                                return
                             await _run_in_thread(P.set_bias, HUB.elec, v, 0.2)
                             note_bias(v_set=v, output_on=True)
                             bias_state.set_content(
@@ -4043,7 +4151,8 @@ def _build_level2_tab():
                         mux_use = ui.switch(value=False) \
                             .props("dense color=primary").classes("inc-toggle")
                         ui.html('<span>IV-MUX ch</span>')
-                    mux_in = ui.number(value=1, step=1, min=1, max=90,
+                    mux_in = ui.number(value=1, step=1, min=1,
+                                       max=HUB.config.ivmux_channels,
                                        format="%d") \
                         .props('dense filled hide-bottom-space') \
                         .style("width:70px")
@@ -4362,6 +4471,9 @@ def _build_level2_tab():
                         iv_status.set_visibility(False)
 
                         async def run_iv():
+                            if _bias_lock_refuses([float(iv_start.value), float(iv_stop.value)],
+                                                  "L2 IV"):
+                                return
                             if HUB.elec is None:
                                 log_msg("b2987 not connected"); return
                             meter = str(iv_meter.value or "k6485")
@@ -4680,6 +4792,8 @@ def _build_level2_tab():
                         pulse_status.set_visibility(False)
 
                         async def run_pulse():
+                            if _bias_lock_refuses(float(pc_bias.value), "L2 pulse"):
+                                return
                             if HUB.elec is None or HUB.dig is None:
                                 log_msg("b2987 or digitizer not connected")
                                 return
@@ -4813,6 +4927,9 @@ def _build_level2_tab():
                             Streams mean amplitude + trigger rate vs bias
                             into the pulse-sweep plot, and the per-bias
                             charge spectrum / waveforms into their views."""
+                            if _bias_lock_refuses([float(pcs_start.value), float(pcs_stop.value)],
+                                                  "L2 pulse sweep"):
+                                return
                             if HUB.elec is None or HUB.dig is None:
                                 log_msg("b2987 or digitizer not connected")
                                 return
@@ -5150,6 +5267,8 @@ def _build_level2_tab():
                         scan_status.set_visibility(False)
 
                         async def run_scan():
+                            if _bias_lock_refuses(float(scan_bias.value), "L2 scan"):
+                                return
                             if HUB.elec is None or HUB.stage is None:
                                 log_msg("b2987 or stage not connected"); return
                             if mux_use.value and HUB.ivmux is None:
@@ -5362,7 +5481,8 @@ def _build_electrometer_tab():
     Layout:
         [statusbar  dot · model · VISA addr · right state]
         [TOP grid]
-          [LEFT  IV sweep card: head row + plot + 4-col sweep fields]
+          [LEFT  measurement card: Sweep (IV) | Ammeter mode, averaged |
+                 timestream view, plot, mode fields, stats line]
           [RIGHT  readout card  +  output card stacked]
         [3-col blocks: SOURCE | MEASURE | TRIGGER/TIMING]
         [footer]
@@ -5400,12 +5520,8 @@ def _build_electrometer_tab():
     def _hint_for_no_data() -> str:
         if HUB.elec is None:
             return "not connected"
-        drv = HUB.elec._driver
-        if not drv._output_on:
-            return ("instrument returned 'no data' (9.91e+37) — "
-                    "source output is OFF; turn it on in the OUTPUT card")
-        return ("instrument returned 'no data' (9.91e+37) — "
-                "check source range / aperture / current limit")
+        return ("instrument returned 'no data' (9.91e+37) — the reading is over "
+                "range: raise the fixed range or the auto-range upper limit")
 
     # ---- Dirty-tracking state ---------------------------------------
     _dirty_specs: list = []
@@ -5476,12 +5592,20 @@ def _build_electrometer_tab():
             with ui.card().classes("ep-card sweep-card") as sweep_block:
                 _blocks["sweep"] = sweep_block
                 with ui.row().classes("plot-head"):
-                    ui.html('<p class="eyebrow">IV sweep</p>')
+                    mode_tg = ui.toggle({"iv": "Sweep (IV)", "amm": "Ammeter"},
+                                        value="iv").props("dense no-caps")
+                    view_tg = ui.toggle({"avg": "averaged", "ts": "timestream"},
+                                        value="avg").props("dense no-caps")
+                    scale_tg = ui.toggle({"lin": "lin", "log": "log"},
+                                         value="lin").props("dense no-caps") \
+                        .tooltip("current axis scale")
                     ui.html('<span class="spacer"></span>')
                     derived_html = ui.html('<span class="derived">— pts</span>')
                     sweep_status_html = ui.html('<span class="statuspill">idle</span>')
                     save_h5_sw = ui.switch("save .h5", value=True).props("dense")
                     run_btn = ui.button("▶ Run sweep").props("color=primary dense")
+                    stop_btn = ui.button("■ Stop").props("color=negative dense flat")
+                    stop_btn.set_enabled(False)
 
                 # ECharts plot (320px box). Series 0 = staged voltages at y=0
                 # (gray dots, updates live as user types). Series 1 = result
@@ -5503,20 +5627,26 @@ def _build_electrometer_tab():
                         "nameLocation": "middle", "nameGap": 46, "scale": True,
                         "axisLine":  {"lineStyle": {"color": "#5c6775"}},
                         "axisLabel": {"color": "#8a93a6", "fontSize": 10,
-                                      "formatter": "{value}"},
+                                      ":formatter": "v => (v === 0 ? '0' : v.toExponential(1))"},
                         "splitLine": {"lineStyle": {"color": "#1d2733"}},
                     },
                     "series": [
                         {"name":"staged","type":"scatter","symbol":"circle","symbolSize":3,
                          "data":[],"itemStyle":{"color":"#5c6775","opacity":0.6},"z":1},
-                        {"name":"I vs V","type":"line","showSymbol":True,"symbolSize":4,
+                        {"name":"I","type":"line","showSymbol":True,"symbolSize":4,
                          "data":[],"lineStyle":{"width":2,"color":"#3b82f6"},
                          "itemStyle":{"color":"#3b82f6"},"z":2},
+                        {"name":"mean","type":"line","showSymbol":False,"data":[],
+                         "lineStyle":{"width":2,"color":"#f0b429"},"z":3},
+                        {"name":"+1σ","type":"line","showSymbol":False,"data":[],
+                         "lineStyle":{"width":1,"type":"dashed","color":"#f0b429"},"z":3},
+                        {"name":"-1σ","type":"line","showSymbol":False,"data":[],
+                         "lineStyle":{"width":1,"type":"dashed","color":"#f0b429"},"z":3},
                     ],
                 }
                 iv_chart = ui.echart(chart_opts).classes("plotbox")
 
-                with ui.element("div").classes("sweep-fields"):
+                with ui.element("div").classes("sweep-fields") as iv_fields:
                     sv_start_wrap, sv_start_n, _ = _field_number(
                         "Start", HUB.config.iv_voltage_start, "V",
                         step=0.1, fmt="%.2f")
@@ -5529,6 +5659,14 @@ def _build_electrometer_tab():
                     sv_avg_wrap,   sv_avg_n,   _ = _field_number(
                         "Avg / pt", HUB.config.iv_n_per_point, "samples",
                         step=1, fmt="%d")
+                with ui.element("div").classes("sweep-fields") as amm_fields:
+                    _, amm_n_n, _ = _field_number(
+                        "Samples", 100, "", step=1, fmt="%d")
+                    _, amm_int_n, _ = _field_number(
+                        "Interval (0 = back to back)", 0.0, "s",
+                        step=0.1, fmt="%.3f")
+                amm_fields.set_visibility(False)
+                stats_html = ui.html('<span class="stats"></span>')
 
             # ===== READOUT + OUTPUT stack (right) =====
             with ui.element("div").classes("readout-stack"):
@@ -5549,7 +5687,9 @@ def _build_electrometer_tab():
                                       type="warning", position="top", timeout=2500)
                             return
                         try:
-                            i = await _run_in_thread(HUB.elec.measure_current)
+                            await _apply_staged()
+                            r = await _run_in_thread(HUB.elec.ammeter, 1)
+                            i = float(r.current_a[0])
                             if _is_sentinel(i):
                                 hint = _hint_for_no_data()
                                 i_hero.set_content(_fmt_i(i))
@@ -5615,6 +5755,8 @@ def _build_electrometer_tab():
                                 log_msg("output OFF")
                             else:
                                 v = float(src_level_n.value)
+                                if _bias_lock_refuses(v, "output on"):
+                                    return
                                 await _run_in_thread(HUB.elec.set_bias, v, 0.1)
                                 note_bias(v_set=v, output_on=True)
                                 log_msg(f"output ON @ {v:.3f} V")
@@ -5660,6 +5802,16 @@ def _build_electrometer_tab():
                             log_msg(f"  HV threshold invalid: {exc}")
                     src_hv_n.on_value_change(_on_hv_threshold)
 
+                    _cur_lock = read_bias_lock()
+                    lock_wrap, lock_n, _ = _field_number(
+                        "Bias lock (max |V|, all tools)",
+                        _cur_lock["max_v"] if _cur_lock else 55.0, "V",
+                        step=0.5, fmt="%.2f")
+                    with ui.row().classes("items-center").style("gap:8px; flex-wrap:wrap"):
+                        set_lock_btn = ui.button("set lock") \
+                            .props("dense flat color=negative no-caps")
+                        lock_html = ui.html("")
+
             # ===== MEASURE =====
             with ui.card().classes("ep-card block") as measure_block:
                 _blocks["measure"] = measure_block
@@ -5673,28 +5825,45 @@ def _build_electrometer_tab():
                     mrng_wrap, mrng_n, mrng_applied = _field_number(
                         "Range", 2e-6, "A", step=1e-9, fmt="%.2e")
                     nplc_wrap, nplc_n, nplc_applied = _field_number(
-                        "Aperture (NPLC)", 1.0, "PLC", step=0.1, fmt="%.2f")
+                        "Integration time (NPLC)", 1.0, "PLC", step=0.1, fmt="%.2f")
+                    with ui.element("div").classes("preset-row"):
+                        for val, lbl in ((0.1, "0.1 · fast"), (1.0, "1 · normal"),
+                                         (10.0, "10 · low noise")):
+                            ui.button(lbl, on_click=lambda v=val: nplc_n.set_value(v)) \
+                                .props("flat dense no-caps")
+                    nplc_hint = ui.html('<p class="hint"></p>')
                     auto_wrap, auto_sw = _field_toggle("Auto-range", True)
-                    zref_wrap, zref_sw = _field_toggle("Zero-correct", True)
-                    mv_wrap, mv_sw = _field_toggle("Also measure voltage", False)
+                    floor_wrap, floor_sel, _ = _field_select(
+                        "Auto-range floor",
+                        {2e-12: "2 pA", 2e-11: "20 pA", 2e-10: "200 pA",
+                         2e-9: "2 nA", 2e-8: "20 nA"}, 2e-12)
+                    ui.html('<p class="hint">Lowest range auto-range may use. On the pA '
+                            'ranges each sweep step can take 3–5 s to settle after the '
+                            'bias changes; 2 nA or higher keeps sweeps fast when you '
+                            "don't need sub-pA resolution.</p>")
+                    zref_wrap, zref_sw = _field_toggle("Zero-correct (sweep)", True)
+                    mv_wrap, mv_sw = _field_toggle("Also measure voltage (sweep)", False)
 
             # ===== TRIGGER / TIMING =====
             with ui.card().classes("ep-card block") as timing_block:
                 _blocks["timing"] = timing_block
                 with ui.row().classes("block-head"):
-                    ui.html('<p class="eyebrow">Trigger / timing</p>')
+                    ui.html('<p class="eyebrow">Timing</p>')
                     apply_timing_btn = ui.button("apply").props("flat dense") \
                         .classes("apply-btn")
                 with ui.element("div").classes("fields"):
-                    trg_src_wrap, trg_src_sel, _ = _field_select(
-                        "Trigger source",
-                        {"AINT":"AUTO", "TIMER":"TIMER", "BUS":"BUS", "EXT":"EXT"},
-                        "AINT")
                     trg_delay_wrap, trg_delay_n, trg_delay_applied = _field_number(
-                        "Trigger delay", 0.1, "s", step=0.01, fmt="%.3f")
-                    trg_timer_wrap, trg_timer_n, _ = _field_number(
-                        "Timer interval (TIMER only)", 0.01, "s",
-                        step=0.01, fmt="%.4f")
+                        "Settling delay (sweep)", 0.1, "s", step=0.01, fmt="%.3f")
+                    ui.html(
+                        '<p class="hint">Wait after each voltage step before measuring, '
+                        'so the source, the device and cable capacitance, and the '
+                        "ammeter's auto-range settle. 0.1 s is fine for µA–nA; use "
+                        '0.5–1 s for pA readings or large capacitance. Ammeter mode '
+                        "doesn't use it: its interval sets the pace.</p>")
+                    ui.html(
+                        '<p class="hint">Sweeps and reads use the values shown here '
+                        'and in Measure; apply only matters for other tools that use '
+                        'the electrometer.</p>')
 
         # -------- FOOTER ------------------------------------------------
         with ui.element("div").classes("efooter w-full"):
@@ -5704,8 +5873,10 @@ def _build_electrometer_tab():
 
     # ---- log widget (small, below the panel) -------------------------
     log = ui.log(max_lines=80).classes("h-12 w-full")
+    jlog = logging.getLogger("webapp.elec")
     def log_msg(s: str):
         log.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+        jlog.info(s)
 
     # ====================================================================
     # WIRING
@@ -5747,6 +5918,8 @@ def _build_electrometer_tab():
     # ---- Apply handlers --------------------------------------------------
     async def apply_source():
         if HUB.elec is None: log_msg("not connected"); return
+        if _bias_lock_refuses(float(src_level_n.value or 0), "source apply"):
+            return
         _arm_hv_guard()
         _on_hv_threshold()      # carry a pre-connect threshold edit to the driver
         try:
@@ -5772,12 +5945,14 @@ def _build_electrometer_tab():
                 HUB.elec.configure_sweep,
                 current_range_auto=bool(auto_sw.value),
                 current_range_v=float(mrng_n.value),
+                current_range_lower_a=float(floor_sel.value),
                 current_aperture_mode="FIXED",
                 current_aperture_s=aper_s,
                 zero_reference=bool(zref_sw.value),
                 measure_voltage=bool(mv_sw.value),
             )
             log_msg(f"measure applied · auto={auto_sw.value} "
+                    f"· floor={float(floor_sel.value):.0e} A "
                     f"· range={float(mrng_n.value):.1e} A "
                     f"· NPLC={float(nplc_n.value):.2f} "
                     f"· zero-correct={zref_sw.value} · meas-v={mv_sw.value}")
@@ -5791,8 +5966,7 @@ def _build_electrometer_tab():
                 HUB.elec.configure_sweep,
                 delay_s=float(trg_delay_n.value),
             )
-            log_msg(f"timing applied · delay={float(trg_delay_n.value):.3f} s "
-                    f"· trigger={trg_src_sel.value}")
+            log_msg(f"timing applied · delay={float(trg_delay_n.value):.3f} s")
         except Exception as e:
             log_msg(f"timing apply FAIL: {type(e).__name__}: {e}")
 
@@ -5800,7 +5974,81 @@ def _build_electrometer_tab():
     apply_measure_btn.on_click(apply_measure)
     apply_timing_btn.on_click(apply_timing)
 
-    # ---- Sweep + plot ------------------------------------------------
+    def _refresh_lock_html():
+        lock = read_bias_lock()
+        if lock is None:
+            lock_html.set_content('<span class="hint" style="color:var(--warn)">'
+                                  'no bias lock set</span>')
+            return
+        when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(lock["set_at"]))
+                if lock.get("set_at") else "?")
+        lock_html.set_content(
+            f'<span class="hint">locked at <b>{lock["max_v"]:.2f} V</b> · '
+            f'{when} · {lock.get("set_by") or "?"}</span>')
+
+    def _write_lock(v: float, who: str):
+        write_bias_lock(v, set_by=who)
+        logging.getLogger("daq.webgui").warning("bias lock set to %.2f V by %s", v, who)
+        log_msg(f"bias lock = {v:.2f} V")
+        ui.notify(f"bias lock set to {v:.2f} V", type="positive",
+                  position="top", timeout=3000)
+        _refresh_lock_html()
+
+    def do_set_lock():
+        try:
+            v = float(lock_n.value)
+        except (TypeError, ValueError):
+            ui.notify("bias lock: enter a voltage", type="warning", position="top")
+            return
+        if v < 0:
+            ui.notify("bias lock must be ≥ 0 V", type="warning", position="top")
+            return
+        who = app.storage.user.get("display_name", "") or "?"
+        cur = read_bias_lock()
+        if cur is None or v <= cur["max_v"]:
+            _write_lock(v, who)
+            return
+        with ui.dialog() as dlg, ui.card():
+            ui.label(f"Raise the bias lock from {cur['max_v']:.2f} V to {v:.2f} V?")
+            ui.label("It applies to every tool that drives the B2987 on this machine.") \
+                .classes("text-xs")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                def _ok():
+                    dlg.close()
+                    _write_lock(v, who)
+                ui.button("Raise lock", color="negative", on_click=_ok)
+        dlg.open()
+
+    set_lock_btn.on_click(do_set_lock)
+    _refresh_lock_html()
+
+    async def _apply_staged():
+        """Runs and reads use what Measure and Timing show, applied or not.
+        (Source is left alone: it sets the output voltage.)"""
+        await apply_measure()
+        await apply_timing()
+
+    def _aperture_s() -> float:
+        try:
+            return max(float(nplc_n.value or 0), 0.0) / 60.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _update_nplc_hint():
+        try:
+            nplc = float(nplc_n.value or 0)
+        except (TypeError, ValueError):
+            nplc = 0.0
+        nplc_hint.set_content(
+            f'<p class="hint">{nplc:g} PLC = {nplc / 60 * 1000:.1f} ms per reading '
+            '(60 Hz mains). Whole numbers cancel mains pickup: 1 for general use, '
+            '10 for the lowest noise at pA levels, 0.1 for fast, coarse scans. '
+            'Longer is quieter but slower.</p>')
+
+    # ---- Sweep / ammeter + plot ---------------------------------------
+    results: dict = {"iv": None, "amm": None}   # last result per mode
+
     def _planned_voltages() -> list:
         try:
             a = float(sv_start_n.value); b = float(sv_stop_n.value)
@@ -5811,87 +6059,311 @@ def _build_electrometer_tab():
         except (ValueError, TypeError):
             return []
 
-    def _update_preview():
-        vs = _planned_voltages()
-        try: avg = int(sv_avg_n.value)
-        except (ValueError, TypeError): avg = 0
-        derived_html.set_content(
-            f'<span class="derived">{len(vs)} pts × {avg} avg = '
-            f'{len(vs) * avg} reads</span>'
-        )
-        iv_chart.options["series"][0]["data"] = [[float(v), 0.0] for v in vs]
+    def _valid(r):
+        """Readings that aren't the 9.91e+37 'no data' sentinel."""
+        ok = _np.abs(r.current_a) < _SENTINEL
+        return r.timestamp_s[ok], r.source_v[ok], r.current_a[ok]
+
+    MARKER_LIMIT = 200   # beyond this many points draw the line only
+
+    def _render_plot(r=None):
+        mode, view = mode_tg.value, view_tg.value
+        series = iv_chart.options["series"]
+        for k in range(5):
+            series[k]["data"] = []
+        by_voltage = mode == "iv" and view == "avg"
+        iv_chart.options["xAxis"]["name"] = "V_source (V)" if by_voltage else "t (s)"
+        if by_voltage:
+            series[0]["data"] = [[float(v), 0.0] for v in _planned_voltages()]
+        if r is None:
+            r = results[mode]
+        if r is not None and len(r.current_a):
+            t, v, i = _valid(r)
+            t0 = float(r.timestamp_s[0])
+            if by_voltage:
+                series[1]["data"] = [[float(x), float(y)] for x, y in
+                                     zip(r.avg_source_v, r.avg_current_a)
+                                     if abs(y) < _SENTINEL]
+            elif view == "ts":
+                series[1]["data"] = [[float(x) - t0, float(y)] for x, y in zip(t, i)]
+            if mode == "amm" and len(i):
+                m, sd = float(_np.mean(i)), float(_np.std(i))
+                t_end = float(r.timestamp_s[-1]) - t0 or 1.0
+                series[2]["data"] = [[0.0, m], [t_end, m]]
+                if view == "avg":
+                    series[3]["data"] = [[0.0, m + sd], [t_end, m + sd]]
+                    series[4]["data"] = [[0.0, m - sd], [t_end, m - sd]]
+        log_y = scale_tg.value == "log"
+        y_axis = iv_chart.options["yAxis"]
+        y_axis["type"] = "log" if log_y else "value"
+        y_axis["name"] = "|I| (A)" if log_y else "I (A)"
+        if log_y:
+            # A log axis can't show I <= 0: plot |I|, drop exact zeros, and drop
+            # a sigma line that crosses zero rather than mirror it.
+            series[0]["data"] = []
+            mean = series[2]["data"][0][1] if series[2]["data"] else None
+            for k in (1, 2, 3, 4):
+                data = series[k]["data"]
+                if k in (3, 4) and data and mean is not None and (data[0][1] > 0) != (mean > 0):
+                    series[k]["data"] = []
+                    continue
+                series[k]["data"] = [[x, abs(y)] for x, y in data if y != 0]
+        series[1]["showSymbol"] = len(series[1]["data"]) <= MARKER_LIMIT
         iv_chart.update()
 
-    for fld in (sv_start_n, sv_stop_n, sv_step_n, sv_avg_n):
+    def _render_stats(r=None, prefix=""):
+        mode = mode_tg.value
+        if r is None:
+            r = results[mode]
+        if r is None or not len(r.current_a):
+            stats_html.set_content('<span class="stats"></span>')
+            return
+        t, v, i = _valid(r)
+        dur = float(r.timestamp_s[-1] - r.timestamp_s[0])
+        bad = len(r.current_a) - len(i)
+        tail = f" · {bad} over range" if bad else ""
+        if not len(i):
+            stats_html.set_content(f'<span class="stats">no valid readings{tail}</span>')
+        elif mode == "amm":
+            m, sd = float(_np.mean(i)), float(_np.std(i))
+            src = (f"source {r.bias_voltage_V:g} V" if HUB.elec and HUB.elec._driver._output_on
+                   else "source off")
+            stats_html.set_content(
+                f'<span class="stats">{prefix}mean {m:.4e} A · σ {sd:.2e} A · '
+                f'SEM {sd / math.sqrt(len(i)):.2e} A · n={len(i)} · '
+                f'{dur:.2f} s · {src}{tail}</span>')
+        else:
+            stats_html.set_content(
+                f'<span class="stats">{prefix}{len(r.avg_source_v)} pts × '
+                f'{r.n_per_voltage} · {dur:.1f} s · I({float(r.avg_source_v[-1]):.2f} V) = '
+                f'{float(r.avg_current_a[-1]):.3e} A{tail}</span>')
+
+    def _update_preview():
+        aper = _aperture_s()
+        if mode_tg.value == "iv":
+            vs = _planned_voltages()
+            try: avg = int(sv_avg_n.value)
+            except (ValueError, TypeError): avg = 0
+            try: delay = float(trg_delay_n.value or 0)
+            except (ValueError, TypeError): delay = 0.0
+            est = len(vs) * (delay + avg * aper) + 0.5
+            derived_html.set_content(
+                f'<span class="derived">{len(vs)} pts × {avg} avg = '
+                f'{len(vs) * avg} reads · ≈{est:.0f} s</span>')
+        else:
+            try: n = int(amm_n_n.value or 0)
+            except (ValueError, TypeError): n = 0
+            try: interval = max(float(amm_int_n.value or 0), 0.0)
+            except (ValueError, TypeError): interval = 0.0
+            est = n * max(aper, interval)
+            derived_html.set_content(
+                f'<span class="derived">{n} reads · ≈{est:.1f} s</span>')
+        _render_plot()
+
+    def _on_mode(_e=None):
+        iv = mode_tg.value == "iv"
+        iv_fields.set_visibility(iv)
+        amm_fields.set_visibility(not iv)
+        run_btn.set_text("▶ Run sweep" if iv else "▶ Measure")
+        _update_preview()
+        _render_stats()
+
+    def _rerender(_e=None):
+        if running["desc"]:
+            live["shown"] = -1      # the next live tick redraws in the new view
+        else:
+            _render_plot()
+
+    mode_tg.on_value_change(_on_mode)
+    view_tg.on_value_change(_rerender)
+    scale_tg.on_value_change(_rerender)
+    for fld in (sv_start_n, sv_stop_n, sv_step_n, sv_avg_n, amm_n_n, amm_int_n,
+                trg_delay_n):
         fld.on_value_change(lambda *_: _update_preview())
+    nplc_n.on_value_change(lambda *_: (_update_nplc_hint(), _update_preview()))
+    _update_nplc_hint()
     _update_preview()
 
-    def _save_sweep_h5(result) -> str:
+    def _save_h5(result, kind: str, extra: dict) -> str:
         import h5py
         out_dir = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "..", "data",
         ))
-        path = h5io.elec_sweep_filename(out_dir)
+        path = h5io.run_filename(out_dir, prefix=f"elec_{kind}")
         with h5py.File(path, "w") as f:
-            h5io.write_top_attrs(f, measurement_type="elec_sweep")
-            g = f.create_group("/elec_sweep")
+            h5io.write_top_attrs(f, measurement_type=f"elec_{kind}")
+            g = f.create_group(f"/elec_{kind}")
             h5io.write_sweep_result(g, result, attrs={
                 "source_range_v":  HUB.elec._source_range,
                 "current_limit":   HUB.elec._current_limit,
                 "aperture_mode":   getattr(HUB.elec, "_current_aperture_mode", "AUTO"),
+                "aperture_s":      getattr(HUB.elec, "_current_aperture", None) or 0.0,
                 "delay_s":         getattr(HUB.elec, "_delay_s", 0.0),
                 "measure_voltage": getattr(HUB.elec, "_measure_voltage", False),
+                **extra,
             })
         return path
 
-    async def do_run_sweep():
+    # What is running, for the output card and the elapsed-time pill.
+    running: dict = {"desc": None, "t0": 0.0, "est": 0.0, "total": 0, "n_per": 1}
+
+    # Readings delivered so far by the running sweep / ammeter (appended from
+    # the worker thread, drawn by _live_tick on the GUI loop).
+    live: dict = {"src": [], "cur": [], "ts": [], "shown": -1}
+    live_lock = threading.Lock()
+
+    def _live_add(voltage, currents, stamps):
+        with live_lock:
+            live["src"] += [voltage] * len(currents)
+            live["cur"] += list(currents)
+            live["ts"]  += list(stamps)
+
+    def _live_result():
+        with live_lock:
+            src, cur, ts = list(live["src"]), list(live["cur"]), list(live["ts"])
+        if not cur or HUB.elec is None:
+            return None
+        return HUB.elec._series_result(src, cur, ts, running["n_per"])
+
+    def _live_tick():
+        if not running["desc"]:
+            return
+        with live_lock:
+            n = len(live["cur"])
+        if n == live["shown"]:
+            return
+        live["shown"] = n
+        r = _live_result()
+        if r is not None:
+            _render_plot(r)
+            _render_stats(r, prefix=f"live {n}/{running['total']} · ")
+
+    ui.timer(0.5, _live_tick)
+
+    def do_stop():
+        if HUB.elec is not None and running["desc"]:
+            HUB.elec.request_stop()
+            log_msg("stop requested")
+
+    stop_btn.on_click(do_stop)
+
+    async def do_run():
         if HUB.elec is None: log_msg("not connected"); return
-        vs = _planned_voltages()
-        if not vs:
-            log_msg("empty sweep range"); return
-        try:    avg = max(1, int(sv_avg_n.value))
-        except (ValueError, TypeError): avg = 1
-        log_msg(f"sweep {len(vs)} pts {vs[0]:.2f} → {vs[-1]:.2f} V (n={avg})")
-        set_activity("electrometer IV sweep",
-                     f"{len(vs)} pts {vs[0]:.2f}..{vs[-1]:.2f} V")
+        mode = mode_tg.value
+        if mode == "iv":
+            vs = _planned_voltages()
+            if not vs:
+                log_msg("empty sweep range"); return
+            if _bias_lock_refuses(vs, "sweep"):
+                return
+            try:    avg = max(1, int(sv_avg_n.value))
+            except (ValueError, TypeError): avg = 1
+        else:
+            try:    n = int(amm_n_n.value)
+            except (ValueError, TypeError): n = 0
+            if n < 1:
+                log_msg("samples must be ≥ 1"); return
+            try:    interval = max(0.0, float(amm_int_n.value or 0))
+            except (ValueError, TypeError): interval = 0.0
+        await _apply_staged()
+        aper = _aperture_s()
+        if mode == "iv":
+            running["desc"] = f"sweeping {vs[0]:.2f} → {vs[-1]:.2f} V"
+            running["est"] = len(vs) * (float(trg_delay_n.value or 0) + avg * aper) + 0.5
+        else:
+            running["desc"] = f"ammeter · {n} samples"
+            running["est"] = n * max(aper, interval)
+        running["t0"] = time.monotonic()
+        running["total"] = len(vs) * avg if mode == "iv" else n
+        running["n_per"] = avg if mode == "iv" else n
+        with live_lock:
+            live["src"], live["cur"], live["ts"], live["shown"] = [], [], [], -1
+        _render_plot(SimpleNamespace(current_a=[]))      # clear the previous run
+        stats_html.set_content(f'<span class="stats">live 0/{running["total"]}</span>')
         sweep_status_html.set_content('<span class="statuspill" style="color:var(--warn)">running…</span>')
         run_btn.props("disable")
+        stop_btn.set_enabled(True)
         try:
-            result = await _run_in_thread(HUB.elec.sweep, vs, avg)
-            n_pts = len(result.avg_source_v)
-            last_v = float(result.avg_source_v[-1])
-            last_i = float(result.avg_current_a[-1])
-            note_bias(v_set=last_v, i_meas=last_i, output_on=True)
-            i_hero.set_content(_fmt_i(last_i))
-            v_hero.set_content(_fmt_v(last_v))
-            log_msg(f"  done: {n_pts} pts, I({last_v:.2f}V)={last_i:.3e} A")
-
-            saved = None
+            if mode == "iv":
+                log_msg(f"sweep {len(vs)} pts {vs[0]:.2f} → {vs[-1]:.2f} V (n={avg})")
+                set_activity("electrometer IV sweep",
+                             f"{len(vs)} pts {vs[0]:.2f}..{vs[-1]:.2f} V")
+                result = await _run_in_thread(HUB.elec.sweep_live, vs, avg, None, _live_add)
+                last_v = float(result.avg_source_v[-1])
+                last_i = float(result.avg_current_a[-1])
+                note_bias(v_set=last_v, i_meas=last_i,
+                          output_on=HUB.elec._driver._output_on)
+                i_hero.set_content(_fmt_i(last_i))
+                v_hero.set_content(_fmt_v(last_v))
+                log_msg(f"  done: {len(result.avg_source_v)} pts, "
+                        f"I({last_v:.2f}V)={last_i:.3e} A")
+                kind, extra = "sweep", {}
+            else:
+                log_msg(f"ammeter {n} samples, interval {interval:g} s")
+                set_activity("electrometer ammeter", f"{n} samples")
+                v_level = (HUB.elec._driver._source_voltage
+                           if HUB.elec._driver._output_on else 0.0)
+                result = await _run_in_thread(
+                    HUB.elec.ammeter, n, interval,
+                    lambda cur, ts: _live_add(v_level, cur, ts))
+                _t, _v, good = _valid(result)
+                if len(good):
+                    m = float(_np.mean(good))
+                    note_bias(i_meas=m)
+                    i_hero.set_content(_fmt_i(m))
+                    log_msg(f"  done: mean {m:.4e} A, σ {float(_np.std(good)):.2e} A "
+                            f"(n={len(good)})")
+                else:
+                    i_hero.set_content(_fmt_i(float(result.current_a[0])))
+                    log_msg(f"  no valid readings: {_hint_for_no_data()}")
+                kind = "ammeter"
+                extra = {"interval_s": interval,
+                         "output_on": bool(HUB.elec._driver._output_on),
+                         "source_v_set": float(result.bias_voltage_V)}
+            for w in HUB.elec._driver.last_warnings:
+                log_msg(f"  instrument: {w}")
+            results[mode] = result
+            _render_stats()
+            _render_plot()
             if bool(save_h5_sw.value):
                 try:
-                    saved = await _run_in_thread(_save_sweep_h5, result)
+                    saved = await _run_in_thread(_save_h5, result, kind, extra)
                     log_msg(f"  saved: {saved}")
                 except Exception as e:
                     log_msg(f"  HDF5 save FAIL: {type(e).__name__}: {e}")
             sweep_status_html.set_content(
-                f'<span class="statuspill" style="color:var(--ok)">done</span>'
-            )
-            iv_chart.options["series"][1]["data"] = list(zip(
-                [float(x) for x in result.avg_source_v],
-                [float(y) for y in result.avg_current_a],
-            ))
-            iv_chart.update()
-        except Exception as e:
-            log_msg(f"  sweep FAIL: {type(e).__name__}: {e}")
+                '<span class="statuspill" style="color:var(--ok)">done</span>')
+        except AcquisitionStopped:
+            partial = _live_result()
+            log_msg(f"  {'sweep' if mode == 'iv' else 'ammeter'} stopped after "
+                    f"{0 if partial is None else len(partial.current_a)} readings")
+            if partial is not None:
+                results[mode] = partial
+                _render_stats(partial, prefix="stopped · ")
+                _render_plot()
+                if bool(save_h5_sw.value):
+                    try:
+                        saved = await _run_in_thread(
+                            _save_h5, partial, "sweep" if mode == "iv" else "ammeter",
+                            {"stopped": True})
+                        log_msg(f"  saved partial: {saved}")
+                    except Exception as e:
+                        log_msg(f"  HDF5 save FAIL: {type(e).__name__}: {e}")
             sweep_status_html.set_content(
-                f'<span class="statuspill" style="color:var(--bad)">failed</span>'
-            )
+                '<span class="statuspill" style="color:var(--warn)">stopped</span>')
+        except Exception as e:
+            log_msg(f"  {'sweep' if mode == 'iv' else 'ammeter'} FAIL: "
+                    f"{type(e).__name__}: {e}")
+            sweep_status_html.set_content(
+                '<span class="statuspill" style="color:var(--bad)">failed</span>')
         finally:
+            running["desc"] = None
             clear_activity()
             run_btn.props(remove="disable")
+            stop_btn.set_enabled(False)
 
-    run_btn.on_click(do_run_sweep)
+    run_btn.on_click(do_run)
 
     # ---- 1-Hz tick: status bar + applied values + dirty marks --------
     def _set_applied(applied_html, value, unit=""):
@@ -5912,6 +6384,7 @@ def _build_electrometer_tab():
         applied_html.set_content(f'<span class="applied-note">applied: {txt}</span>')
 
     def tick():
+        _refresh_lock_html()
         # Status bar + output card + connect button visibility
         if HUB.elec is None:
             statusbar.classes(remove="is-connected")
@@ -5968,10 +6441,20 @@ def _build_electrometer_tab():
                 '<span class="ic">■</span><span>output off</span></button>'
             )
             output_card.classes(remove="is-on")
-        readback_html.set_content(
-            f'<div class="readback">source level '
-            f'<span class="v">{drv._source_voltage:.3f} V</span></div>'
-        )
+        if running["desc"]:
+            # A list sweep never updates the cached level, which would keep
+            # showing whatever the Source block set last.
+            readback_html.set_content(
+                f'<div class="readback">{running["desc"]}</div>')
+            elapsed = time.monotonic() - running["t0"]
+            sweep_status_html.set_content(
+                f'<span class="statuspill" style="color:var(--warn)">running… '
+                f'{elapsed:.0f} s / ≈{running["est"]:.0f} s</span>')
+        else:
+            readback_html.set_content(
+                f'<div class="readback">source level '
+                f'<span class="v">{drv._source_voltage:.3f} V</span></div>'
+            )
 
         # Applied-value notes
         _set_applied(src_level_applied, drv._source_voltage, "V")
@@ -6260,11 +6743,13 @@ def _build_mux_tab():
             '<span class="lbl">Connected — 96-channel IV-Pulse MUX</span>'
         )
         connect_btn.set_visibility(False)
-        try:
-            ch = HUB.mux.active_channel()
-        except Exception:
-            ch = None
-        if ch is None:
+        ch = _reading("mux_ch", HUB.mux.active_channel)
+        if ch is _PENDING:
+            return
+        if isinstance(ch, Exception):
+            active_ch.set_content('<span class="v" '
+                                  'style="color:var(--bad)">err</span>')
+        elif ch is None:
             active_ch.set_content('<span class="v" '
                                   'style="color:var(--mut)">none</span>')
         else:
@@ -6275,11 +6760,12 @@ def _build_mux_tab():
 
 
 def _build_ivmux_tab():
-    """90-channel IV MUX front panel.
+    """IV MUX front panel.
 
     Mirrors the pulse-MUX panel (reuses its `.mux-panel` CSS scope) but
-    targets HUB.ivmux and the 1–90 channel range.  The IV MUX has no bypass
-    relay, so the right column carries only the Arduino die-temperature card.
+    targets HUB.ivmux and the fitted channels (config.ivmux_channels).  The IV
+    MUX has no bypass relay, so the right column carries only the Arduino
+    die-temperature card.
 
     Layout:
         [connect strip]
@@ -6288,14 +6774,16 @@ def _build_ivmux_tab():
                    select / zero / refresh buttons]
           [RIGHT side column — Arduino die temperature]
         [Channel sweep card — start/stop/dwell + run + status pill]
+        [Serial monitor — every line on the port + raw command input]
     """
+    n_ch = HUB.config.ivmux_channels
     with ui.element("div").classes("mux-panel w-full"):
 
         # ---- Connect strip ----
         with ui.row().classes("connstrip w-full") as connstrip:
             ui.html('<span class="dot"></span>')
             conn_lbl = ui.html(
-                '<span class="lbl">Not connected — 90-channel IV MUX</span>'
+                f'<span class="lbl">Not connected — {n_ch}-channel IV MUX</span>'
             )
             async def _do_connect():
                 ok = await _quick_connect("ivmux")
@@ -6323,9 +6811,9 @@ def _build_ivmux_tab():
                         .style("display:grid; grid-template-columns:1fr 1fr; "
                                "gap:14px; margin-bottom:16px"):
                     with ui.element("div").classes("fld"):
-                        ui.html('<label class="fld-lbl">Channel (1–90)</label>')
+                        ui.html(f'<label class="fld-lbl">Channel (1–{n_ch})</label>')
                         ch_n = ui.number(value=1, step=1, format="%d",
-                                         min=1, max=90) \
+                                         min=1, max=n_ch) \
                             .props("dense filled hide-bottom-space")
                     with ui.element("div").classes("fld"):
                         ui.html('<label class="fld-lbl">Settle</label>')
@@ -6338,8 +6826,8 @@ def _build_ivmux_tab():
                                   type="warning", position="top", timeout=2000)
                         return
                     ch = int(ch_n.value or 0)
-                    if ch < 1 or ch > 90:
-                        ui.notify("channel must be 1–90",
+                    if ch < 1 or ch > n_ch:
+                        ui.notify(f"channel must be 1–{n_ch}",
                                   type="warning", position="top", timeout=2000)
                         return
                     try:
@@ -6372,6 +6860,11 @@ def _build_ivmux_tab():
 
             # ----- RIGHT side column -----
             with ui.element("div").classes("side-col"):
+
+                # ---- NGE100 power for the MUX board ----
+                with ui.card().classes("card-mux"):
+                    ui.html('<p class="eyebrow">Power · NGE100</p>')
+                    _build_rail_power("ivmux")
 
                 # ---- Arduino die temperature card ----
                 with ui.card().classes("card-mux"):
@@ -6429,12 +6922,12 @@ def _build_ivmux_tab():
                 with ui.element("div").classes("fld").style("width:130px"):
                     ui.html('<label class="fld-lbl">Start ch</label>')
                     sw_start_n = ui.number(value=1, step=1, format="%d",
-                                           min=1, max=90) \
+                                           min=1, max=n_ch) \
                         .props("dense filled hide-bottom-space")
                 with ui.element("div").classes("fld").style("width:130px"):
                     ui.html('<label class="fld-lbl">Stop ch</label>')
-                    sw_stop_n = ui.number(value=90, step=1, format="%d",
-                                          min=1, max=90) \
+                    sw_stop_n = ui.number(value=n_ch, step=1, format="%d",
+                                          min=1, max=n_ch) \
                         .props("dense filled hide-bottom-space")
                 with ui.element("div").classes("fld").style("width:140px"):
                     ui.html('<label class="fld-lbl">Dwell</label>')
@@ -6450,8 +6943,8 @@ def _build_ivmux_tab():
                                   position="top", timeout=2000)
                         return
                     a = int(sw_start_n.value or 1)
-                    b = int(sw_stop_n.value or 90)
-                    a = max(1, min(90, a)); b = max(1, min(90, b))
+                    b = int(sw_stop_n.value or n_ch)
+                    a = max(1, min(n_ch, a)); b = max(1, min(n_ch, b))
                     chans = list(range(a, b + 1)) if a <= b else list(range(a, b - 1, -1))
                     dwell = float(sw_dwell_n.value or 0)
                     sweep_status_html.set_content(
@@ -6481,26 +6974,109 @@ def _build_ivmux_tab():
                         sweep_btn.props(remove="disable")
                 sweep_btn.on_click(do_ivmux_sweep)
 
+        # ---- Serial monitor ----
+        with ui.card().classes("card-mux w-full"):
+            with ui.row().classes("items-center w-full").style("gap:12px"):
+                ui.html('<p class="eyebrow" style="margin:0">'
+                        'Serial monitor · 9600 8N1</p>')
+                hide_polls = ui.checkbox("hide status polls", value=True) \
+                    .props("dense")
+                mon_clear_btn = ui.button("clear").props("flat dense") \
+                    .style("margin-left:auto")
+            mon_log = ui.log(max_lines=500).classes("w-full") \
+                .style("height:260px; font-family:ui-monospace,monospace; "
+                       "font-size:12px")
+            with ui.row().classes("items-end w-full").style("gap:12px"):
+                raw_in = ui.input(placeholder="d   a 5   b 5 1   s 5 0   z   w   t") \
+                    .props("dense filled hide-bottom-space") \
+                    .classes("flex-grow") \
+                    .style("font-family:ui-monospace,monospace")
+                send_btn = ui.button("send").props("color=primary")
+            ui.html('<p class="desc">Every line sent (→) and received (←) on the '
+                    'IV MUX port, from this tab, the status poll or a running '
+                    'measurement. Raw commands go to the firmware as typed; '
+                    '<code>a</code>, <code>b</code>, <code>s</code>, <code>z</code> '
+                    f'and <code>q</code> switch relays. Channels are limited to 1–{n_ch}.</p>')
+
+        # Entries are read by sequence number; "floor" hides what was cleared.
+        mon_state = {"seq": 0, "floor": 0}
+
+        def _mon_line(entry) -> str | None:
+            _seq, t, direction, text, tag = entry
+            if tag == "poll" and hide_polls.value:
+                return None
+            ts = time.strftime("%H:%M:%S", time.localtime(t)) + f".{int(t % 1 * 1000):03d}"
+            arrow = {"tx": "→", "rx": "←", "info": "·"}[direction]
+            return f"{ts}  {arrow} {text}" + ("   [poll]" if tag == "poll" else "")
+
+        def _mon_push_new():
+            snap = IVM.TRAFFIC.copy()   # the tap appends from worker threads
+            for entry in snap:
+                if entry[0] > mon_state["seq"]:
+                    line = _mon_line(entry)
+                    if line is not None:
+                        mon_log.push(line)
+            if snap:
+                mon_state["seq"] = max(mon_state["seq"], snap[-1][0])
+
+        def _mon_rerender():
+            mon_log.clear()
+            mon_state["seq"] = mon_state["floor"]
+            _mon_push_new()
+
+        def _mon_clear():
+            mon_log.clear()
+            last = IVM.TRAFFIC[-1][0] if IVM.TRAFFIC else 0
+            mon_state["floor"] = mon_state["seq"] = last
+
+        async def do_send():
+            text = (raw_in.value or "").strip()
+            if not text:
+                return
+            if HUB.ivmux is None:
+                ui.notify("iv-mux not connected", type="warning",
+                          position="top", timeout=2000)
+                return
+            try:
+                reply = await _run_in_thread(HUB.ivmux.send_raw, text)
+                raw_in.value = ""
+                if not reply:
+                    ui.notify("no reply from the IV MUX", type="warning",
+                              position="top", timeout=3000)
+            except Exception as e:
+                ui.notify(f"send FAIL: {type(e).__name__}: {e}",
+                          type="negative", position="top", timeout=4000)
+            _mon_push_new()
+
+        hide_polls.on_value_change(lambda _e: _mon_rerender())
+        mon_clear_btn.on_click(_mon_clear)
+        send_btn.on_click(do_send)
+        raw_in.on("keydown.enter", do_send)
+        _mon_push_new()
+        ui.timer(0.5, _mon_push_new)
+
     # ---- Periodic refresh (state + connect strip + active channel) ----
     def _refresh_state():
         if HUB.ivmux is None:
             connstrip.classes(remove="is-connected")
             conn_lbl.set_content(
-                '<span class="lbl">Not connected — 90-channel IV MUX</span>'
+                f'<span class="lbl">Not connected — {n_ch}-channel IV MUX</span>'
             )
             connect_btn.set_visibility(True)
             active_ch.set_content('<span class="v">—</span>')
             return
         connstrip.classes(add="is-connected")
         conn_lbl.set_content(
-            '<span class="lbl">Connected — 90-channel IV MUX</span>'
+            f'<span class="lbl">Connected — {n_ch}-channel IV MUX</span>'
         )
         connect_btn.set_visibility(False)
-        try:
-            ch = HUB.ivmux.active_channel()
-        except Exception:
-            ch = None
-        if ch is None:
+        ch = _reading("ivmux_ch", HUB.ivmux.poll_active_channel)
+        if ch is _PENDING:
+            return
+        if isinstance(ch, Exception):
+            active_ch.set_content('<span class="v" '
+                                  'style="color:var(--bad)">err</span>')
+        elif ch is None:
             active_ch.set_content('<span class="v" '
                                   'style="color:var(--mut)">none</span>')
         else:
@@ -7325,6 +7901,105 @@ def _build_ks33500b_tab():
     )
 
 
+# One PSU, possibly several browsers: commands and their readback+repaint run
+# one at a time, so a quick on/off pair executes and paints in click order.
+_NGE_CMD_LOCK = asyncio.Lock()
+
+NGE_CHANNELS = 3  # NGE103
+
+
+def _read_nge100_state() -> dict:
+    """Blocking: {ch: (is_on, v, i)}, None for any query that failed."""
+    psu = HUB.nge100
+    def _q(fn, ch):
+        try:
+            return fn(ch)
+        except Exception:
+            return None
+    return {ch: (_q(psu.output_state, ch), _q(psu.measure_voltage, ch),
+                 _q(psu.measure_current, ch))
+            for ch in range(1, NGE_CHANNELS + 1)}
+
+
+def _build_rail_power(device: str) -> None:
+    """Power on/off for one bench device's NGE100 rails (mapped on the nge100
+    tab), with live readback. Used on the nge100, iv-mux and cremat tabs."""
+    name = RAILS.DEVICES[device]
+    with ui.element("div").classes("rail-power w-full"):
+        with ui.row().classes("items-center w-full").style("gap:10px; flex-wrap:wrap"):
+            ui.html(f'<span class="rail-name">{name}</span>')
+            state_html = ui.html('<span class="rail-state">—</span>')
+            on_btn = ui.button("power on").props("dense color=negative") \
+                .style("margin-left:auto")
+            off_btn = ui.button("power off").props("dense flat")
+        setpt_html = ui.html("")
+        detail_html = ui.html("")
+
+    async def _switch(on: bool) -> None:
+        verb = "on" if on else "off"
+        if HUB.nge100 is None:
+            ui.notify("nge100 not connected", type="warning",
+                      position="top", timeout=2000)
+            return
+        async with _NGE_CMD_LOCK:
+            try:
+                fn = RAILS.power_on if on else RAILS.power_off
+                chans = await _run_in_thread(fn, HUB.nge100,
+                                             HUB.config.nge100_rails, device)
+                log.info("nge100: %s power %s (ch %s)", name, verb,
+                         ", ".join(map(str, chans)))
+                ui.notify(f"{name} powered {verb}", type="positive",
+                          position="top", timeout=2500)
+            except Exception as e:
+                ui.notify(f"{name} power {verb} FAIL: {type(e).__name__}: {e}",
+                          type="negative", position="top", timeout=5000)
+            _invalidate_reading("nge100")
+
+    on_btn.on_click(lambda: _switch(True))
+    off_btn.on_click(lambda: _switch(False))
+
+    def _tick() -> None:
+        rails = HUB.config.nge100_rails
+        chans = RAILS.channels_for(rails, device)
+        ready = HUB.nge100 is not None and bool(chans)
+        on_btn.set_enabled(ready)
+        off_btn.set_enabled(ready)
+        setpt_html.set_content(
+            '<span class="rail-setpt">' + (" · ".join(
+                f'ch{ch} {rails[ch]["voltage"]:g} V / {rails[ch]["current"] * 1000:g} mA'
+                for ch in chans) or "no channel mapped") + '</span>')
+        if not chans:
+            state_html.set_content('<span class="rail-state">not mapped</span>')
+            detail_html.set_content(f'<span class="rail-detail">map a channel to {name} '
+                                    'on the nge100 tab</span>')
+            return
+        if HUB.nge100 is None:
+            state_html.set_content('<span class="rail-state">—</span>')
+            detail_html.set_content('<span class="rail-detail">connect the NGE100 '
+                                    '(nge100 tab) to power it</span>')
+            return
+        st = _reading("nge100", _read_nge100_state, 1.5)
+        if not isinstance(st, dict):
+            return
+        ons = [st[ch][0] for ch in chans]
+        if any(o is None for o in ons):
+            state_html.set_content('<span class="rail-state warn">no response</span>')
+        elif all(ons):
+            state_html.set_content('<span class="rail-state on">on</span>')
+        elif any(ons):
+            state_html.set_content('<span class="rail-state warn">partly on</span>')
+        else:
+            state_html.set_content('<span class="rail-state">off</span>')
+        def _fmt(x, scale, unit, spec):
+            return f"{x * scale:{spec}} {unit}" if isinstance(x, (int, float)) else f"— {unit}"
+        detail_html.set_content('<span class="rail-detail">' + " · ".join(
+            f"ch{ch} {_fmt(st[ch][1], 1, 'V', '.2f')} {_fmt(st[ch][2], 1000, 'mA', '.0f')}"
+            for ch in chans) + '</span>')
+
+    _tick()
+    ui.timer(1.0, _tick)
+
+
 def _build_nge_tab():
     """R&S NGE103 power supply (MUX rail) front panel.
 
@@ -7342,7 +8017,8 @@ def _build_nge_tab():
     neutral when off. Set fields use the accent-blue dirty marker until
     Apply commits both V setpoint and I limit.
     """
-    N_CHANNELS = 3  # NGE103 = 3 channels
+    N_CHANNELS = NGE_CHANNELS
+    rails = HUB.config.nge100_rails
 
     # Per-channel UI state we need to mutate in handlers
     ch_widgets: dict = {}      # ch -> dict of element refs
@@ -7380,25 +8056,76 @@ def _build_nge_tab():
                             .classes("tgl-danger")
                     refresh_btn = ui.button("refresh").props("flat dense")
 
-            async def _do_master_toggle(_e):
-                if HUB.nge100 is None:
-                    ui.notify("nge100 not connected", type="warning",
-                              position="top", timeout=2000)
-                    master_sw.set_value(not bool(_e.value))
-                    return
+            # Sync on purpose (so is _on_out): NiceGUI runs it inside the
+            # value assignment, so the echo check sees `shown` as of this
+            # change. An async handler body runs later, after another readback
+            # may have moved `shown`, and then takes a stale echo for a click.
+            def _do_master_toggle(_e):
                 on = bool(_e.value)
-                try:
-                    if on:
-                        await _run_in_thread(HUB.nge100.all_outputs_on)
-                    else:
-                        await _run_in_thread(HUB.nge100.all_outputs_off)
-                    log.info("nge100 master output %s", "on" if on else "off")
-                    _refresh_all()
-                except Exception as e:
-                    master_sw.set_value(not on)
-                    ui.notify(f"master toggle FAIL: {type(e).__name__}: {e}",
-                              type="negative", position="top", timeout=4000)
+                if on == master_sw_state.get("shown"):
+                    return None
+                master_sw_state["shown"] = on
+                return _master_cmd(on)
             master_sw.on_value_change(_do_master_toggle)
+
+        # ---- Devices: power + channel mapping ----
+        with ui.card().classes("card-psu w-full"):
+            ui.html('<p class="eyebrow">Devices</p>')
+            with ui.element("div").classes("rail-list"):
+                for dev_key in RAILS.DEVICES:
+                    _build_rail_power(dev_key)
+            ui.html('<p class="eyebrow">Channel mapping</p>')
+            map_rows: dict = {}
+            with ui.element("div").classes("railmap"):
+                for hdr in ("channel", "device", "voltage", "current limit"):
+                    ui.html(f'<span class="hdr">{hdr}</span>')
+                for ch in range(1, N_CHANNELS + 1):
+                    rail = rails.get(ch, {"device": "", "voltage": 0.0, "current": 0.0})
+                    ui.html(f'<span class="title">ch{ch}</span>')
+                    dev_sel = ui.select({"": "—", **RAILS.DEVICES}, value=rail["device"]) \
+                        .props("dense filled hide-bottom-space")
+                    v_n = ui.number(value=rail["voltage"], step=0.5, format="%.2f") \
+                        .props('dense filled hide-bottom-space suffix="V"')
+                    i_n = ui.number(value=rail["current"] * 1000, step=10, format="%.0f") \
+                        .props('dense filled hide-bottom-space suffix="mA"')
+                    map_rows[ch] = (dev_sel, v_n, i_n)
+            with ui.row().classes("items-center w-full").style("gap:12px; margin-top:12px"):
+                save_map_btn = ui.button("update mapping").props("color=primary dense")
+                ui.html('<span class="info">Saved; applies the next time a device '
+                        'is powered on.</span>')
+
+        def _save_mapping():
+            new = {ch: {"device": dev.value or "",
+                        "voltage": float(v.value or 0),
+                        "current": float(i.value or 0) / 1000}
+                   for ch, (dev, v, i) in map_rows.items()}
+            try:
+                RAILS.validate(new)
+                RAILS.save(new)
+            except (ValueError, OSError) as e:
+                ui.notify(f"mapping not saved: {e}", type="negative",
+                          position="top", timeout=5000)
+                return
+            old = HUB.config.nge100_rails
+            HUB.config.nge100_rails = new
+            log.info("nge100 mapping saved: %s", "; ".join(
+                f"ch{ch} {RAILS.DEVICES.get(r['device'], '—')} "
+                f"{r['voltage']:g} V {r['current'] * 1000:g} mA"
+                for ch, r in sorted(new.items())))
+            ui.notify("mapping saved", type="positive", position="top", timeout=2000)
+            # A live channel moved to another device is no longer switched by
+            # its old device's power-off button.
+            st = READINGS.get("nge100")
+            moved = [ch for ch in new
+                     if new[ch]["device"] != old.get(ch, {}).get("device")
+                     and isinstance(st, dict) and st.get(ch, (None,))[0]]
+            if moved:
+                ui.notify("still on after re-mapping: "
+                          + ", ".join(f"ch{ch}" for ch in moved)
+                          + " (switch it off on its channel card if needed)",
+                          type="warning", position="top", timeout=8000)
+
+        save_map_btn.on_click(_save_mapping)
 
         # ---- Channel grid ----
         with ui.element("div").classes("chgrid w-full"):
@@ -7434,13 +8161,15 @@ def _build_nge_tab():
                     with ui.element("div").classes("fld") \
                             .style("margin-bottom:12px"):
                         ui.html('<label class="fld-lbl">V setpoint</label>')
-                        vset_n = ui.number(value=5.000, step=0.05, format="%.3f") \
+                        vset_n = ui.number(value=rails.get(ch, {}).get("voltage", 5.0),
+                                           step=0.05, format="%.3f") \
                             .props('dense filled hide-bottom-space suffix="V"')
 
                     # I limit
                     with ui.element("div").classes("fld"):
                         ui.html('<label class="fld-lbl">I limit</label>')
-                        ilim_n = ui.number(value=0.500, step=0.01, format="%.3f") \
+                        ilim_n = ui.number(value=rails.get(ch, {}).get("current", 0.5),
+                                           step=0.01, format="%.3f") \
                             .props('dense filled hide-bottom-space suffix="A"')
 
                     # Apply button (accent when dirty)
@@ -7461,29 +8190,13 @@ def _build_nge_tab():
 
                     # Wire per-channel handlers
                     def _make_out_handler(c=ch):
-                        async def _on_out(_e):
-                            if HUB.nge100 is None:
-                                ui.notify("nge100 not connected", type="warning",
-                                          position="top", timeout=2000)
-                                ch_widgets[c]["out_sw"].set_value(
-                                    not bool(_e.value)
-                                ); return
+                        def _on_out(_e):
+                            w = ch_widgets[c]
                             on = bool(_e.value)
-                            try:
-                                if on:
-                                    await _run_in_thread(HUB.nge100.output_on, c)
-                                else:
-                                    await _run_in_thread(HUB.nge100.output_off, c)
-                                log.info("nge100 ch%d output %s",
-                                         c, "on" if on else "off")
-                                _refresh_channel(c)
-                                _refresh_master_state()
-                            except Exception as e:
-                                ch_widgets[c]["out_sw"].set_value(not on)
-                                ui.notify(
-                                    f"ch{c} toggle FAIL: {type(e).__name__}: {e}",
-                                    type="negative", position="top", timeout=4000,
-                                )
+                            if on == w.get("shown"):
+                                return None
+                            w["shown"] = on
+                            return _out_cmd(c, on)
                         return _on_out
                     out_sw.on_value_change(_make_out_handler(ch))
 
@@ -7500,105 +8213,134 @@ def _build_nge_tab():
                                           type="warning",
                                           position="top", timeout=2000); return
                             w = ch_widgets[c]
-                            try:
-                                v = float(w["vset_n"].value or 0)
-                                i = float(w["ilim_n"].value or 0)
-                                await _run_in_thread(
-                                    HUB.nge100.apply, c, v, i,
-                                )
-                                w["apply_btn"].classes(remove="is-dirty")
-                                log.info("nge100 ch%d applied · V=%.3f I=%.3f",
-                                         c, v, i)
-                                ui.notify(
-                                    f"ch{c} · V={v:.3f} V · I={i:.3f} A",
-                                    type="positive", position="top", timeout=2000,
-                                )
-                                _refresh_channel(c)
-                            except Exception as e:
-                                ui.notify(
-                                    f"ch{c} apply FAIL: {type(e).__name__}: {e}",
-                                    type="negative", position="top", timeout=4000,
-                                )
+                            async with _NGE_CMD_LOCK:
+                                try:
+                                    v = float(w["vset_n"].value or 0)
+                                    i = float(w["ilim_n"].value or 0)
+                                    if not await _run_in_thread(HUB.nge100.apply, c, v, i):
+                                        raise RuntimeError("PSU did not accept the command")
+                                    w["apply_btn"].classes(remove="is-dirty")
+                                    log.info("nge100 ch%d applied · V=%.3f I=%.3f",
+                                             c, v, i)
+                                    ui.notify(
+                                        f"ch{c} · V={v:.3f} V · I={i:.3f} A",
+                                        type="positive", position="top", timeout=2000,
+                                    )
+                                except Exception as e:
+                                    ui.notify(
+                                        f"ch{c} apply FAIL: {type(e).__name__}: {e}",
+                                        type="negative", position="top", timeout=4000,
+                                    )
+                                await _refresh_now()
                         return _do_apply
                     apply_ch_btn.on_click(_make_apply(ch))
 
     # ===== Refresh helpers =====
 
-    def _refresh_channel(ch: int):
-        """Pull measured V/I + output state from the PSU and update the UI."""
-        w = ch_widgets[ch]
-        if HUB.nge100 is None:
+    # Switches are also set from readback, and NiceGUI fires on_value_change
+    # for programmatic changes as well as clicks. Each switch therefore
+    # remembers the value last shown, and the handlers ignore events that
+    # merely echo it -- otherwise painting a readback re-sends the output
+    # command (from a stale or failed read, the opposite one), and showing
+    # the master as on because one channel is on switches all channels on.
+    master_sw_state: dict = {}
+
+    def _show_switch(sw, state: dict, value: bool) -> None:
+        state["shown"] = value
+        if bool(sw.value) != value:
+            sw.value = value
+
+    def _render(state: dict | None) -> None:
+        """Paint channel cards and the master switch from a _read_nge100_state()
+        result, or blanks when state is None (not connected)."""
+        on_count = 0
+        unknown = False
+        for ch in range(1, N_CHANNELS + 1):
+            is_on, v, i = state[ch] if state else (None, None, None)
+            unknown |= state is not None and is_on is None
+            w = ch_widgets[ch]
+            if is_on is not None:
+                _show_switch(w["out_sw"], w, bool(is_on))
+            on_count += bool(is_on)
+            state_txt = "—" if is_on is None else ("on" if is_on else "off")
             w["out_state_html"].set_content(
-                '<span class="state">—</span>'
+                f'<span class="state{" is-on" if is_on else ""}">{state_txt}</span>'
             )
+            if is_on:
+                w["readback_el"].classes(add="is-live")
+            else:
+                w["readback_el"].classes(remove="is-live")
+            v_txt = f"{v:.3f}" if isinstance(v, (int, float)) else "—"
+            i_txt = f"{i:.3f}" if isinstance(i, (int, float)) else "—"
             w["vm_html"].set_content(
-                '<span><span class="val">—</span><span class="u">V</span></span>'
+                f'<span><span class="val">{v_txt}</span><span class="u">V</span></span>'
             )
             w["im_html"].set_content(
-                '<span><span class="val small">—</span><span class="u">A</span></span>'
+                f'<span><span class="val small">{i_txt}</span><span class="u">A</span></span>'
             )
-            w["readback_el"].classes(remove="is-live")
+        if unknown:
+            master_state_html.set_content('<span class="state">no response</span>')
             return
-        try:
-            is_on = bool(HUB.nge100.is_output_on(ch))
-        except Exception:
-            is_on = False
-        try:
-            v = HUB.nge100.measure_voltage(ch)
-        except Exception:
-            v = None
-        try:
-            i = HUB.nge100.measure_current(ch)
-        except Exception:
-            i = None
-        # Update toggle state (without firing the change handler again)
-        # if needed
-        if bool(w["out_sw"].value) != is_on:
-            w["out_sw"].value = is_on  # set directly to avoid loops
-        w["out_state_html"].set_content(
-            f'<span class="state{" is-on" if is_on else ""}">'
-            f'{"on" if is_on else "off"}</span>'
-        )
-        if is_on:
-            w["readback_el"].classes(add="is-live")
-        else:
-            w["readback_el"].classes(remove="is-live")
-        v_txt = f"{v:.3f}" if isinstance(v, (int, float)) else "—"
-        i_txt = f"{i:.3f}" if isinstance(i, (int, float)) else "—"
-        w["vm_html"].set_content(
-            f'<span><span class="val">{v_txt}</span><span class="u">V</span></span>'
-        )
-        w["im_html"].set_content(
-            f'<span><span class="val small">{i_txt}</span><span class="u">A</span></span>'
-        )
-
-    def _refresh_master_state():
-        on_count = 0
-        if HUB.nge100 is not None:
-            for ch in range(1, N_CHANNELS + 1):
-                try:
-                    if HUB.nge100.is_output_on(ch):
-                        on_count += 1
-                except Exception:
-                    pass
         if on_count == N_CHANNELS:
-            txt, on = "all on", True
+            txt = "all on"
         elif on_count == 0:
-            txt, on = "off", False
+            txt = "off"
         else:
-            txt, on = f"{on_count} of {N_CHANNELS} on", True
+            txt = f"{on_count} of {N_CHANNELS} on"
         master_state_html.set_content(
             f'<span class="state{" is-on" if on_count > 0 else ""}">{txt}</span>'
         )
-        if bool(master_sw.value) != on:
-            master_sw.value = on
+        _show_switch(master_sw, master_sw_state, on_count > 0)
 
-    def _refresh_all():
-        for ch in range(1, N_CHANNELS + 1):
-            _refresh_channel(ch)
-        _refresh_master_state()
+    async def _refresh_now() -> None:
+        """Read and paint immediately (after a command, or on the refresh
+        button), discarding any periodic read that began before it."""
+        _invalidate_reading("nge100")
+        if HUB.nge100 is None:
+            _render(None)
+        else:
+            _render(await _run_in_thread(_read_nge100_state))
 
-    refresh_btn.on_click(_refresh_all)
+    async def _refresh_locked() -> None:
+        async with _NGE_CMD_LOCK:
+            await _refresh_now()
+
+    refresh_btn.on_click(_refresh_locked)
+
+    async def _master_cmd(on: bool) -> None:
+        if HUB.nge100 is None:
+            ui.notify("nge100 not connected", type="warning",
+                      position="top", timeout=2000)
+            _show_switch(master_sw, master_sw_state, not on)
+            return
+        async with _NGE_CMD_LOCK:
+            try:
+                fn = HUB.nge100.all_outputs_on if on else HUB.nge100.all_outputs_off
+                if not await _run_in_thread(fn):
+                    raise RuntimeError("PSU did not accept the command")
+                log.info("nge100 master output %s", "on" if on else "off")
+            except Exception as e:
+                ui.notify(f"master toggle FAIL: {type(e).__name__}: {e}",
+                          type="negative", position="top", timeout=4000)
+            await _refresh_now()
+
+    async def _out_cmd(ch: int, on: bool) -> None:
+        w = ch_widgets[ch]
+        if HUB.nge100 is None:
+            ui.notify("nge100 not connected", type="warning",
+                      position="top", timeout=2000)
+            _show_switch(w["out_sw"], w, not on)
+            return
+        async with _NGE_CMD_LOCK:
+            try:
+                fn = HUB.nge100.output_on if on else HUB.nge100.output_off
+                if not await _run_in_thread(fn, ch):
+                    raise RuntimeError("PSU did not accept the command")
+                log.info("nge100 ch%d output %s", ch, "on" if on else "off")
+            except Exception as e:
+                ui.notify(f"ch{ch} toggle FAIL: {type(e).__name__}: {e}",
+                          type="negative", position="top", timeout=4000)
+            await _refresh_now()
 
     # ---- Connection refresh (2 s tick) ----
     def tick():
@@ -7609,21 +8351,34 @@ def _build_nge_tab():
             )
             connect_btn.set_visibility(True)
             ch_count_html.set_content('<span class="info">— channels</span>')
-        else:
-            connstrip.classes(add="is-connected")
-            conn_lbl.set_content(
-                '<span class="lbl">Connected — R&amp;S NGE103 power supply (MUX rail)</span>'
-            )
-            connect_btn.set_visibility(False)
-            try:
-                n = HUB.nge100.num_channels()
-            except Exception:
-                n = N_CHANNELS
-            ch_count_html.set_content(f'<span class="info">{n} channels</span>')
-        _refresh_all()
+            _render(None)
+            return
+        connstrip.classes(add="is-connected")
+        conn_lbl.set_content(
+            '<span class="lbl">Connected — R&amp;S NGE103 power supply (MUX rail)</span>'
+        )
+        connect_btn.set_visibility(False)
+        try:
+            n = HUB.nge100.num_channels()
+        except Exception:
+            n = N_CHANNELS
+        ch_count_html.set_content(f'<span class="info">{n} channels</span>')
+        state = _reading("nge100", _read_nge100_state, 1.5)
+        if isinstance(state, dict):
+            _render(state)
 
     tick()
     ui.timer(2.0, tick)
+
+
+def _build_cremat_tab():
+    """Cremat charge-sensitive preamp + shaper. It has no instrument link of
+    its own; its supply rails come from the NGE100 (mapping on the nge100 tab).
+    """
+    with ui.element("div").classes("psu-panel w-full"):
+        with ui.card().classes("card-psu w-full"):
+            ui.html('<p class="eyebrow">Power · NGE100</p>')
+            _build_rail_power("cremat")
 
 
 def _build_webcam_tab():
@@ -9708,6 +10463,20 @@ def _build_alignment_tab():
 # Main page
 # ===========================================================================
 
+def _bias_lock_refuses(voltages, what: str) -> bool:
+    """True, with a message, if `what` would apply a bias above the persisted
+    lock; the caller must not start. (The driver refuses such commands anyway;
+    this stops a run before it moves anything else.)"""
+    try:
+        check_bias_lock(voltages)
+    except BiasLockExceeded as e:
+        ui.notify(f"{what} not started: {e}", type="negative",
+                  position="top", timeout=8000)
+        log.warning("%s not started: %s", what, e)
+        return True
+    return False
+
+
 async def _emergency_bias_off():
     """Header-level safety button. Calls bias_off on the B2987 if connected.
 
@@ -9720,6 +10489,7 @@ async def _emergency_bias_off():
                   type="warning", position="top", timeout=4000)
         return
     ui.notify("BIAS OFF requested…", type="warning", position="top", timeout=2000)
+    HUB.elec.request_stop()   # a running sweep would otherwise keep going
     try:
         await _run_in_thread(HUB.elec.bias_off)
         ui.notify("BIAS OFF — output disabled", type="positive",
@@ -9820,8 +10590,9 @@ def index():
     # Gate the main page on a valid session.  Anything else (FastAPI
     # endpoints, webcam stream, etc.) is gated separately at the route.
     if not _is_authenticated():
-        ui.navigate.to("/login")
-        return
+        # A real HTTP redirect: ui.navigate.to() is delivered over the socket,
+        # so a browser whose socket never connects would sit on a blank page.
+        return RedirectResponse("/login", status_code=303)
 
     ui.add_head_html(f"<style>{_XSPHERE_CSS}</style>")
     ui.dark_mode().enable()
@@ -9835,7 +10606,10 @@ def index():
         ip = "?"
     saved_name = app.storage.user.get("display_name", "")
     SESSIONS.register(client_id, saved_name, ip)
-    client.on_disconnect(lambda: SESSIONS.unregister(client_id))
+    # on_delete, not on_disconnect: a socket drop that reconnects shouldn't
+    # drop the user from the pill, and a page whose socket never connected
+    # still gets removed when NiceGUI prunes it.
+    client.on_delete(lambda: SESSIONS.unregister(client_id))
 
     def _open_name_dialog():
         with ui.dialog() as dlg, ui.card():
@@ -9875,6 +10649,7 @@ def index():
         t_wfg    = ui.tab("wfg (dg1022)")    # Rigol — hidden from header
         t_ks     = ui.tab("wfg")             # Keysight 33500B — the visible one
         t_nge    = ui.tab("nge100")
+        t_cremat = ui.tab("cremat")
         t_cam    = ui.tab("webcam")
         t_lab    = ui.tab("lab book")
         t_l1     = ui.tab("L1 — primitives")
@@ -9897,6 +10672,7 @@ def index():
         "settings":     [("status", t_status), ("connections", t_conn),
                          ("config", t_cfg), ("lab book", t_lab),
                          ("webcam", t_cam),
+                         ("cremat (CSP/shaper)", t_cremat),
                          ("wfg (dg1022, hidden)", t_wfg)],
         # "plots" is promoted out of this dropdown to its own header
         # button — it's the most-clicked destination, so it doesn't
@@ -10048,6 +10824,7 @@ def index():
         with ui.tab_panel(t_wfg):    _build_wfg_tab()
         with ui.tab_panel(t_ks):     _build_ks33500b_tab()
         with ui.tab_panel(t_nge):    _build_nge_tab()
+        with ui.tab_panel(t_cremat): _build_cremat_tab()
         with ui.tab_panel(t_cam):    _build_webcam_tab()
         with ui.tab_panel(t_plots):  _build_plots_tab()
         with ui.tab_panel(t_lab):    _build_labbook_tab()

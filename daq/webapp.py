@@ -26,7 +26,8 @@ try:
 except ImportError:
     pass
 
-from nicegui import app, ui
+import nicegui
+from nicegui import Client, app, ui
 
 from daq.webgui import shell   # noqa: F401 — registers the @ui.page("/") + /login routes
 # Import webcam at startup so its FastAPI routes (/webcam.mjpeg, /webcam.jpg)
@@ -35,6 +36,7 @@ from daq.webgui import shell   # noqa: F401 — registers the @ui.page("/") + /l
 from daq.webgui import webcam as _webcam   # noqa: F401 — registers /webcam.* routes
 from daq import connection_state
 from daq import labbook
+from daq import rails
 
 # Pre-fill instrument addresses with whatever was last successfully used.
 # The Connections tab inputs read from HUB.config — populating it before
@@ -44,6 +46,8 @@ if _applied:
     logging.getLogger("daq.webapp").info(
         "loaded last-known addresses: %s", _applied
     )
+
+shell.HUB.config.nge100_rails = rails.load(shell.HUB.config.nge100_rails)
 
 # Serve the plots/ directory so the status page can render thumbnails.
 # Files written by daq.plotting land in <repo>/plots/*.png.
@@ -111,6 +115,49 @@ def _release_instruments():
 app.on_shutdown(_release_instruments)
 
 
+# "session connect" in shell.index() marks a page build, not a live socket.
+# These lines show whether each page's socket.io connection came up, dropped
+# or was pruned; a delete with no connect is a page that never went live.
+# Logged outside the "daq" tree so they reach the journal but not the Status
+# tab's activity log.
+def _log_client(event: str):
+    def handler(client):
+        try:
+            ip = client.request.client.host
+        except Exception:
+            ip = "?"
+        logging.getLogger("webapp.sockets").info("socket %s: client=%s ip=%s",
+                                                 event, client.id, ip)
+    return handler
+
+
+app.on_connect(_log_client("connect"))
+app.on_disconnect(_log_client("disconnect"))
+app.on_delete(_log_client("delete"))
+
+
+# NiceGUI 3.12.1 bug: when a page reconnects on a new socket before the server
+# has timed out the old one (any network blip -- socket.io closes on the
+# browser's "offline" event), the old socket's late disconnect clears
+# client.tab_id although the new socket is live. has_socket_connection then
+# reads False: the tab silently drops every click (BIAS OFF included) and
+# stops updating until a manual reload. Keep tab_id while a socket remains.
+if nicegui.__version__ == "3.12.1":
+    _orig_handle_disconnect = Client.handle_disconnect
+
+    def _handle_disconnect(self, socket_id):
+        tab_id = self.tab_id
+        _orig_handle_disconnect(self, socket_id)
+        if getattr(self, "_socket_to_document_id", None):
+            self.tab_id = tab_id
+
+    Client.handle_disconnect = _handle_disconnect
+else:
+    logging.getLogger("daq.webapp").warning(
+        "NiceGUI %s: stale-disconnect patch (written for 3.12.1) not applied",
+        nicegui.__version__)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ETS DAQ web GUI")
     parser.add_argument("--host", default="0.0.0.0",
@@ -147,7 +194,14 @@ def main():
     ui.run(host=args.host, port=args.port, reload=args.reload,
            title="nEXO SiPM DAQ", show=False,
            favicon=favicon_path,
-           storage_secret=storage_secret)
+           storage_secret=storage_secret,
+           # The 3 s default deletes a client whose socket is down for 3 s,
+           # and its next reconnect then reloads the whole page -- routine
+           # over a VPN. Also sets engine.io ping interval/timeout to 24/12 s.
+           reconnect_timeout=30.0,
+           # Cap how long a stop waits for open responses, so it can't end in
+           # systemd's SIGKILL, which skips _release_instruments.
+           timeout_graceful_shutdown=5)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

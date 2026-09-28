@@ -12,6 +12,488 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-09-27 (midnight) — Data tab: tick-box multi-file download
+
+### Changed (shell.py `_build_data_tab`, h5browse.py)
+- Each file row has a tick box. Above the list is an "all" box that
+  applies to the rows the name filter currently shows (it goes
+  indeterminate when only some are ticked), plus an "N selected" count and
+  a download button. Ticked files stay ticked when the filter changes.
+  One ticked file downloads as is; several are zipped first
+  (`h5browse.zip_files`: folder layout kept relative to data/,
+  `_safe_under_root` checked, level-1 deflate for speed).
+- Zips are written to `$TMPDIR/daq_downloads/` and served single-use.
+  Zips older than 1 h are deleted each time a new zip is built.
+- The existing per-file "download" button in the structure card is unchanged.
+
+### Testing note
+- NiceGUI's `user_simulation` works outside pytest only with
+  `PYTEST_CURRENT_TEST` set and a `main_file` app (the `root=` form falls
+  into script mode). Programmatic event names are camelCase
+  (`update:modelValue`). Script: session scratchpad `sim_data_tab.py`, not
+  kept in the repo.
+
+---
+
+## 2026-09-27 (late night, 3) — B2987 plot: lin/log current axis
+
+- Toggle lin | log next to averaged | timestream. Log plots |I| (axis
+  "|I| (A)"), drops exact zeros, hides the planned-voltage dots (at I = 0) and
+  any sigma line that would cross zero. Tick labels now use exponent notation
+  via an ECharts `":formatter"` (NiceGUI evaluates `:`-prefixed option keys as
+  JS). Switching view or scale during a live run redraws the live data at the
+  next tick instead of flashing the previous run.
+- Tested on the fake B2987 with mixed-sign currents; no console errors.
+- Held back at 23:52 while Lucas's 605-reading sweep ran; deployed after he
+  asked (B2987 idle, output off, released on restart).
+
+---
+
+## 2026-09-27 (late night, 2) — live plotting for B2987 sweeps and ammeter runs
+
+### Changed
+- Controller `sweep_live(voltages, n, delay, on_point)`: software-stepped
+  sweep (checks all voltages against lock + HV interlock up front, output on
+  at the first voltage, `write_level` per step, readings in ~1 s chunks via
+  `acquire_current`, output off in `finally`). The hardware list sweep
+  (`sweep()`) can only be fetched once finished, so it can't show progress;
+  `sweep()` is unchanged for L2/L3/bench callers. `ammeter(n, interval,
+  on_chunk)` now acquires in ~1 s chunks too.
+- Driver split: `configure_current_sense()`, `acquire_current()`,
+  `write_level()`; stop flag cleared once per run (`reset_stop()`), checked
+  between chunks (`check_stop()`); completion poll every 20 ms.
+- Tab: 0.5 s live redraw of the running data in the chosen view (averaged
+  running means per voltage, or timestream), stats line "live k/N", plot
+  cleared at run start, markers only when <= 200 points. Stop keeps the
+  partial data on screen and saves it (h5 attr `stopped=True`).
+
+### Verified
+Fake B2987 in headless Chrome: live counts 16/32/50/66/82 of 100, markers
+off at 232 points, partial kept + saved on Stop. Hardware (40/50 V x50):
+chunks of 8 every ~1.2 s; 5.6 s gap after the 40->50 V step (auto-range
+settling on pA ranges); the timestream shows the settling transient
+(-32 fA decaying to ~0 over ~6 s). Ammeter 100: chunks of 60 + 40.
+
+### Incident
+My hardware test connected while Lucas's webapp session held the B2987
+(idle, output off, after he stopped a sweep). `connect_elec` sends *RST, so
+his session's instrument settings were reset. Abort such tests when the
+webapp holds the instrument; don't just print the socket count.
+
+---
+
+## 2026-09-27 (late night) — sweep "stall" root cause; persistent 55 V bias lock
+
+### Root cause of the stalled 605-point sweep (verified on hardware)
+Not a stall: **auto-range settling**. With auto-range allowed down to the
+2 pA range and a dark photodiode (~ -15 fA), every bias step makes the
+ammeter re-range and settle for ~4.6 s; readings at constant voltage take
+0.118 s (0.1 s delay + 1 PLC). 121 steps x 4.6 s + 605 x 0.12 s ~ 10.5 min >
+the 600 s sweep timeout. With the floor at 2 nA the step gap is 0.13 s (but
+SEM ~20 fA instead of ~2 fA). Afternoon sweeps were fast because the
+photodiode was lit (nA-uA).
+
+### B2987 facts learned
+- `:STAT:OPER:COND?` answers mid-acquisition: 1152 busy, 1170 idle
+  (bits 1 and 4 = transient/acquire idle).
+- `*OPC` then `*ESR?`: the instrument holds the query until the acquisition
+  ends (so it can't be used to poll or stop). Don't use it.
+- Errors at INIT (e.g. -222 source range after *RST's 20 V default) end the
+  acquisition immediately with 1 point; `+231 "Invalid reference data"`
+  appears when the zero-reference acquisition fails (seen with fixed range).
+- FETC after ABOR does not report the partial count reliably.
+
+### Changed (driver submodule + shell.py + sequence.py)
+- Completion: poll STAT:OPER:COND? for bits 0x12; afterwards drain the error
+  queue: any error except +231 -> RuntimeError "B2987 reported: ...";
+  +231 -> `driver.last_warnings` (shown in the tab log). Stop/timeout abort.
+- **Bias lock** (driver): `~/.config/b2987b/bias_lock.json` (env
+  `B2987_BIAS_LOCK_FILE` overrides), re-read before every set_voltage, list
+  sweep and output_on (which queries the instrument's actual level first);
+  `BiasLockExceeded`, nothing sent; unreadable file fails closed. Hardware
+  mode only. Set to **55.00 V** tonight. Raw SCPI or the front panel bypass
+  it.
+- Web app: `_bias_lock_refuses()` pre-check (message, run doesn't start) at
+  L1 set/toggle bias, L2 IV / pulse / pulse sweep / scan (before
+  `_prep_position` moves anything), B2987 output toggle / source apply /
+  sweep; L3 `run_sequence` checks all planned voltages first. Lock control in
+  the B2987 Source block (raising asks for confirmation; logged with the
+  user's name). Measure block: "Auto-range floor" (default 2 pA) with hint.
+- Hardware verified: 40/50 V x50 at both floors, Stop mid-sweep (output and
+  input off), ammeter 50 samples output off, set_bias(56) refused. UI
+  verified against a fake B2987 answering STAT like the real one.
+
+### Open threads
+- Default auto-range floor stays 2 pA (sensitivity); fast IV sweeps need
+  2 nA+. Lucas to decide the default.
+- keysight2987b-python changes (lock, series, stop, completion, partial
+  configure_sweep) still need commit + push + bump.
+
+---
+
+## 2026-09-27 (night) — B2987 sweep "doesn't change the bias"; Stop button
+
+### Diagnosis (read-only queries while Lucas's sweep was loaded)
+- The Source-output card's "source level" is the driver's cached last
+  commanded voltage (`_source_voltage`, 50 V from the Source block); a list
+  sweep never updates it, so it always read 50 V during sweeps.
+- `_run_sweep_hardware` turned the output on in LIST mode before triggering:
+  the output sits at the immediate level (the Source block's 50 V) until the
+  first trigger.
+- Completion was detected with `STAT:OPER:COND?` and `resp[2] == "7"`. Verified
+  values: 1152 while TRAN+ACQ are busy, 1170 when idle.
+- Tonight's sweep (40->52 V, 0.1 V step, x5 = 605 list points, fixed 16.7 ms
+  aperture, auto-range, delay 0.1 s) **stalled**: status stayed 1152 for many
+  minutes, `FETC` blocked, error queue empty, ARM/TRIG all AINT, then the
+  600 s timeout aborted it (no h5 written). Sweeps that completed today: 15:58
+  (13 voltages, 1 V step, 65 pts, AUTO aperture) and 17:0x (1 voltage, up to
+  1000 pts, FIXED aperture). **Root cause of the stall is open**; not the
+  point count alone.
+
+### Changed (keysight2987b-python submodule, still uncommitted, + shell.py)
+- Driver: `_wait_acquisition()` starts INIT, sends `*OPC`, polls `*ESR?`
+  (bit 0 done; bits 2-5 -> read `SYST:ERR?`, abort, raise "B2987 reported:
+  ..."), honours `request_stop()` (thread-safe Event; the polling thread sends
+  `ABOR`), times out with ", N points acquired" appended. Used by sweeps and
+  the ammeter series. Sweep sets the immediate level to the first list point
+  before OUTP ON, and always turns ammeter + output off in `finally` (a VISA
+  error mid-sweep used to leave the output on). `AcquisitionStopped`
+  exception; controller `request_stop()`.
+- Tab: "Stop" button (enabled only while running); status pill shows elapsed
+  vs estimated time; output card shows "sweeping A -> B V" while running;
+  tab log lines also go to the journal (logger `webapp.elec`); header BIAS OFF
+  also requests a stop.
+- Verified against a fake B2987 over TCP (list sweeps with real timing,
+  *OPC/*ESR?, ABOR, error queue): completion, first-point start, Stop mid
+  605-point sweep, BIAS OFF mid-sweep, injected -222 error surfaced; output
+  and ammeter off afterwards in every case. Not yet on hardware.
+
+### Open threads
+- Reproduce the stall on hardware with the new code: the Stop/timeout message
+  now says how many points were acquired (0 = never started; k = stalled
+  mid-way). Candidate differences to bisect: 0.1 V vs 1 V step, 121 vs 13
+  distinct voltages, FIXED 16.7 ms vs AUTO aperture, output already on at 50 V
+  before INIT.
+- keysight2987b-python changes need commit + push + submodule bump.
+
+---
+
+## 2026-09-27 (afternoon, 4) — B2987 tab: ammeter mode, averaged/timestream views, reads with output off
+
+### Root cause (verified on the instrument, output off)
+Driver reads used `:TRIG1:ALL` + `:INIT:ALL`, which also starts the source's
+transient action: with the output off the B2987 returns 9.91e+37 and
+`+212,"Output relay must be on"`. `:INIT:ACQ` reads the photodiode fine
+(-0.45 pA, no error). Line frequency reported: 60 Hz.
+
+### Changed — keysight2987b-python submodule (UNCOMMITTED; needs commit + push
+there and a bump here)
+- `driver.measure_current` / `measure_voltage`: `:TRIG1:ACQ` + `:INIT:ACQ`.
+- `driver.measure_current_series(n, interval_s, ...)`: applies range and
+  aperture, zero-reference OFF (absolute readings), TIM-paced or back-to-back,
+  `*OPC?` with a sized timeout, returns raw currents + UTC timestamps.
+- `controller.ammeter(n, interval_s)` -> SweepResult (raw + mean/SEM), so
+  plotting and `h5io.write_sweep_result` are shared with sweeps.
+- `controller.configure_sweep`: source_range / n_per_voltage / delay_s /
+  measure_voltage / current_limit are now truly partial (default None). Before,
+  any partial call (e.g. the tab's Measure or Timing apply) silently reset the
+  source range to 1000 V and the current-limit resistor to off and wrote both
+  to the instrument, even with the output on. All existing callers pass these
+  explicitly or rely on values equal to the controller's initial state.
+
+### Changed — electrometer tab (shell.py)
+- Mode toggle Sweep (IV) | Ammeter (samples + interval, 0 = back to back);
+  view toggle averaged | timestream (IV: I(V) vs all raw samples vs t;
+  ammeter: mean +/-1 sigma vs all samples vs t). Stats line: mean, sigma, SEM,
+  n, duration, source state, over-range count. Ammeter runs saved as
+  `data/elec_ammeter_*.h5` (raw + averaged).
+- "read I" = `ammeter(1)`: works with the output off, uses the on-screen
+  range/aperture.
+- Runs and reads apply the Measure and Timing blocks first (what you see is
+  what runs); Source is left alone.
+- NPLC: hint with ms per reading and guidance, presets 0.1 / 1 / 10, estimated
+  run time in the header. Delay renamed "Settling delay (sweep)" with
+  guidance. Removed "Trigger source" and "Timer interval": never applied.
+- After a sweep the Status bias state records the real output state (the
+  driver turns the output off at the end of a sweep).
+
+### Verified
+Harness (simulated B2987): read I with output off, 100-sample ammeter
+(stats, averaged = mean +/- sigma lines, timestream = 100 points), IV sweep
+(averaged 5 pts, timestream 25 raw), NPLC presets/hint, h5 files, source range
+20 V + resistor survive the pre-run apply. 0 JS / 0 server errors. Hardware:
+the acquire-only read path (see above).
+
+### Incidents
+- A first B2987 probe ran while Lucas's webapp session held the instrument
+  with the output on; it sent only `*IDN?`, `:OUTP1?`, `:INP1?`, `*CLS` before
+  failing. Always check the webapp's sockets and OUTP1 first and abort.
+- The requested restart (16:4x) also interrupted Will's and Lei's sessions;
+  release disconnected elec (output off), stage and slow control.
+
+---
+
+## 2026-09-27 (afternoon, 3) — NGE100 device rails: mapping, power buttons, cremat tab
+
+### Changed
+- `daq/rails.py`: mapping {ch: {device, voltage V, current A}}, load/save/
+  validate, `power_on`/`power_off` per device. Power-on applies V/I (APPL) to
+  every mapped channel first, then OUTP ON each; if any output fails, all of
+  the device's channels are switched off again (rails go on together or not
+  at all).
+- Defaults in `config.nge100_rails` (config.py + template): ch1, ch2 ->
+  cremat (CSP/Shaper) 6 V / 600 mA; ch3 -> ivmux 12 V / 200 mA. UI edits are
+  saved to `<repo>/.nge100_rails.json` (gitignored) and loaded at startup in
+  `daq/webapp.py`.
+- nge100 tab: "Devices" card with a power row per device and the mapping
+  editor (device select, V, mA) + "update mapping". Saving never touches the
+  PSU; settings apply on the next power-on. Warns if a channel that is on was
+  moved to another device (its old device's power-off no longer covers it).
+  Channel cards' V/I fields default to the mapping.
+- `_build_rail_power(device)` (shared widget: state on/off/partly on/no
+  response, setpoints, live V/I, buttons disabled with the reason when the
+  NGE100 isn't connected or nothing is mapped) on the nge100 tab, the iv-mux
+  tab (side column) and a new cremat tab (settings menu -> "cremat
+  (CSP/shaper)"). Commands go through `_NGE_CMD_LOCK`; readback shares the
+  single background NGE poll (`_read_nge100_state`, now module level).
+
+### Verified (isolated harness, simulated NGE100 behind `_SerializedNGE100`)
+IV MUX on from its tab -> exactly apply(3, 12, 0.2), output_on(3); CSP on/off
+from the cremat tab -> ch1/ch2 at 6 V / 0.6 A, ch3 untouched; mapping edit
+(ch3 11 V) saved and used on next power-on; 40 V rejected, file unchanged;
+ch2 output_on failure -> ch1 and ch2 switched off; NGE disconnected ->
+buttons disabled with reason. 0 JS / 0 server errors. Not yet exercised on
+the real PSU.
+
+### Open threads
+- Mapping edits in one browser don't refresh the editor fields in another
+  open browser until reload (power cards do update live).
+- `_release_instruments` still doesn't include nge100, so a webapp stop leaves
+  the rails as they are (intended for amplifier supplies? confirm with Lucas).
+
+---
+
+## 2026-09-27 (afternoon, 2) — IV MUX is 30 channels; serial monitor on the iv-mux tab
+
+### Changed
+- **30 channels, not 90.** The firmware addresses 6 boards x 15 (1-90) and
+  always dumps six words; this bench has the first two boards. New
+  `config.ivmux_channels = 30` (config.py + template). New `daq/ivmux.py`
+  `IVMux(MuxController)` refuses channels outside 1-n in `select`, `sweep`,
+  `sequence` and raw commands, before anything reaches the firmware (a relay on
+  an absent board would "succeed" with nothing connected). Hub and `run.py`
+  build the IV MUX through it. UI limits/labels (iv-mux tab, L1 card, L2
+  input) read the config. The submodule's 90 is the firmware protocol and is
+  left alone.
+- **Serial monitor** (iv-mux tab): `_SerialTap` wraps the driver's pyserial
+  port (`_drv._ser`) and records every line into `IVM.TRAFFIC` (deque 2000,
+  sequence-numbered), tagged "poll" for the UI's periodic `d` dumps
+  (`poll_active_channel`), "user" for raw sends, "" for everything else incl.
+  measurements. Log view (hide-polls toggle, clear), raw command input
+  (Enter/send) via `IVMux.send_raw` under the driver lock; `t` is stopped with
+  `x` after ~3 s; `q` gets a dwell-scaled timeout.
+
+### Verified
+Fake-firmware pty: out-of-range select/sweep/sequence/raw all refused with 0
+bytes sent; raw replies incl. "Error in command"; `t` stream stopped and the
+next command works; tags correct. Headless Chrome on an isolated app: "30-channel"
+strip, `max=30` on every channel input, live log, `a 12` + Enter -> reply +
+active ch12, `a 45` -> fitted-range error, toggle/clear OK, 0 JS/server errors.
+Real MUX (read-only: `d` only, closed without `z`): same traffic in the monitor.
+
+### Open threads
+- `IVMux` reaches into `MuxController._drv._ser` / `_drv._lock`; an
+  `on_traffic` hook and `n_channels` parameter upstream in ivmux-python would
+  remove that.
+- Channel -> physical relay mapping for 1-30 assumes the fitted boards are
+  firmware boards 0 and 1 (chain order); not checked on hardware.
+
+---
+
+## 2026-09-27 (afternoon) — IV MUX is on the CP2102 at /dev/ttyUSB0; ports pinned by-id
+
+### Correction to 2026-09-26
+The CP2102 (USB serial `0001`) at `/dev/ttyUSB0` is the **IV MUX's** adapter
+(Arduino Serial1 over USB-UART, 9600 8N1), not the K6485's. The K6485 uses a
+Prolific PL2303 ("USB-Serial Controller D", no serial; last seen May 27), so
+`/dev/ttyUSB0` only meant the K6485 when the PL2303 enumerated first. Last
+night's `ivmux: /dev/ttyUSB0` was the right port; the hang came from the MUX
+not answering at that time (firmware wedged or board unpowered — unknown), and
+the K6485's timeouts were its connects opening the MUX's adapter.
+
+### Verified (14:3x, read-only)
+Raw probe at 9600 8N1: `d` -> `Command: <d>`, `Dump`, six `0` words,
+`Command complete` in 60 ms. `InstrumentHub.connect_ivmux()` on the by-id path:
+OK in 2.1 s (2 s settle + reply), `active_channel()` None in 61 ms, closed
+without sending `z` (relays untouched, all off).
+
+### Changed
+- `config.py` and `config.example.py`: `ivmux_port` = CP2102 by-id path
+  (replaces the `/dev/ttyACM0` placeholder); `k6485_port` = PL2303 by-id path
+  `usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0`, inferred
+  from the May kernel log, **unverified until the PL2303 is plugged in**.
+- `scripts/bench_test.py`: same K6485 by-id default.
+- `.last_connections.json`: dropped `k6485: /dev/ttyUSB0` (it overrides the
+  config at startup). Backup in the session scratchpad.
+- CLAUDE.md hardware table: K6485 row fixed, IV MUX row added.
+- Service restarted (clean stop in 0.19 s); IV MUX not yet connected in the
+  webapp — connect it from the iv-mux tab or "connect all".
+
+### Open threads
+- The round-2 adversarial verification workflow (wf_310c6100-534) was cut off
+  when the previous session ended; round-2 fixes are deployed but only
+  smoke-tested.
+- If a second stock CP2102 (serial 0001) is ever added, switch the IV MUX to
+  its `/dev/serial/by-path/` name.
+
+---
+
+## 2026-09-27 — remote browser "always loading": webcam thread leak + socket never connecting
+
+### Symptoms
+Lucas, remote (10.127.184.205, Yale VPN path via 172.16.0.1): page "always
+loading". The InfluxDB UI on this machine's :8086 works from the same browser.
+
+### Findings (5 reproduced hypotheses + adversarial verifiers; scratch
+`wf/` artifacts in the session scratchpad)
+- **Webcam stream (everyone, confirmed).** With /dev/video0 absent the status
+  tab's `<img src=/webcam.mjpeg>` never got even headers (GZipMiddleware waits
+  for the first body chunk), so the load event never fired: that is the
+  literal endless tab spinner. The old *sync* `_mjpeg_iter` looped forever
+  without yielding, so each request pinned an anyio worker thread (Starlette
+  cannot cancel it). The pool has 40 tokens and also serves StaticFiles, so at
+  40 leaks NiceGUI's JS/CSS stop loading: blank page for any uncached browser.
+  PID 1407 logged exactly 40 grabber starts, the 40th at 21:46:04; PID 10549
+  had reached 28/40 before the redeploy. It also made every service stop hang
+  until SIGKILL, so `on_shutdown(_release_instruments)` never ran.
+- **Remote socket.io handshake never completing (remote-only, confirmed; root
+  cause open).** 19 of 30 remote page builds after 23:57: websocket upgrade got
+  101 + engine.io OPEN (ACKed), the browser's `40` CONNECT never arrived,
+  server closed at +6 s, the client never answered the FIN (FIN-WAIT-2 60 s),
+  no reconnects until a manual reload. The server-side pattern matches a
+  browser main-thread stall right after `new WebSocket()` (reproduced exactly)
+  better than a websocket-breaking middlebox with live JS (which would retry
+  within 1-9 s or reload every 20 s). Client-side interception (AV web shield,
+  VPN web-security module, extension) is the other candidate. Needs a check in
+  the remote browser's DevTools, InPrivate/extensions-off, or another browser.
+- NiceGUI defaults are LAN-tuned: reconnect_timeout 3 s -> ping 4 s /
+  timeout 2 s, and a client down > 3 s is deleted, so its reconnect reloads
+  the page. Reproduced; a secondary effect on the remote session.
+- Refuted as causes: page weight (heavy: 872 KB HTML / 127 KB gz, 2779
+  elements, ~0.85 s synchronous build, but only slow), auth/storage loss on
+  SIGKILL (auth persisted; Lucas authenticated on every build).
+- Log caveat: "session connect" is logged when '/' is *built*, not when the
+  socket connects. The new `socket connect/disconnect/delete` lines are the
+  real signal; a `delete` without `connect` = a page that never went live.
+- Polling-only transports survive every network-fault model but fail the same
+  way under the page-stall model. `['polling','websocket']` is worse:
+  python-engineio 4.13.2 freezes a polling session whose upgrade probe opens
+  but carries no frames. Not deployed; an experiment if the remote DevTools
+  check shows frames dropped on a live page.
+
+### What changed (deployed 01:58)
+- `webcam.py`: async routes; `_first_frame` awaits up to 3 s and gives up at
+  once when the grabber thread exits (no camera): 503 in ~50 ms instead of
+  3 s; async `_mjpeg_iter` sends each new frame once; `Content-Encoding:
+  identity` so gzip passes the stream through.
+- `webapp.py`: `reconnect_timeout=30.0`, `timeout_graceful_shutdown=5`,
+  socket lifecycle log lines.
+- `shell.py`: unauthenticated '/' -> HTTP 303 to /login (was a socket
+  message: blank page when the socket fails); SESSIONS unregister on delete
+  instead of disconnect; lab-book paste drained only by tabs with a live socket.
+- Smoke-tested in an isolated harness: 6 authenticated loads, load event in
+  ~1 s, handshake over websocket, 0 leaked threads, static JS 9 ms, SIGTERM
+  exits in 0.6 s with the release hook running. After the redeploy the remote
+  page's socket connected in 1.7 s.
+
+### Open threads
+- `_release_instruments` now runs on every stop (it never did before, because
+  stops always SIGKILLed). Its list omits ivmux / ks33500b / nge100.
+- Status, L1 and stage tabs stream MJPEG on every page view; with a working
+  camera that's ~17 Mbit/s per landing-page viewer (hurts remote users).
+  Consider a snapshot + slow refresh or streaming only on the webcam tab.
+- Lazy tab-panel building would cut the '/' build from ~830 ms to ~20 ms.
+
+---
+
+## 2026-09-26 — webapp hung by a mis-addressed IV MUX; timers moved off the event loop
+
+### Symptoms (reported by Lucas)
+DAQ very slow, devices dropping, web UI won't load.
+
+### Root cause (confirmed)
+- `.last_connections.json` had `"ivmux": "/dev/ttyUSB0"` (saved 20:48:51) —
+  someone retyped the IV MUX address to the **K6485's CP2102** (WRONG — see
+  the 2026-09-27 afternoon correction: that CP2102 is the IV MUX's own adapter,
+  so the address was right and the MUX simply didn't answer). The IV MUX
+  `connect()` only opens the port, so it reported ✓. From then on the Status
+  tab (1 s) and IV MUX tab (1.5 s) timers called `active_channel()` ->
+  `dump_state()` -> a serial command with a **10 s** timeout, synchronously on
+  the event loop, once per open browser. Evidence: `curl /login` took
+  3 ms / 4 s / 6 s / >15 s; main thread in `do_select` 142/150 wchan samples
+  (idle asyncio sits in `ep_poll`). Browsers dropped their websockets and
+  reconnected every ~40 s; the ~1150 "parent slot of the element has been
+  deleted" tracebacks are dead sessions' timers — symptom, not cause.
+- A hung MUX couldn't be released from the UI either: `MuxController.disconnect()`
+  zeroes first and raises on the timeout *before* closing the port, so
+  `disconnect_ivmux` left `HUB.ivmux` set. Only a restart cleared it.
+- The pulse MUX had also been saved as `/dev/ttyUSB0` (20:41). Note
+  `connection_state._ADDR_ATTRS` has no `ivmux` key, so the IV MUX address is
+  *not* restored at startup; `mux` is.
+
+### Other findings
+- **CAEN FELib segfaults on two overlapping opens** (reproduced in a scratch
+  process with the VX2740 unreachable: 4 sequential failed opens are clean,
+  2 concurrent ones -> exit 139). Explains tonight's crashes at 20:12 / 20:16
+  (two threads died at once). Sep 18 had a similar crash in `libphidget22.so`
+  on Phidget hot-unplug — not addressed.
+- **NGE100 tab master switch turned on every rail** when one channel was on:
+  the refresh set `master_sw.value = True`, and NiceGUI fires
+  `on_value_change` for programmatic sets too (the old comment claiming
+  otherwise was wrong) -> `all_outputs_on()`. Reproduced against HEAD with a
+  simulated PSU: ch1 on -> ch1/2/3 on within 2.5 s. A failed read
+  (`is_on=False`) likewise re-sent `output_off`.
+- Hardware: VX2740 (.51) and 33510B (.46) fail ARP (off / unplugged / dead
+  switch port); IV MUX Arduino never enumerated today; C525 webcam unplugged
+  20:32:58; K6485 timed out on every connect today. Phidget hub, webcam and
+  CP2102 were moved between USB ports 20:10–20:33; PC rebooted 4x 20:40–20:47.
+  NIC at **100 Mbps** since the 16:21 boot (1000 Mbps on Sep 16–18).
+- The webcam is not a factor: opening the missing `/dev/video0` fails in ~1 ms.
+
+### What changed (uncommitted at time of writing)
+- `shell.py`: `_reading(key, fn)` / `READINGS` — timers render cached values;
+  the query runs in a worker thread, at most one in flight per key however
+  many clients ask. Used by Status (temperature, pulse MUX, IV MUX), the MUX
+  tabs, and the NGE100 tab (now `_read_nge100` + `_render` + `_refresh_now`).
+  MUX tabs show `err` instead of `none` when the query fails.
+- NGE100 switches remember the value last shown (`_show_switch`); handlers
+  ignore echoes of it. Verified: ch1 on -> only ch1 on.
+- `hub.py`: MUX connects require a firmware reply (`_require_mux_reply`) —
+  wrong port now fails in ~12 s with `ConnectionError`; MUX disconnects always
+  close the port and drop the reference (`_close_mux`); `connect_dig` /
+  `disconnect_dig` serialized by `_dig_lock` (verified: 3 rounds of 2
+  concurrent connects, no crash); K6485 and digitizer close on a failed
+  post-connect setup.
+- Verified with headless Chrome against the real tab builders: 3 browsers on a
+  never-answering IV MUX -> `/ping` 1–11 ms, one `d` command in flight at a
+  time, tab shows the TimeoutError. All four modified tabs build and tick with
+  zero tracebacks.
+- Removed the bogus `mux`/`ivmux` entries from `.last_connections.json`
+  (backup in the session scratchpad); restarted the service 23:57.
+
+### Open threads
+- `_close_mux` reaches into `MuxController._drv`; the real fix is upstream in
+  `ivmux-python` / `pulse-mux-python`: make `disconnect()` close the port in a
+  `finally`. Then drop the reach-in.
+- Other connects (`ivmux`, `k6485`, ...) can still race each other from two
+  browsers; only the digitizer is locked because only FELib crashes on it.
+- Service stop still SIGKILLs after the 20 s grace even when idle (existing
+  known issue in CLAUDE.md).
+- Chrome headless on this box needs `--no-sandbox --disable-dev-shm-usage
+  --password-store=basic --use-mock-keychain` or it hangs at startup.
+
+---
+
 ## 2026-06-02 — config.py untracked; template + first-run bootstrap; stop buttons
 
 ### What changed
