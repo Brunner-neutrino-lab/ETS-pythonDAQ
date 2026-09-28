@@ -894,6 +894,21 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
   border-radius:8px; background:var(--panel2);
 }
 
+/* Viewer + recent-acquisitions list side by side, stacked when narrow */
+.dig-panel .viewer-grid {
+  display:grid; grid-template-columns:minmax(0, 1fr) 460px;
+  gap:14px; align-items:start;
+}
+@media (max-width: 1250px) { .dig-panel .viewer-grid { grid-template-columns:1fr; } }
+.dig-panel .acq-table { background:transparent; }
+.dig-panel .acq-table .q-table__middle { max-height:400px; }
+.dig-panel .acq-table tbody tr { cursor:pointer; }
+.dig-panel .acq-table th, .dig-panel .acq-table td {
+  padding:3px 6px !important; font-size:12px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-variant-numeric:tabular-nums;
+}
+
 /* Status pill */
 .dig-panel .statuspill {
   font-size:12px; color:var(--mut);
@@ -8985,6 +9000,90 @@ def _build_plots_tab():
         ui.button("refresh file list", on_click=refresh_files)
 
 
+# ---------------------------------------------------------------------------
+# Recent digitizer-tab acquisitions
+#
+# Kept in memory only (nothing here is written to disk) and shared by every
+# browser session, so a reload or a second viewer sees the same list. Raw
+# waveforms dominate the memory: past the budget the oldest entries lose
+# theirs but keep the pulse amplitudes the spectrum needs.
+# ---------------------------------------------------------------------------
+
+DIG_HISTORY_MAX = 20
+DIG_RAW_BUDGET_BYTES = 256 * 1024 ** 2
+DIG_HISTORY: list = []         # newest first
+_DIG_HISTORY_SEQ = itertools.count(1)
+_DIG_HISTORY_STATE = {"version": 0}
+
+
+def _raw_bytes(result) -> int:
+    return sum(getattr(w, "nbytes", 0) for w in result.waveforms.values())
+
+
+def _dig_history_add(result, trigger: str, n_requested: int, stored: bool):
+    entry = SimpleNamespace(id=next(_DIG_HISTORY_SEQ), t=time.time(), r=result,
+                            trigger=trigger, n_requested=n_requested,
+                            stored=stored, dropped=False)
+    DIG_HISTORY.insert(0, entry)
+    del DIG_HISTORY[DIG_HISTORY_MAX:]
+    total, over = 0, False
+    for e in DIG_HISTORY:
+        nb = _raw_bytes(e.r)
+        if nb and e is not entry and (over or total + nb > DIG_RAW_BUDGET_BYTES):
+            over = True
+            e.r.waveforms = {}
+            e.dropped = True
+        else:
+            total += nb
+    _DIG_HISTORY_STATE["version"] += 1
+    return entry
+
+
+def _dig_history_get(acq_id):
+    return next((e for e in DIG_HISTORY if e.id == acq_id), None)
+
+
+def _fmt_channel_list(chs) -> str:
+    chs = sorted(chs)
+    parts, i = [], 0
+    while i < len(chs):
+        j = i
+        while j + 1 < len(chs) and chs[j + 1] == chs[j] + 1:
+            j += 1
+        parts.append(str(chs[i]) if i == j else f"{chs[i]}-{chs[j]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def _dig_history_rows() -> list[dict]:
+    rows = []
+    for e in DIG_HISTORY:
+        r = e.r
+        if e.dropped:
+            raw = "dropped"
+        elif _raw_bytes(r):
+            raw = "yes"
+        else:
+            raw = "no"
+        n = f"{r.n_waveforms}"
+        if r.n_waveforms < e.n_requested:
+            n += f" / {e.n_requested}"
+        rows.append({
+            "id": e.id,
+            "time": time.strftime("%H:%M:%S", time.localtime(e.t)),
+            "wfs": n,
+            "chans": _fmt_channel_list(r.channel_ids),
+            "pulses": sum(len(a) for a in r.amplitudes.values()),
+            "raw": raw,
+            "trig": e.trigger,
+        })
+    return rows
+
+
+_DIG_TRACE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444",
+                     "#a855f7", "#06b6d4", "#eab308", "#ec4899"]
+
+
 def _build_digitizer_tab():
     """CAEN VX2740 digitizer panel — Quick I/V style.
 
@@ -8993,8 +9092,11 @@ def _build_digitizer_tab():
                        (or global threshold when threshold-mode = global)
         ACQUISITION — capture window (pre/post µs) + sample rate + trigger
                        + run-acquisition / SW trigger / store-raw toggle
-        WAVEFORMS   — single-waveform viewer with channel + index controls
+        WAVEFORMS   — waveform viewer with channel + index controls
         SPECTRUM    — pulse-amplitude histogram with bin-count control
+
+    Each viewer sits beside a list of the recent acquisitions (DIG_HISTORY)
+    and can overlay traces from several of them.
 
     All controls go through the VX2740Controller stored on HUB.dig. The
     backend wrapper for the dig is a `_VX2740Backend` that exposes the
@@ -9036,7 +9138,6 @@ def _build_digitizer_tab():
              "threshold": 150}
         for ch in range(N_CHANNELS)
     }
-    _last_result = {"r": None}
 
     # ===== Panel scaffold =====
     with ui.element("div").classes("dig-panel w-full"):
@@ -9347,7 +9448,8 @@ def _build_digitizer_tab():
                         store_raw_sw = ui.switch(value=False).props("dense")
                         ui.html('Store raw waveforms '
                                 '<span style="color:var(--mut)">'
-                                '(memory-heavy)</span>')
+                                '(for the waveform viewer; kept in memory, '
+                                'not saved to disk)</span>')
                     with ui.element("div").classes("fld") \
                             .style("max-width:160px; margin-bottom:14px"):
                         ui.html('<label class="fld-lbl">Timeout</label>')
@@ -9420,39 +9522,18 @@ def _build_digitizer_tab():
                                 1000, store, tmo,
                             )
                             await _run_in_thread(ctrl.disarm)
-                            _last_result["r"] = result
+                            entry = _dig_history_add(
+                                result, getattr(ctrl, "_trigger_mode", "?"),
+                                n, store)
                             acq_status.set_content(
                                 f'<span class="statuspill" '
-                                f'style="color:var(--ok)">done · '
+                                f'style="color:var(--ok)">done · #{entry.id} · '
                                 f'{result.n_waveforms} wfs</span>'
                             )
-                            log.info("vx2740 acquired %d waveforms",
-                                     result.n_waveforms)
-                            # Auto-jump the waveform / spectrum dropdowns
-                            # to a channel that actually has data, so the
-                            # user isn't stuck on "no waveforms — re-run"
-                            # when their enabled channel isn't ch 0.
-                            try:
-                                _chs_with_waves = [
-                                    ch for ch in result.channel_ids
-                                    if result.waveforms.get(ch) is not None
-                                    and len(result.waveforms[ch]) > 0
-                                ]
-                                _chs_with_amps = [
-                                    ch for ch in result.channel_ids
-                                    if len(result.amplitudes.get(ch, [])) > 0
-                                ]
-                                if (_chs_with_waves
-                                        and int(wave_ch.value or 0) not in _chs_with_waves):
-                                    wave_ch.set_value(_chs_with_waves[0])
-                                if (_chs_with_amps
-                                        and int(spec_ch.value or 0) not in _chs_with_amps):
-                                    spec_ch.set_value(_chs_with_amps[0])
-                            except Exception:
-                                pass
-                            # Refresh waveform / spectrum plots if visible
-                            _draw_waveform()
-                            _draw_spectrum()
+                            log.info("vx2740 acquisition #%d: %d waveforms",
+                                     entry.id, result.n_waveforms)
+                            wave_list.sync()
+                            spec_list.sync()
                         except Exception as e:
                             acq_status.set_content(
                                 f'<span class="statuspill" '
@@ -9513,155 +9594,436 @@ def _build_digitizer_tab():
                         f.on_value_change(_mark_acq_dirty)
 
         # ==========================================================
+        # Recent-acquisitions list (one beside each viewer)
+        # ==========================================================
+        _ACQ_COLUMNS = [
+            {"name": "id",     "label": "#",       "field": "id",     "align": "right"},
+            {"name": "time",   "label": "time",    "field": "time",   "align": "left"},
+            {"name": "wfs",    "label": "wfs",     "field": "wfs",    "align": "right"},
+            {"name": "chans",  "label": "ch",      "field": "chans",  "align": "left"},
+            {"name": "pulses", "label": "pulses",  "field": "pulses", "align": "right"},
+            {"name": "raw",    "label": "raw",     "field": "raw",    "align": "left"},
+            {"name": "trig",   "label": "trigger", "field": "trig",   "align": "left"},
+        ]
+
+        def _acq_list(on_pick):
+            """Table of DIG_HISTORY. on_pick(entry) runs when a row is
+            clicked, and for each new acquisition while 'follow latest' is
+            on."""
+            with ui.card().classes("card-dig"):
+                with ui.row().classes("items-center w-full no-wrap") \
+                        .style("gap:10px; margin-bottom:8px"):
+                    ui.html('<p class="eyebrow" style="margin:0">'
+                            'Recent acquisitions</p>')
+                    ui.html('<div style="flex:1"></div>')
+                    follow = ui.switch("follow latest", value=True).props("dense")
+                table = ui.table(columns=_ACQ_COLUMNS, rows=_dig_history_rows(),
+                                 row_key="id", selection="single") \
+                    .props("dense flat hide-selected-banner "
+                           'no-data-label="no acquisitions yet"') \
+                    .classes("acq-table w-full")
+                ui.html(f'<div class="derived">last {DIG_HISTORY_MAX} runs of '
+                        'this tab, kept in memory only (not saved to disk)</div>')
+            seen = {"version": _DIG_HISTORY_STATE["version"],
+                    "newest": DIG_HISTORY[0].id if DIG_HISTORY else None}
+
+            def pick(acq_id):
+                entry = _dig_history_get(acq_id)
+                if entry is None:
+                    return
+                table.selected = [r for r in table.rows if r["id"] == acq_id]
+                on_pick(entry)
+
+            def _on_select(e):
+                if e.selection:
+                    pick(e.selection[0]["id"])
+
+            table.on("rowClick", lambda e: pick(e.args),
+                     js_handler="(evt, row) => emit(row.id)")
+            table.on_select(_on_select)
+
+            def sync():
+                if seen["version"] == _DIG_HISTORY_STATE["version"]:
+                    return
+                seen["version"] = _DIG_HISTORY_STATE["version"]
+                table.update_rows(_dig_history_rows(), clear_selection=False)
+                newest = DIG_HISTORY[0].id if DIG_HISTORY else None
+                if newest != seen["newest"]:
+                    seen["newest"] = newest
+                    if follow.value and newest is not None:
+                        pick(newest)
+
+            ui.timer(1.0, sync)
+            if follow.value and DIG_HISTORY:
+                ui.timer(0.1, lambda: pick(DIG_HISTORY[0].id), once=True)
+            return SimpleNamespace(sync=sync)
+
+        def _set_series(chart, series):
+            chart.options["series"] = series
+            chart.options["legend"]["show"] = len(series) > 1
+            chart.options["grid"]["top"] = 34 if len(series) > 1 else 14
+            chart.update()
+
+        def _note(el, text, warn=False):
+            color = "var(--warn)" if warn else "var(--mut)"
+            el.set_content(f'<span class="derived" style="color:{color}">{text}</span>')
+
+        def _chart_opts(xname, yname, ytype="value"):
+            axis = {"axisLine":  {"lineStyle": {"color": "#5c6775"}},
+                    "axisLabel": {"color": "#8a93a6", "fontSize": 10},
+                    "splitLine": {"lineStyle": {"color": "#1d2733"}},
+                    "nameLocation": "middle", "scale": True}
+            return {
+                "tooltip": {"trigger": "axis"},
+                "legend": {"show": False, "top": 4, "type": "scroll",
+                           "textStyle": {"color": "#8a93a6", "fontSize": 11}},
+                "grid": {"left": 60, "right": 18, "top": 14, "bottom": 38},
+                "backgroundColor": "transparent",
+                "textStyle": {"color": "#dde3ee"},
+                "xAxis": {**axis, "type": "value", "name": xname, "nameGap": 22},
+                "yAxis": {**axis, "type": ytype, "name": yname, "nameGap": 46},
+                "series": [],
+            }
+
+        _HOLD_TIP = ("keep the trace(s) on the plot; the next one you pick "
+                     "is drawn on top")
+        _MAX_TRACES = len(_DIG_TRACE_COLORS)
+
+        # ==========================================================
         # WAVEFORMS panel
         # ==========================================================
         with panel_waveforms:
-            with ui.card().classes("card-dig"):
-                with ui.row().classes("items-end w-full") \
-                        .style("gap:14px; margin-bottom:14px"):
-                    ui.html('<p class="eyebrow" style="margin:0">Waveform viewer</p>')
-                    ui.html('<div style="flex:1"></div>')
-                    with ui.element("div").classes("fld").style("width:160px"):
-                        ui.html('<label class="fld-lbl">Channel</label>')
-                        wave_ch = ui.select(
-                            {ch: f"ch{ch}" for ch in range(N_CHANNELS)},
-                            value=0,
-                        ).props("dense filled hide-bottom-space")
-                    with ui.element("div").classes("fld").style("width:130px"):
-                        ui.html('<label class="fld-lbl">Waveform #</label>')
-                        wave_n = ui.number(value=0, step=1, format="%d") \
-                            .props("dense filled hide-bottom-space")
-                    prev_btn = ui.button("◀ prev").props("flat dense")
-                    next_btn = ui.button("next ▶").props("flat dense")
+            with ui.element("div").classes("viewer-grid"):
+                with ui.card().classes("card-dig"):
+                    with ui.row().classes("items-end w-full") \
+                            .style("gap:14px; margin-bottom:10px"):
+                        ui.html('<p class="eyebrow" style="margin:0">Waveform viewer</p>')
+                        ui.html('<div style="flex:1"></div>')
+                        with ui.element("div").classes("fld").style("width:160px"):
+                            ui.html('<label class="fld-lbl">Channel</label>')
+                            wave_ch = ui.select(
+                                {ch: f"ch{ch}" for ch in range(N_CHANNELS)},
+                                value=0,
+                            ).props("dense filled hide-bottom-space")
+                        with ui.element("div").classes("fld").style("width:130px"):
+                            ui.html('<label class="fld-lbl">Waveform #</label>')
+                            wave_n = ui.number(value=0, min=0, step=1, format="%d") \
+                                .props("dense filled hide-bottom-space")
+                        prev_btn = ui.button("◀ prev").props("flat dense")
+                        next_btn = ui.button("next ▶").props("flat dense")
+                    with ui.row().classes("items-center w-full") \
+                            .style("gap:8px; margin-bottom:8px"):
+                        wave_redraw_btn = ui.button("redraw").props("flat dense")
+                        wave_hold_btn = ui.button("overlay").props("flat dense") \
+                            .tooltip(_HOLD_TIP)
+                        wave_clear_btn = ui.button("clear plot").props("flat dense")
+                        wave_note = ui.html("").style(
+                            "margin-left:auto; text-align:right; flex:1 1 220px")
 
-                wave_chart = ui.echart({
-                    "tooltip": {"trigger": "axis"},
-                    "grid": {"left": 60, "right": 18, "top": 14, "bottom": 38},
-                    "backgroundColor": "transparent",
-                    "textStyle": {"color": "#dde3ee"},
-                    "xAxis": {
-                        "type": "value", "name": "time (µs)",
-                        "nameLocation": "middle", "nameGap": 22, "scale": True,
-                        "axisLine":  {"lineStyle": {"color": "#5c6775"}},
-                        "axisLabel": {"color": "#8a93a6", "fontSize": 10},
-                        "splitLine": {"lineStyle": {"color": "#1d2733"}},
-                    },
-                    "yAxis": {
-                        "type": "value", "name": "ADC counts",
-                        "nameLocation": "middle", "nameGap": 46, "scale": True,
-                        "axisLine":  {"lineStyle": {"color": "#5c6775"}},
-                        "axisLabel": {"color": "#8a93a6", "fontSize": 10},
-                        "splitLine": {"lineStyle": {"color": "#1d2733"}},
-                    },
-                    "series": [{
-                        "type": "line", "showSymbol": False,
-                        "data": [],
-                        "lineStyle": {"width": 1.4, "color": "#3b82f6"},
-                    }],
-                }).classes("plotbox-dig")
+                    wave_chart = ui.echart(_chart_opts("time (µs)", "ADC counts")) \
+                        .classes("plotbox-dig")
 
-                def _draw_waveform():
-                    r = _last_result["r"]
-                    if r is None:
-                        wave_chart.options["series"][0]["data"] = []
-                        wave_chart.update(); return
-                    ch = int(wave_ch.value or 0)
-                    idx = int(wave_n.value or 0)
-                    # `wfs` may be a numpy 2-D array (from the controller's
-                    # post-loop consolidate step), an empty list (no
-                    # waveforms stored for this channel), or None (channel
-                    # wasn't enabled in the result).  Use `len() == 0` —
-                    # `not wfs` triggers numpy's truth-value ambiguity.
-                    wfs = r.waveforms.get(ch) if hasattr(r, "waveforms") else None
-                    if wfs is None or len(wfs) == 0 or idx >= len(wfs):
-                        wave_chart.options["series"][0]["data"] = []
-                        wave_chart.update(); return
-                    wf = wfs[idx]
-                    # x = sample-index * (1/SAMPLE_RATE) in microseconds
-                    dt_us = 1e6 / SAMPLE_RATE_HZ
-                    data = [[i * dt_us, float(v)] for i, v in enumerate(wf)]
-                    wave_chart.options["series"][0]["data"] = data
-                    wave_chart.update()
+                wave_list = _acq_list(lambda entry: _wave_pick(entry))
 
-                wave_ch.on_value_change(lambda _e: _draw_waveform())
-                wave_n.on_value_change(lambda _e: _draw_waveform())
-                prev_btn.on_click(lambda: (
-                    wave_n.set_value(max(0, int(wave_n.value or 0) - 1)),
-                    _draw_waveform(),
-                ))
-                next_btn.on_click(lambda: (
-                    wave_n.set_value(int(wave_n.value or 0) + 1),
-                    _draw_waveform(),
-                ))
+            # A trace is (acquisition id, channel, waveform index). `cur`
+            # follows the list selection and the channel / waveform
+            # controls; `held` are frozen by "overlay".
+            wv = {"acq": None, "held": [], "cur": None}
+            wave_quiet = {"on": False}
+
+            def _wave_spec():
+                return (wv["acq"], int(wave_ch.value or 0),
+                        max(0, int(wave_n.value or 0)))
+
+            def _n_waveforms(entry, ch):
+                return len(entry.r.waveforms.get(ch, []))
+
+            def _wave_pick(entry):
+                wv["acq"] = entry.id
+                chs = [ch for ch in entry.r.channel_ids if _n_waveforms(entry, ch)]
+                wave_quiet["on"] = True
+                try:
+                    if chs and int(wave_ch.value or 0) not in chs:
+                        wave_ch.set_value(chs[0])
+                    n = _n_waveforms(entry, int(wave_ch.value or 0))
+                    if n and int(wave_n.value or 0) >= n:
+                        wave_n.set_value(n - 1)
+                finally:
+                    wave_quiet["on"] = False
+                wv["cur"] = _wave_spec()
+                _draw_waveform()
+
+            def _wave_trace(spec):
+                """(data, label), or (None, why there is nothing to draw)."""
+                acq, ch, idx = spec
+                entry = _dig_history_get(acq)
+                if entry is None:
+                    return None, f"#{acq} is no longer in the list"
+                wfs = entry.r.waveforms.get(ch)
+                if wfs is None or len(wfs) == 0:
+                    if entry.dropped:
+                        return None, f"#{acq}: raw waveforms dropped to free memory"
+                    if not entry.stored:
+                        return None, (f"#{acq} was taken with 'Store raw "
+                                      f"waveforms' off: spectrum only")
+                    return None, f"#{acq} has no waveforms on ch{ch}"
+                if idx >= len(wfs):
+                    return None, (f"#{acq} ch{ch} has {len(wfs)} waveforms "
+                                  f"(0-{len(wfs) - 1})")
+                dt_us = 1e6 / SAMPLE_RATE_HZ
+                data = [[round(i * dt_us, 4), y]
+                        for i, y in enumerate(wfs[idx].tolist())]
+                return data, f"#{acq} ch{ch} wf{idx}"
+
+            def _draw_waveform():
+                specs = wv["held"] + ([wv["cur"]] if wv["cur"] else [])
+                series, problems = [], []
+                for i, spec in enumerate(specs):
+                    data, label = _wave_trace(spec)
+                    if data is None:
+                        problems.append(label)
+                        continue
+                    color = _DIG_TRACE_COLORS[i % _MAX_TRACES]
+                    series.append({
+                        "type": "line", "name": label, "showSymbol": False,
+                        "data": data,
+                        "lineStyle": {"width": 1.4 if spec is wv["cur"] else 1.0,
+                                      "color": color},
+                        "itemStyle": {"color": color},
+                    })
+                _set_series(wave_chart, series)
+                if problems:
+                    _note(wave_note, " · ".join(problems), warn=True)
+                elif wv["cur"]:
+                    acq, ch, idx = wv["cur"]
+                    entry = _dig_history_get(acq)
+                    _note(wave_note, f"#{acq} · ch{ch} · waveform {idx} of "
+                          f"{_n_waveforms(entry, ch)}"
+                          + (f" · {len(wv['held'])} overlaid" if wv["held"] else ""))
+                elif wv["held"]:
+                    _note(wave_note, f"{len(wv['held'])} overlaid · pick the next trace")
+                elif wv["acq"] is None:
+                    _note(wave_note, "pick an acquisition from the list")
+                else:
+                    _note(wave_note, f"plot cleared · redraw shows #{wv['acq']}")
+
+            def _wave_controls_changed():
+                if wave_quiet["on"] or wv["acq"] is None:
+                    return
+                wv["cur"] = _wave_spec()
+                _draw_waveform()
+
+            def _wave_step(d):
+                idx = max(0, int(wave_n.value or 0) + d)
+                entry = _dig_history_get(wv["acq"])
+                if entry is not None:
+                    n = _n_waveforms(entry, int(wave_ch.value or 0))
+                    if n:
+                        idx = min(idx, n - 1)
+                if idx == int(wave_n.value or 0):
+                    _wave_controls_changed()
+                else:
+                    wave_n.set_value(idx)
+
+            def _wave_redraw():
+                if wv["acq"] is None:
+                    ui.notify("pick an acquisition from the list first",
+                              type="warning", position="top", timeout=2500)
+                    return
+                wv["cur"] = _wave_spec()
+                _draw_waveform()
+
+            def _wave_hold():
+                if wv["cur"] is None or _wave_trace(wv["cur"])[0] is None:
+                    ui.notify("nothing to overlay: draw a trace first",
+                              type="warning", position="top", timeout=2500)
+                    return
+                if len(wv["held"]) >= _MAX_TRACES - 1:
+                    ui.notify(f"at most {_MAX_TRACES} traces: clear the plot first",
+                              type="warning", position="top", timeout=3000)
+                    return
+                if wv["cur"] not in wv["held"]:
+                    wv["held"].append(wv["cur"])
+                wv["cur"] = None
+                _draw_waveform()
+
+            def _wave_clear():
+                wv["held"].clear()
+                wv["cur"] = None
+                _draw_waveform()
+
+            wave_ch.on_value_change(lambda _e: _wave_controls_changed())
+            wave_n.on_value_change(lambda _e: _wave_controls_changed())
+            prev_btn.on_click(lambda: _wave_step(-1))
+            next_btn.on_click(lambda: _wave_step(+1))
+            wave_redraw_btn.on_click(_wave_redraw)
+            wave_hold_btn.on_click(_wave_hold)
+            wave_clear_btn.on_click(_wave_clear)
+            _draw_waveform()
 
         # ==========================================================
         # SPECTRUM panel
         # ==========================================================
         with panel_spectrum:
-            with ui.card().classes("card-dig"):
-                with ui.row().classes("items-end w-full") \
-                        .style("gap:14px; margin-bottom:14px"):
-                    ui.html('<p class="eyebrow" style="margin:0">'
-                            'Pulse-amplitude spectrum</p>')
-                    ui.html('<div style="flex:1"></div>')
-                    with ui.element("div").classes("fld").style("width:160px"):
-                        ui.html('<label class="fld-lbl">Channel</label>')
-                        spec_ch = ui.select(
-                            {ch: f"ch{ch}" for ch in range(N_CHANNELS)},
-                            value=0,
-                        ).props("dense filled hide-bottom-space")
-                    with ui.element("div").classes("fld").style("width:120px"):
-                        ui.html('<label class="fld-lbl">Bins</label>')
-                        spec_bins = ui.number(value=100, step=10, format="%d") \
-                            .props("dense filled hide-bottom-space")
+            with ui.element("div").classes("viewer-grid"):
+                with ui.card().classes("card-dig"):
+                    with ui.row().classes("items-end w-full") \
+                            .style("gap:14px; margin-bottom:10px"):
+                        ui.html('<p class="eyebrow" style="margin:0">'
+                                'Pulse-amplitude spectrum</p>')
+                        ui.html('<div style="flex:1"></div>')
+                        with ui.element("div").classes("fld").style("width:160px"):
+                            ui.html('<label class="fld-lbl">Channel</label>')
+                            spec_ch = ui.select(
+                                {ch: f"ch{ch}" for ch in range(N_CHANNELS)},
+                                value=0,
+                            ).props("dense filled hide-bottom-space")
+                        with ui.element("div").classes("fld").style("width:120px"):
+                            ui.html('<label class="fld-lbl">Bins</label>')
+                            spec_bins = ui.number(value=100, min=10, max=2000,
+                                                  step=10, format="%d") \
+                                .props("dense filled hide-bottom-space")
+                        spec_scale = ui.toggle({"lin": "lin", "log": "log"},
+                                               value="lin").props("dense no-caps") \
+                            .tooltip("counts axis scale")
+                    with ui.row().classes("items-center w-full") \
+                            .style("gap:8px; margin-bottom:8px"):
+                        spec_redraw_btn = ui.button("redraw").props("flat dense")
+                        spec_hold_btn = ui.button("overlay").props("flat dense") \
+                            .tooltip(_HOLD_TIP)
+                        spec_clear_btn = ui.button("clear plot").props("flat dense")
+                        spec_note = ui.html("").style(
+                            "margin-left:auto; text-align:right; flex:1 1 220px")
 
-                spec_chart = ui.echart({
-                    "tooltip": {"trigger": "axis"},
-                    "grid": {"left": 60, "right": 18, "top": 14, "bottom": 38},
-                    "backgroundColor": "transparent",
-                    "textStyle": {"color": "#dde3ee"},
-                    "xAxis": {
-                        "type": "value", "name": "pulse amplitude (ADC)",
-                        "nameLocation": "middle", "nameGap": 22, "scale": True,
-                        "axisLine":  {"lineStyle": {"color": "#5c6775"}},
-                        "axisLabel": {"color": "#8a93a6", "fontSize": 10},
-                        "splitLine": {"lineStyle": {"color": "#1d2733"}},
-                    },
-                    "yAxis": {
-                        "type": "value", "name": "counts",
-                        "nameLocation": "middle", "nameGap": 46, "scale": True,
-                        "axisLine":  {"lineStyle": {"color": "#5c6775"}},
-                        "axisLabel": {"color": "#8a93a6", "fontSize": 10},
-                        "splitLine": {"lineStyle": {"color": "#1d2733"}},
-                    },
-                    "series": [{
-                        "type": "bar",
-                        "data": [],
-                        "itemStyle": {"color": "#3b82f6"},
-                        "barCategoryGap": "5%",
-                    }],
-                }).classes("plotbox-dig")
+                    spec_chart = ui.echart(_chart_opts("pulse amplitude (ADC)", "counts")) \
+                        .classes("plotbox-dig")
 
-                def _draw_spectrum():
-                    r = _last_result["r"]
-                    if r is None:
-                        spec_chart.options["series"][0]["data"] = []
-                        spec_chart.update(); return
-                    ch = int(spec_ch.value or 0)
-                    amps = r.amplitudes.get(ch, []) if hasattr(r, "amplitudes") else []
-                    if len(amps) == 0:
-                        spec_chart.options["series"][0]["data"] = []
-                        spec_chart.update(); return
-                    bins = max(10, int(spec_bins.value or 100))
-                    arr = _np.asarray(amps, dtype=float)
-                    hist, edges = _np.histogram(arr, bins=bins)
-                    data = [[float((edges[i] + edges[i + 1]) / 2), int(h)]
-                            for i, h in enumerate(hist)]
-                    spec_chart.options["series"][0]["data"] = data
-                    spec_chart.update()
+                spec_list = _acq_list(lambda entry: _spec_pick(entry))
 
-                spec_ch.on_value_change(lambda _e: _draw_spectrum())
-                spec_bins.on_value_change(lambda _e: _draw_spectrum())
+            # A trace is (acquisition id, channel). Overlaid spectra share
+            # one set of bin edges so their counts compare bin for bin.
+            sv = {"acq": None, "held": [], "cur": None}
+            spec_quiet = {"on": False}
+
+            def _spec_spec():
+                return (sv["acq"], int(spec_ch.value or 0))
+
+            def _spec_pick(entry):
+                sv["acq"] = entry.id
+                chs = [ch for ch in entry.r.channel_ids
+                       if len(entry.r.amplitudes.get(ch, [])) > 0]
+                if chs and int(spec_ch.value or 0) not in chs:
+                    spec_quiet["on"] = True
+                    try:
+                        spec_ch.set_value(chs[0])
+                    finally:
+                        spec_quiet["on"] = False
+                sv["cur"] = _spec_spec()
+                _draw_spectrum()
+
+            def _has_pulses(acq, ch):
+                entry = _dig_history_get(acq)
+                return entry is not None and len(entry.r.amplitudes.get(ch, [])) > 0
+
+            def _draw_spectrum():
+                specs = sv["held"] + ([sv["cur"]] if sv["cur"] else [])
+                arrays, problems = [], []
+                for i, spec in enumerate(specs):
+                    acq, ch = spec
+                    entry = _dig_history_get(acq)
+                    amps = entry.r.amplitudes.get(ch) if entry is not None else None
+                    if entry is None:
+                        problems.append(f"#{acq} is no longer in the list")
+                    elif amps is None or len(amps) == 0:
+                        problems.append(f"#{acq} has no pulses on ch{ch}")
+                    else:
+                        arrays.append((i, spec, _np.asarray(amps, dtype=float)))
+                log_y = spec_scale.value == "log"
+                spec_chart.options["yAxis"]["type"] = "log" if log_y else "value"
+                series, bin_w = [], None
+                if arrays:
+                    lo = min(float(a.min()) for _, _, a in arrays)
+                    hi = max(float(a.max()) for _, _, a in arrays)
+                    if hi <= lo:
+                        hi = lo + 1.0
+                    bins = min(2000, max(10, int(spec_bins.value or 100)))
+                    edges = _np.linspace(lo, hi, bins + 1)
+                    centers = ((edges[:-1] + edges[1:]) / 2).tolist()
+                    bin_w = (hi - lo) / bins
+                    for i, spec, a in arrays:
+                        color = _DIG_TRACE_COLORS[i % _MAX_TRACES]
+                        counts = _np.histogram(a, bins=edges)[0].tolist()
+                        if log_y:
+                            counts = [c if c > 0 else None for c in counts]
+                        filled = spec is sv["cur"] and len(arrays) == 1
+                        series.append({
+                            "type": "line", "step": "middle", "showSymbol": False,
+                            "name": f"#{spec[0]} ch{spec[1]} ({len(a)})",
+                            "data": [[round(x, 2), c] for x, c in zip(centers, counts)],
+                            "lineStyle": {"width": 1.4, "color": color},
+                            "itemStyle": {"color": color},
+                            "areaStyle": {"color": color,
+                                          "opacity": 0.18 if filled else 0},
+                        })
+                _set_series(spec_chart, series)
+                if problems:
+                    _note(spec_note, " · ".join(problems), warn=True)
+                elif sv["cur"]:
+                    acq, ch = sv["cur"]
+                    _note(spec_note, f"#{acq} · ch{ch} · "
+                          f"{len(arrays[-1][2])} pulses · bin {bin_w:.3g} ADC"
+                          + (f" · {len(sv['held'])} overlaid" if sv["held"] else ""))
+                elif sv["held"]:
+                    _note(spec_note, f"{len(sv['held'])} overlaid · pick the next spectrum")
+                elif sv["acq"] is None:
+                    _note(spec_note, "pick an acquisition from the list")
+                else:
+                    _note(spec_note, f"plot cleared · redraw shows #{sv['acq']}")
+
+            def _spec_controls_changed():
+                if spec_quiet["on"] or sv["acq"] is None:
+                    return
+                sv["cur"] = _spec_spec()
+                _draw_spectrum()
+
+            def _spec_rebin():
+                if sv["cur"] or sv["held"]:
+                    _draw_spectrum()
+
+            def _spec_redraw():
+                if sv["acq"] is None:
+                    ui.notify("pick an acquisition from the list first",
+                              type="warning", position="top", timeout=2500)
+                    return
+                sv["cur"] = _spec_spec()
+                _draw_spectrum()
+
+            def _spec_hold():
+                if sv["cur"] is None or not _has_pulses(*sv["cur"]):
+                    ui.notify("nothing to overlay: draw a spectrum first",
+                              type="warning", position="top", timeout=2500)
+                    return
+                if len(sv["held"]) >= _MAX_TRACES - 1:
+                    ui.notify(f"at most {_MAX_TRACES} spectra: clear the plot first",
+                              type="warning", position="top", timeout=3000)
+                    return
+                if sv["cur"] not in sv["held"]:
+                    sv["held"].append(sv["cur"])
+                sv["cur"] = None
+                _draw_spectrum()
+
+            def _spec_clear():
+                sv["held"].clear()
+                sv["cur"] = None
+                _draw_spectrum()
+
+            spec_ch.on_value_change(lambda _e: _spec_controls_changed())
+            spec_bins.on_value_change(lambda _e: _spec_rebin())
+            spec_scale.on_value_change(lambda _e: _spec_rebin())
+            spec_redraw_btn.on_click(_spec_redraw)
+            spec_hold_btn.on_click(_spec_hold)
+            spec_clear_btn.on_click(_spec_clear)
+            _draw_spectrum()
 
         # ---- Periodic connect-strip refresh ----
         def _refresh_conn():

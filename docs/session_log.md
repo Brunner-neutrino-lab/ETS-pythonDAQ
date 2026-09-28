@@ -12,6 +12,55 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-09-28 — Digitizer tab: recent-acquisitions list in the waveform / spectrum viewers
+
+### Where raw waveforms go (user asked; answer recorded here)
+- **Digitizer tab** ("Store raw waveforms", default off): nothing is ever
+  written to disk. The switch only keeps the traces in memory so the
+  waveform viewer has something to show; pulse finding (amplitudes and
+  timestamps for the spectrum) runs either way. The label now says so.
+- **L2 pulse** ("store raw", default on): traces saved to the L2 HDF5
+  (`MSTORE.save_l2_pulse_run` → `h5io.write_pulse_multichannel`).
+- **L2 pulse sweep**: never saves traces, only per-bias amplitudes,
+  timestamps and rates.
+- **L3 sequence** ("store raw", default off): traces saved to run.h5 only
+  when on.
+
+### Changed (shell.py)
+- Module-level `DIG_HISTORY` (newest first, 20 entries), shared by every
+  browser, so a reload or second viewer sees the same list. Raw waveforms
+  are capped at `DIG_RAW_BUDGET_BYTES` (256 MB). Once a run doesn't fit, it
+  and every older run lose their traces (the raw column says "dropped") but
+  keep amplitudes. The newest run always keeps its own.
+- Waveform and spectrum sub-tabs: each has a list beside the plot (#, time,
+  wfs [got / requested if stopped early], channels, pulses, raw, trigger)
+  with "follow latest" (default on). Clicking a row plots it.
+  - **redraw** re-plots the selection.
+  - **overlay** freezes the plotted trace(s), so the next pick draws on top
+    (up to 8).
+  - **clear plot** empties the plot.
+  - Channel, waveform # and bins act on the live trace. Picking a run jumps
+    to a channel that has data and clamps waveform #.
+- Spectrum: step lines, not bars. Overlaid spectra share bin edges, and
+  there is a lin/log counts toggle (zero bins are dropped on log).
+- The viewer says why a trace is missing: store raw was off, raw dropped
+  for memory, no waveforms on that channel, or index past the end.
+
+### Testing
+- Isolated harness on :8896 with a simulated VX2740 (dark rate raised to
+  2e5 Hz for pulses). `HUB.connect_dig` was patched to sim so nothing could
+  reach 172.16.0.51. Driven with headless Chrome: follow, next/prev,
+  overlay, a UI-run acquisition, clear, redraw, row picks, no-raw run,
+  index clamp, lin/log, rebin, budget-drop order, second browser. No JS
+  exceptions. Scripts are in the session scratchpad `digview/`, not kept.
+
+### Open threads
+- Nothing on the digitizer tab saves to disk. If a quick-look acquisition
+  turns out to be worth keeping, a "save .h5" button on a list row would
+  reuse `h5io.write_pulse_multichannel`. Not built; the user hasn't asked.
+
+---
+
 ## 2026-09-27 (midnight) — Data tab: tick-box multi-file download
 
 ### Changed (shell.py `_build_data_tab`, h5browse.py)
