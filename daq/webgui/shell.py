@@ -7643,13 +7643,16 @@ def _build_data_tab():
     top level, L1/L2 measurements in per-SiPM/per-T subfolders), newest
     first, with a name filter. Each row has move/delete actions, and the
     header has a new-folder button, so the operator can organize runs into
-    folders without leaving the browser. Right: the selected file's
+    folders without leaving the browser. Tick boxes (plus a select-all over
+    the filtered rows) pick files for download: one file downloads as is,
+    several are zipped first. Right: the selected file's
     group/dataset tree (``ui.tree``) and a detail pane that, for a clicked
     node, shows attributes, the domain analysis plot (e.g. /iv -> the IV
     curve via ``daq.plotting``), and a raw value preview/plot for datasets.
     Introspection + file ops live in :mod:`daq.h5browse` (pure, no GUI deps).
     """
     import inspect
+    import tempfile
     from pathlib import Path
     from daq import h5browse as HB
     from daq import plotting as P
@@ -7658,10 +7661,15 @@ def _build_data_tab():
         "Browse every recorded .h5 under ./data. Pick a file for its "
         "group/dataset tree; click a node (e.g. iv) for its analysis plot, "
         "attributes, and a raw value preview. Use the file-row icons to move "
-        "or delete a run, and the folder icon to make a new folder."
+        "or delete a run, and the folder icon to make a new folder. Tick files "
+        "and press download; several files arrive as one zip."
     ).classes("text-gray-400 text-sm")
 
-    state = {"path": None, "files": []}
+    # sel: rel paths ticked for download (kept across filter changes).
+    # boxes: rel -> checkbox for the rows currently rendered.
+    state = {"path": None, "files": [], "sel": set(), "boxes": {},
+             "syncing": False}
+    zip_dir = Path(tempfile.gettempdir()) / "daq_downloads"
 
     def _plot_params(key: str) -> set[str]:
         return set(inspect.signature(P.PLOTS[key]["fn"]).parameters)
@@ -7680,6 +7688,15 @@ def _build_data_tab():
                         .props("flat dense round size=sm").tooltip("refresh")
             flt = ui.input(placeholder="filter by name...") \
                 .props("dense clearable").classes("w-full")
+            with ui.row().classes("items-center no-wrap w-full gap-2"):
+                all_box = ui.checkbox("all", on_change=lambda e: _toggle_all(e.value)) \
+                    .props("dense size=sm").tooltip("tick every file shown")
+                sel_lbl = ui.label("").classes("text-gray-400 text-xs")
+                ui.space()
+                sel_dl_btn = ui.button("download", icon="download",
+                                       on_click=lambda: download_selected()) \
+                    .props("flat dense no-caps size=sm") \
+                    .tooltip("download ticked files (zipped if more than one)")
             file_list = ui.column().classes("w-full gap-1") \
                 .style("max-height:62vh; overflow-y:auto")
 
@@ -7813,6 +7830,73 @@ def _build_data_tab():
         if state["path"]:
             ui.download.file(state["path"], Path(state["path"]).name)
     dl_btn.on_click(_download)
+
+    # ---- multi-file download ---------------------------------------------
+    def _sync_selection():
+        """Push state["sel"] into the row boxes, the select-all box
+        (indeterminate when only some shown rows are ticked) and the
+        download button."""
+        state["syncing"] = True
+        try:
+            for rel, box in state["boxes"].items():
+                box.value = rel in state["sel"]
+            shown = set(state["boxes"])
+            n_shown = len(shown & state["sel"])
+            all_box.value = (False if n_shown == 0
+                             else True if n_shown == len(shown) else None)
+        finally:
+            state["syncing"] = False
+        n = len(state["sel"])
+        sel_lbl.set_text(f"{n} selected" if n else "")
+        sel_dl_btn.set_enabled(n > 0)
+
+    def _tick(rel, on):
+        if state["syncing"]:
+            return
+        if on:
+            state["sel"].add(rel)
+        else:
+            state["sel"].discard(rel)
+        _sync_selection()
+
+    def _toggle_all(on):
+        if state["syncing"]:
+            return
+        if on:
+            state["sel"].update(state["boxes"])
+        else:
+            state["sel"].difference_update(state["boxes"])
+        _sync_selection()
+
+    def _prune_zips(max_age_s=3600):
+        """Download zips are served single-use but stay on disk; drop the
+        ones old enough that their transfer is long over."""
+        cutoff = time.time() - max_age_s
+        for p in zip_dir.glob("daq_data_*.zip"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+
+    async def download_selected():
+        rels = [f["rel"] for f in state["files"] if f["rel"] in state["sel"]]
+        if not rels:
+            return
+        if len(rels) == 1:
+            ui.download.file(HB.data_root() / rels[0], Path(rels[0]).name)
+            return
+        sel_dl_btn.props("loading")
+        try:
+            _prune_zips()
+            zpath = await _run_in_thread(HB.zip_files, rels, zip_dir)
+        except Exception as e:
+            ui.notify(f"zip failed: {type(e).__name__}: {e}", type="negative")
+            return
+        finally:
+            sel_dl_btn.props(remove="loading")
+        ui.download.file(zpath, f"daq_data_{time.strftime('%Y%m%d_%H%M%S')}"
+                                f"_{len(rels)}files.zip")
 
     # ---- detail pane -----------------------------------------------------
     def _domain_plot(h5path):
@@ -7987,12 +8071,14 @@ def _build_data_tab():
 
     def refresh_files():
         state["files"] = HB.list_data_files()
+        state["sel"] &= {f["rel"] for f in state["files"]}
         render_file_list()
 
     def render_file_list():
         q = (flt.value or "").strip().lower()
         files = [f for f in state["files"] if q in f["rel"].lower()]
         count_lbl.set_text(f"{len(files)}/{len(state['files'])}")
+        state["boxes"] = {}
         file_list.clear()
         with file_list:
             if not files:
@@ -8003,6 +8089,9 @@ def _build_data_tab():
                         f"{time.strftime('%m-%d %H:%M', time.localtime(f['mtime']))}")
                 with ui.row().classes(
                         "data-file-row items-center no-wrap w-full gap-1"):
+                    state["boxes"][f["rel"]] = ui.checkbox(
+                        on_change=lambda e, r=f["rel"]: _tick(r, e.value)) \
+                        .props("dense size=sm")
                     with ui.element("div").classes("df-click") \
                             .style("flex:1 1 auto; min-width:0; cursor:pointer") \
                             .on("click", lambda _e=None, p=f["path"]: load_file(p)):
@@ -8015,6 +8104,7 @@ def _build_data_tab():
                               on_click=lambda _e=None, r=f["rel"]: open_delete(r)) \
                         .props("flat dense round size=sm color=negative") \
                         .tooltip("delete")
+        _sync_selection()
 
     flt.on("update:model-value", lambda _e: render_file_list())
     refresh_files()

@@ -13,8 +13,11 @@ exercised without a browser. The GUI side lives in
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 
 import h5py
@@ -77,7 +80,7 @@ def context_hints(h5path: str) -> dict:
     return hints
 
 
-# --- file management (create folder / move / delete) ----------------------
+# --- file management (create folder / move / delete / zip) ----------------
 #
 # Every path is resolved and checked to stay within the data root before any
 # filesystem mutation — the rel paths come from the browser, so a "../.."
@@ -134,6 +137,33 @@ def delete_file(rel_path: str, data_dir=None) -> None:
     if not src.is_file():
         raise FileNotFoundError(rel_path)
     src.unlink()
+
+
+def zip_files(rel_paths, dest_dir, data_dir=None) -> Path:
+    """Bundle data files into one new zip in ``dest_dir``, keeping each
+    file's folder layout relative to the data root. Returns the zip path.
+
+    Level-1 deflate: waveform files can run to GBs, and the zip is built
+    while the operator waits for the download to start.
+    """
+    root = (Path(data_dir) if data_dir else data_root()).resolve()
+    srcs = [_safe_under_root(root, r) for r in rel_paths]
+    for s in srcs:
+        if not s.is_file():
+            raise FileNotFoundError(str(s.relative_to(root)))
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="daq_data_", suffix=".zip", dir=dest_dir)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
+                             compresslevel=1) as zf:
+            for s in srcs:
+                zf.write(s, arcname=str(s.relative_to(root)))
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return Path(tmp)
 
 
 def human_size(n: float) -> str:
