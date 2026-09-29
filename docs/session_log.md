@@ -572,6 +572,39 @@ DAQ very slow, devices dropping, web UI won't load.
 
 ---
 
+## 2026-09-29 — L3 pulse raw waveforms persist through the common digitizer API
+
+### What changed
+- `_VX2740Backend.run` now accepts and forwards `batch_size` and
+  `store_waveforms`, then normalizes the controller-specific acquisition into
+  `DigitizerResult` as before.
+- L3 `_exec_pulse` still configures the VX2740 controller directly, but runs
+  acquisition through the common digitizer backend. This gives the HDF5 writer
+  the `waveforms_v` field it expects instead of the controller-only
+  `waveforms` field.
+- Added simulation-backed regression tests covering an exact 10-waveform HDF5
+  dataset and the store-raw-disabled case.
+
+### Root cause
+The UI count and `store raw` value were reaching `VX2740Controller.run`, but
+L3 bypassed the normalization layer. The HDF5 writer therefore saw timestamps
+but no `waveforms_v` and silently omitted the waveform dataset.
+
+### Verified
+VX2740 simulation acquisition plus a real temporary HDF5 file: requesting 10
+stored waveforms writes `.../ch2/waveforms` with 10 rows and
+`n_waveforms = 10`; disabling storage omits the dataset.
+
+### Open threads
+- Deploy this branch to the DAQ host and restart `daq-webapp`; no real hardware
+  acquisition was run during this local fix.
+- The parent repository currently pins VX2740 submodule commit
+  `215bf7199e6742ca8adad450441008b8283fa2c8`, which is no longer available on
+  the submodule remote. Local simulation verification used public `main` at
+  `b0873b8`; reconcile the parent pointer separately.
+
+---
+
 ## 2026-06-02 — config.py untracked; template + first-run bootstrap; stop buttons
 
 ### What changed

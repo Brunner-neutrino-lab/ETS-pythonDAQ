@@ -335,10 +335,10 @@ def _exec_pulse(spec, instruments, config, illuminated, bias_v):
         ctrl.configure_channels(sipm_channels=sipm_chs, thresholds=thresholds,
                                 threshold_mode="per_channel", include_pmt=False)
         ctrl.configure_trigger(mode="self")
-        return ctrl.run(n_waveforms=n,
-                        batch_size=min(int(spec.pulse_batch_size), n),
-                        store_waveforms=bool(spec.pulse_store_waveforms),
-                        timeout_s=120.0)
+        return dig.run(n_waveforms=n,
+                       batch_size=min(int(spec.pulse_batch_size), n),
+                       store_waveforms=bool(spec.pulse_store_waveforms),
+                       timeout_s=120.0)
     finally:
         if illuminated:
             _awg_off(awg, 1)

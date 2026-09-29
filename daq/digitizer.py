@@ -211,8 +211,13 @@ class _VX2740Backend:
             include_pmt     = False,
         )
 
-    def run(self, n_waveforms: int, timeout_s: float = 120.0) -> DigitizerResult:
-        raw = self._ctrl.run(n_waveforms=n_waveforms, timeout_s=timeout_s)
+    def run(self, n_waveforms: int, timeout_s: float = 120.0, *,
+            batch_size: int = 1000,
+            store_waveforms: bool = False) -> DigitizerResult:
+        raw = self._ctrl.run(n_waveforms=n_waveforms,
+                             batch_size=batch_size,
+                             store_waveforms=store_waveforms,
+                             timeout_s=timeout_s)
         return _vx_result_to_normalised(raw)
 
     def __enter__(self):  self.connect();    return self
