@@ -126,7 +126,8 @@ def measure_current(elec) -> float:
 
 
 def iv_sweep(elec, voltages, n_per_voltage: int = 5,
-             delay_s: float = 0.1):
+             delay_s: float = 0.1, progress_cb=None,
+             timeout_s: float = 600.0):
     """
     Run a full IV sweep using the electrometer's own ammeter.
 
@@ -137,14 +138,23 @@ def iv_sweep(elec, voltages, n_per_voltage: int = 5,
                     Accepts np.ndarray, list, np.arange result, etc.
     n_per_voltage : Number of current readings averaged at each voltage.
     delay_s       : Trigger delay between voltage steps (s).
+    progress_cb   : Optional callback(voltage, currents, timestamps). When
+                    supplied, use the software-stepped live sweep.
+    timeout_s     : Maximum sweep duration (s).
 
     Returns
     -------
     SweepResult (b2987b.controller.SweepResult)
     """
-    log.info("iv_sweep: %d voltages, %d pts/V, delay=%.2f s",
-             len(list(voltages)), n_per_voltage, delay_s)
-    return elec.sweep(list(voltages), n_per_voltage=n_per_voltage, delay_s=delay_s)
+    voltages = list(voltages)
+    log.info("iv_sweep: %d voltages, %d pts/V, delay=%.2f s, timeout=%.1f s",
+             len(voltages), n_per_voltage, delay_s, timeout_s)
+    if progress_cb is not None:
+        return elec.sweep_live(voltages, n_per_voltage=n_per_voltage,
+                               delay_s=delay_s, on_point=progress_cb,
+                               timeout_s=timeout_s)
+    return elec.sweep(voltages, n_per_voltage=n_per_voltage,
+                      delay_s=delay_s, timeout_s=timeout_s)
 
 
 def iv_sweep_external_meter(elec, meter, voltages,

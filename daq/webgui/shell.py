@@ -10044,6 +10044,8 @@ def _build_digitizer_tab():
         ui.timer(1.5, _refresh_conn)
 
 def _build_level3_tab():
+    import queue
+
     ui.label("Build a list of per-SiPM measurement specs and run them in order. "
              "Each entry runs the checked measurements for one SiPM; add the same "
              "SiPM twice to repeat it. Results go to one run.h5.").classes(
@@ -10052,6 +10054,8 @@ def _build_level3_tab():
     from daq.sequence import (MeasurementSpec, SequenceFile,
                               save_sequence, load_sequence,
                               build_sequence_steps, run_sequence as _run_seq)
+    from daq.ivprogress import (IVLiveAccumulator, format_point_summary,
+                                format_sample_status, parse_iv_timeout)
 
     specs:   list = []           # list[MeasurementSpec]
     editing = {"i": None}        # index being edited, or None (add mode)
@@ -10100,6 +10104,8 @@ def _build_level3_tab():
                 with ui.row().classes("gap-2"):
                     b_iv_n_dark  = ui.number(label="n IV samp (dark)",  value=HUB.config.iv_n_per_point, step=1, format="%d").classes("w-32 num")
                     b_iv_n_illum = ui.number(label="n IV samp (illum)", value=HUB.config.iv_n_per_point, step=1, format="%d").classes("w-32 num")
+                    b_iv_delay = ui.number(label="settling delay (s)", value=0.1,
+                                           min=0, step=0.01, format="%.3f").classes("w-36 num")
 
             with ui.element("div") as sec_pulse:
                 ui.html("<h2 style='margin-top:.5rem'>pulse</h2>")
@@ -10167,6 +10173,8 @@ def _build_level3_tab():
         with ui.row().classes("gap-2 items-end"):
             run_dir = ui.input(label="run directory", value=HUB.config.data_dir).classes("w-72")
             run_id  = ui.input(label="run id",        value="run_001").classes("w-40")
+            iv_timeout = ui.number(label="IV max time (s)", value=600,
+                                   min=1, step=60, format="%.0f").classes("w-40 num")
             resume_sw = ui.switch("resume", value=True)
         seq_path = ui.input(label="sequence YAML",
                             value=os.path.join(HUB.config.data_dir, "l3_sequence.yaml")).classes("w-full")
@@ -10174,7 +10182,8 @@ def _build_level3_tab():
             ui.button("save list", on_click=lambda: save_list())
             ui.button("load list", on_click=lambda: load_list()).props("color=primary")
 
-        log_lbl    = ui.log(max_lines=24).classes("h-48 w-full")
+        iv_live_lbl = ui.label("IV live — idle").classes("num text-sm")
+        log_lbl    = ui.log(max_lines=100).classes("h-48 w-full")
         entry_prog = ui.linear_progress(value=0).classes("w-full")
         entry_lbl  = ui.label("entry 0 / 0").classes("num text-sm")
         step_prog  = ui.linear_progress(value=0).classes("w-full")
@@ -10199,6 +10208,7 @@ def _build_level3_tab():
             dark=(cond in ("dark", "both")), illuminated=(cond in ("bright", "both")),
             do_iv=bool(en_iv.value), do_pulse=bool(en_pulse.value), do_scan=bool(en_scan.value),
             iv_voltages=ivv, iv_meter=str(b_iv_meter.value),
+            iv_delay_s=float(b_iv_delay.value),
             n_iv_samples_dark=int(b_iv_n_dark.value), n_iv_samples_illum=int(b_iv_n_illum.value),
             pulse_bias_v=_parse_floats(b_pc_bias.value),
             pulse_capture_ch=int(b_pc_ch.value), pulse_threshold_adc=int(b_pc_thr.value),
@@ -10230,6 +10240,7 @@ def _build_level3_tab():
             b_iv_start.value, b_iv_stop.value = s.iv_voltages[0], s.iv_voltages[-1]
             if len(s.iv_voltages) > 1:
                 b_iv_step.value = round(s.iv_voltages[1] - s.iv_voltages[0], 6)
+        b_iv_delay.value = s.iv_delay_s
         b_iv_n_dark.value, b_iv_n_illum.value = s.n_iv_samples_dark, s.n_iv_samples_illum
         b_pc_ch.value, b_pc_thr.value = s.pulse_capture_ch, s.pulse_threshold_adc
         b_pc_aux_use.value = s.pulse_aux_ch is not None
@@ -10253,7 +10264,8 @@ def _build_level3_tab():
                  else "bright" if s.illuminated else "dark")
         parts = [f"#{s.sipm_id} mux{s.mux_channel} T{s.temperature_K:.1f}K [{conds}]"]
         if s.do_iv and s.iv_voltages:
-            parts.append(f"IV[{s.iv_voltages[0]:g}-{s.iv_voltages[-1]:g} {s.iv_meter}]")
+            parts.append(f"IV[{s.iv_voltages[0]:g}-{s.iv_voltages[-1]:g} "
+                         f"{s.iv_meter}, settle {s.iv_delay_s:g}s]")
         if s.do_pulse:
             parts.append(f"pulse[bias {','.join(f'{v:g}' for v in s.pulse_bias_v)}]")
         if s.do_scan:
@@ -10337,6 +10349,30 @@ def _build_level3_tab():
             log_msg(f"load failed: {type(e).__name__}: {e}")
 
     # ---------------- run ----------------
+    iv_live = {"queue": queue.SimpleQueue(), "acc": IVLiveAccumulator()}
+
+    def _queue_iv_progress(entry_idx, n_entries, illuminated, voltage,
+                           currents, _timestamps, n_per_voltage, n_voltages):
+        iv_live["queue"].put((entry_idx, n_entries, illuminated, voltage,
+                              currents, n_per_voltage, n_voltages))
+
+    def _drain_iv_progress():
+        latest = None
+        while True:
+            try:
+                event = iv_live["queue"].get_nowait()
+            except queue.Empty:
+                break
+            sample, point = iv_live["acc"].add(*event)
+            if sample is not None:
+                latest = sample
+            if point is not None:
+                log_msg(format_point_summary(point))
+        if latest is not None:
+            iv_live_lbl.text = format_sample_status(latest)
+
+    ui.timer(0.25, _drain_iv_progress)
+
     def request_finish_step():
         abort["flag"] = True
         log_msg("Finish Step requested — stopping after current step")
@@ -10345,6 +10381,12 @@ def _build_level3_tab():
         abort["flag"] = True
         log_msg("Stop Now requested — stopping current measurement and sequence")
         stop_errors = []
+
+        if HUB.elec is not None:
+            try:
+                HUB.elec.request_stop()
+            except Exception as e:
+                stop_errors.append(f"electrometer stop: {type(e).__name__}: {e}")
 
         ctrl = getattr(HUB.dig, "_ctrl", None) if HUB.dig else None
         if ctrl is not None:
@@ -10383,7 +10425,14 @@ def _build_level3_tab():
         if not specs: log_msg("no entries"); return
         if HUB.elec is None: log_msg("electrometer not connected"); return
         if not run_dir.value.strip(): log_msg("run directory is empty"); return
+        try:
+            timeout_s = parse_iv_timeout(iv_timeout.value)
+        except ValueError as e:
+            log_msg(str(e)); return
         abort["flag"] = False
+        iv_live["queue"] = queue.SimpleQueue()
+        iv_live["acc"] = IVLiveAccumulator()
+        iv_live_lbl.text = "IV live — waiting for first sample"
         from daq.storage import RunFile, run_filename
         from daq.resume  import RunManifest
         mdir = os.path.join(run_dir.value.strip(), run_id.value.strip())
@@ -10397,15 +10446,20 @@ def _build_level3_tab():
         rf = RunFile(run_filename(run_dir.value.strip(), run_id.value.strip()),
                      config=HUB.config)
         set_activity("L3 sequence", f"{len(specs)} entries")
-        log_msg(f"running {len(specs)} entries ({len(steps)} steps)…")
+        log_msg(f"running {len(specs)} entries ({len(steps)} steps), "
+                f"IV timeout {timeout_s:g} s…")
         try:
             rf.open()
             summary = await _run_in_thread(
                 _run_seq, list(specs), HUB.instruments, HUB.config,
-                rf, manifest, _on_progress, abort,
+                run_file=rf, manifest=manifest, on_progress=_on_progress,
+                abort=abort, on_iv_progress=_queue_iv_progress,
+                iv_timeout_s=timeout_s,
             )
+            _drain_iv_progress()
             log_msg(f"done — {summary}")
         except Exception as e:
+            _drain_iv_progress()
             log_msg(f"FAIL: {type(e).__name__}: {e}")
         finally:
             try: rf.close()

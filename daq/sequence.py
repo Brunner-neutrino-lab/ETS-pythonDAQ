@@ -273,7 +273,8 @@ def _move_for_condition(instruments, spec: MeasurementSpec, illuminated: bool,
         P.select_channel(ivmux, int(spec.mux_channel))
 
 
-def _exec_iv(spec, instruments, config, illuminated):
+def _exec_iv(spec, instruments, config, illuminated,
+             progress_cb=None, timeout_s=600.0):
     elec = instruments.get("elec")
     if elec is None:
         raise RuntimeError("electrometer not connected")
@@ -293,7 +294,8 @@ def _exec_iv(spec, instruments, config, illuminated):
             return P.iv_sweep_external_meter(elec, meter, spec.iv_voltages,
                                              n_per_voltage=n, delay_s=spec.iv_delay_s)
         return P.iv_sweep(elec, spec.iv_voltages, n_per_voltage=n,
-                          delay_s=spec.iv_delay_s)
+                          delay_s=spec.iv_delay_s,
+                          progress_cb=progress_cb, timeout_s=timeout_s)
     finally:
         if illuminated:
             _awg_off(awg, 1)
@@ -455,7 +457,8 @@ def _ensure_hv_confirmer(instruments, specs, hv_confirmer) -> bool:
 
 def run_sequence(specs, instruments, config,
                  run_file=None, manifest=None,
-                 on_progress=None, abort=None, hv_confirmer=None) -> dict:
+                 on_progress=None, abort=None, hv_confirmer=None,
+                 on_iv_progress=None, iv_timeout_s=600.0) -> dict:
     """Run a list of MeasurementSpecs sequentially.
 
     Parameters
@@ -468,6 +471,9 @@ def run_sequence(specs, instruments, config,
     on_progress  : callable(entry_idx, n_entries, step_name, done, total).
     abort        : mutable dict; runner stops cleanly when abort["flag"] is set.
     hv_confirmer : callable(vmax)->bool for >threshold voltages, or None.
+    on_iv_progress : callback(entry_idx, n_entries, illuminated, voltage,
+                     currents, timestamps, n_per_voltage, n_voltages).
+    iv_timeout_s : maximum duration of each B2987 IV sweep.
 
     Returns
     -------
@@ -489,6 +495,7 @@ def run_sequence(specs, instruments, config,
                 run_file.write_sequence_meta({
                     "schema_version": SCHEMA_VERSION,
                     "hash":           sequence_hash(specs),
+                    "iv_timeout_s":   float(iv_timeout_s),
                     "entries":        [spec_to_dict(s) for s in specs],
                 })
             except Exception as e:
@@ -513,7 +520,22 @@ def run_sequence(specs, instruments, config,
 
                 illum = leaf["illuminated"]
                 if leaf["kind"] == "iv":
-                    result = _exec_iv(spec, instruments, config, illum)
+                    live_cb = None
+                    if on_iv_progress is not None and spec.iv_meter == "b2987":
+                        n_per = (spec.n_iv_samples_illum if illum
+                                 else spec.n_iv_samples_dark)
+
+                        def live_cb(voltage, currents, timestamps,
+                                    idx=idx, illum=illum, n_per=n_per,
+                                    n_voltages=len(spec.iv_voltages)):
+                            on_iv_progress(
+                                idx, n_entries, illum, float(voltage),
+                                list(currents), list(timestamps),
+                                int(n_per), int(n_voltages))
+
+                    result = _exec_iv(
+                        spec, instruments, config, illum,
+                        progress_cb=live_cb, timeout_s=float(iv_timeout_s))
                     if run_file is not None:
                         run_file.write_iv_seq(
                             idx, spec.sipm_id, spec.temperature_K, illum, result,

@@ -12,6 +12,35 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-09-29 — L3 B2987 live IV progress, settling delay, and timeout
+
+### Changed
+- L3 B2987 IV sweeps now use the controller's software-stepped `sweep_live`
+  path. A dedicated status line shows the latest sample; the L3 log gets one
+  mean / standard-deviation / count summary per completed voltage instead of
+  one line per sample.
+- The L3 IV spec builder exposes `settling delay (s)`. It is stored in the
+  existing `MeasurementSpec.iv_delay_s`, survives YAML save/load, and is shown
+  in the entry summary.
+- The run row exposes `IV max time (s)` (default 600 s). The limit applies to
+  each B2987 IV leaf independently and is recorded in `/meta/sequence`.
+- `sweep_live` now enforces its overall deadline before and after every
+  acquisition chunk; timeout and Stop Now both retain the existing ammeter-off,
+  source-output-off, and sequence BIAS OFF cleanup.
+
+### Testing
+- Added seven `unittest` cases covering live dispatch, contextual progress,
+  sample and point aggregation, timeout validation, and the real B2987
+  controller's deadline/cleanup behavior with a fake clock and driver.
+- Verified Python compilation, the full new test suite, diff checks, server
+  environment imports, and construction of the L3 NiceGUI page without
+  connecting instruments.
+
+### Open threads
+- Physical bench timing and live browser rendering still need a short operator
+  smoke test after deployment. Re-apply the desired B2987 measurement settings
+  after the web service restart because controller state is in memory.
+
 ## 2026-09-28 — Digitizer tab: recent-acquisitions list in the waveform / spectrum viewers
 
 ### Where raw waveforms go (user asked; answer recorded here)
