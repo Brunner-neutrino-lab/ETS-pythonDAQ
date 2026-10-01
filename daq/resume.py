@@ -57,6 +57,7 @@ log = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "run_manifest.json"
 LOG_FILENAME      = "run_log.jsonl"
+FAILURE_LOG_FILENAME = "run_failures.jsonl"
 
 
 @dataclass
@@ -91,6 +92,7 @@ class RunManifest:
         os.makedirs(run_dir, exist_ok=True)
         self._manifest_path = os.path.join(run_dir, MANIFEST_FILENAME)
         self._log_path      = os.path.join(run_dir, LOG_FILENAME)
+        self._failure_log_path = os.path.join(run_dir, FAILURE_LOG_FILENAME)
 
     # ------------------------------------------------------------------
     # Generation
@@ -281,6 +283,38 @@ class RunManifest:
 
         with open(self._log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
+
+    def mark_failed(self,
+                    step_id: str,
+                    error: str,
+                    hdf5_path: Optional[str] = None,
+                    extra: Optional[dict] = None):
+        """Append a recoverable failure without marking the step complete."""
+        record = {
+            "step_id": step_id,
+            "t": time.time(),
+            "error": str(error),
+            "hdf5_path": hdf5_path,
+        }
+        if extra:
+            record.update(extra)
+        with open(self._failure_log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def completed_hdf5_paths(self) -> list[str]:
+        """Return distinct HDF5 paths recorded by completed steps."""
+        paths = []
+        if not os.path.exists(self._log_path):
+            return paths
+        with open(self._log_path) as f:
+            for line in f:
+                try:
+                    path = json.loads(line).get("hdf5_path")
+                except json.JSONDecodeError:
+                    continue
+                if path and path not in paths:
+                    paths.append(path)
+        return paths
 
     def is_done(self, step_id: str) -> bool:
         return step_id in self._done

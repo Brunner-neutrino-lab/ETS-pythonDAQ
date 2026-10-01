@@ -49,6 +49,10 @@ VX2740_ADC_COUNTS     = 2 ** VX2740_ADC_BITS   # 65536
 VX2740_COUNTS_PER_V   = VX2740_ADC_COUNTS / VX2740_FULL_SCALE_V   # 32768 counts/V
 
 
+class DigitizerDataError(RuntimeError):
+    """The digitizer completed a call without the requested channel data."""
+
+
 # ---------------------------------------------------------------------------
 # Normalised result container
 # ---------------------------------------------------------------------------
@@ -132,7 +136,12 @@ def _vx_result_to_normalised(raw) -> DigitizerResult:
         result.amplitudes_v[ch] = _counts_to_volts(amp_counts)
         result.timestamps[ch]   = raw.timestamps.get(ch, np.array([], dtype=np.float64))
         if ch in getattr(raw, "waveforms", {}):
-            result.waveforms_v[ch] = _counts_to_volts(raw.waveforms[ch])
+            waveforms = raw.waveforms[ch]
+            if not isinstance(waveforms, np.ndarray) or waveforms.size == 0:
+                raise DigitizerDataError(
+                    f"channel {ch} returned no waveform array"
+                )
+            result.waveforms_v[ch] = _counts_to_volts(waveforms)
     return result
 
 

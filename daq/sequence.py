@@ -30,6 +30,7 @@ from typing import Optional
 import numpy as np
 
 from . import primitives as P
+from .digitizer import DigitizerDataError
 from .resume import Step
 
 log = logging.getLogger("daq.sequence")
@@ -468,7 +469,8 @@ def _notify_observer(name, callback, *args) -> None:
 def run_sequence(specs, instruments, config,
                  run_file=None, manifest=None,
                  on_progress=None, abort=None, hv_confirmer=None,
-                 on_iv_progress=None, iv_timeout_s=600.0) -> dict:
+                 on_iv_progress=None, on_step_error=None,
+                 iv_timeout_s=600.0) -> dict:
     """Run a list of MeasurementSpecs sequentially.
 
     Parameters
@@ -483,6 +485,7 @@ def run_sequence(specs, instruments, config,
     hv_confirmer : callable(vmax)->bool for >threshold voltages, or None.
     on_iv_progress : callback(entry_idx, n_entries, illuminated, voltage,
                      currents, timestamps, n_per_voltage, n_voltages).
+    on_step_error : callback(failure_dict) for recoverable pulse failures.
     iv_timeout_s : maximum duration of each B2987 IV sweep.
 
     Returns
@@ -497,6 +500,7 @@ def run_sequence(specs, instruments, config,
     n_entries = len(specs)
     n_done = n_skipped = 0
     aborted = False
+    failures = []
     path = getattr(run_file, "_path", None)
 
     try:
@@ -560,7 +564,42 @@ def run_sequence(specs, instruments, config,
                            f"{_cond_key(illum)}/iv")
                 elif leaf["kind"] == "pulse":
                     bias_v = leaf["bias_v"]
-                    result = _exec_pulse(spec, instruments, config, illum, bias_v)
+                    try:
+                        result = _exec_pulse(
+                            spec, instruments, config, illum, bias_v,
+                        )
+                    except (TimeoutError, DigitizerDataError) as exc:
+                        failure = {
+                            "entry_idx": idx,
+                            "sipm_id": spec.sipm_id,
+                            "step_id": sid,
+                            "step_name": leaf["step_name"],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        failures.append(failure)
+                        if manifest is not None:
+                            manifest.mark_failed(
+                                sid,
+                                failure["error"],
+                                hdf5_path=path,
+                                extra={
+                                    "entry_idx": idx,
+                                    "sipm_id": spec.sipm_id,
+                                    "step_name": leaf["step_name"],
+                                },
+                            )
+                        log.error(
+                            "recoverable pulse failure; skipping entry %d: %s",
+                            idx + 1, failure["error"],
+                        )
+                        _notify_observer(
+                            "sequence step error", on_step_error, failure,
+                        )
+                        _notify_observer(
+                            "sequence progress", on_progress,
+                            idx, n_entries, leaf["step_name"], total, total,
+                        )
+                        break
                     if run_file is not None:
                         run_file.write_pulse_seq(
                             idx, spec.sipm_id, spec.temperature_K, illum, bias_v,
@@ -596,8 +635,12 @@ def run_sequence(specs, instruments, config,
                     idx, n_entries, leaf["step_name"], li + 1, total,
                 )
 
-        return {"n_entries": n_entries, "n_done": n_done,
-                "n_skipped": n_skipped, "aborted": aborted}
+        summary = {"n_entries": n_entries, "n_done": n_done,
+                   "n_skipped": n_skipped, "aborted": aborted}
+        if failures:
+            summary["n_failed"] = len(failures)
+            summary["failures"] = failures
+        return summary
     finally:
         # Restore deny-by-default only if we registered the confirmer here, so
         # we never disarm a pre-existing one (e.g. the GUI dialog bridge).

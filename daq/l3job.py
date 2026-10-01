@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -10,14 +11,34 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import h5py
+
 from . import primitives as P
 from .ivprogress import IVLiveAccumulator, format_point_summary, format_sample_status
 from .resume import RunManifest
-from .sequence import build_sequence_steps, run_sequence
+from .sequence import build_sequence_steps, run_sequence, sequence_hash
 from .storage import RunFile, run_filename
 
 
 log = logging.getLogger("daq.l3job")
+
+
+def _validate_resume_h5(path: str, specs: tuple) -> None:
+    """Refuse to append when an HDF5 file belongs to another sequence."""
+    with h5py.File(path, "r") as h5:
+        if "meta/sequence" not in h5:
+            raise RuntimeError(
+                f"resume HDF5 has no sequence metadata: {path}"
+            )
+        raw = h5["meta/sequence"][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        stored_hash = json.loads(raw).get("hash")
+    expected_hash = sequence_hash(list(specs))
+    if stored_hash != expected_hash:
+        raise RuntimeError(
+            f"resume HDF5 sequence does not match current sequence: {path}"
+        )
 
 
 @dataclass(frozen=True)
@@ -159,9 +180,21 @@ class L3Job:
     def _complete(self, summary: dict) -> None:
         with self._lock:
             self._summary = dict(summary)
-            self._status = "aborted" if summary.get("aborted") else "done"
+            if summary.get("aborted"):
+                self._status = "aborted"
+            elif summary.get("n_failed"):
+                self._status = "completed_with_errors"
+            else:
+                self._status = "done"
             self._finished = time.time()
             self._append_log_locked(f"{self._status} — {summary}")
+
+    def _record_step_error(self, failure: dict) -> None:
+        with self._lock:
+            self._append_log_locked(
+                f"entry {failure['entry_idx'] + 1} · SiPM {failure['sipm_id']} · "
+                f"SKIPPED: {failure['error']}"
+            )
 
     def _fail(self, exc: Exception) -> None:
         with self._lock:
@@ -208,8 +241,24 @@ class L3Job:
                 manifest.set_steps(steps)
                 manifest.save()
 
+            run_path = run_filename(request.run_dir, prefix=request.run_id)
+            if request.resume:
+                completed_paths = manifest.completed_hdf5_paths()
+                if len(completed_paths) > 1:
+                    raise RuntimeError(
+                        "resume manifest refers to multiple HDF5 files: "
+                        + ", ".join(completed_paths)
+                    )
+                if completed_paths:
+                    run_path = completed_paths[0]
+                    if not os.path.exists(run_path):
+                        raise FileNotFoundError(
+                            f"resume HDF5 file does not exist: {run_path}"
+                        )
+                    _validate_resume_h5(run_path, request.specs)
+
             run_file = RunFile(
-                run_filename(request.run_dir, prefix=request.run_id),
+                run_path,
                 config=config,
             )
             run_file.open()
@@ -220,6 +269,7 @@ class L3Job:
                 on_progress=self._record_progress,
                 abort=self._abort,
                 on_iv_progress=self._record_iv,
+                on_step_error=self._record_step_error,
                 iv_timeout_s=float(request.iv_timeout_s),
             )
             self._complete(summary)
