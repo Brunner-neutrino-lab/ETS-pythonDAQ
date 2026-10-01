@@ -48,6 +48,7 @@ from daq import labbook
 from daq import port_recovery
 from daq import ivmux as IVM
 from daq import rails as RAILS
+from daq.l3job import L3Job, L3JobRequest
 
 log = logging.getLogger("daq.webgui")
 
@@ -64,6 +65,10 @@ HUB = InstrumentHub()
 # the status tab reads this every ~1 s to show "what is the experiment doing
 # right now?". `detail` is a short free-text line shown beneath the name.
 ACTIVITY: dict = {"name": None, "started": None, "detail": ""}
+
+# The Level-3 worker and its progress belong to the application, not to the
+# browser tab that launched it. New/reconnected clients render this same state.
+L3_JOB = L3Job()
 
 
 def set_activity(name: str, detail: str = "") -> None:
@@ -10044,7 +10049,7 @@ def _build_digitizer_tab():
         ui.timer(1.5, _refresh_conn)
 
 def _build_level3_tab():
-    import queue
+    import copy
 
     ui.label("Build a list of per-SiPM measurement specs and run them in order. "
              "Each entry runs the checked measurements for one SiPM; add the same "
@@ -10052,16 +10057,28 @@ def _build_level3_tab():
                  "text-gray-400 text-sm")
 
     from daq.sequence import (MeasurementSpec, SequenceFile,
-                              save_sequence, load_sequence,
-                              build_sequence_steps, run_sequence as _run_seq)
-    from daq.ivprogress import (IVLiveAccumulator, format_point_summary,
-                                format_sample_status, parse_iv_timeout)
+                              save_sequence, load_sequence)
+    from daq.ivprogress import parse_iv_timeout
 
     specs:   list = []           # list[MeasurementSpec]
     editing = {"i": None}        # index being edited, or None (add mode)
-    abort   = {"flag": False}
+    client = ui.context.client
+    client_id = client.id
 
-    def log_msg(s: str): log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+    def _client_is_live() -> bool:
+        try:
+            return (Client.instances.get(client_id) is client
+                    and bool(client.has_socket_connection))
+        except Exception:
+            return False
+
+    def log_msg(s: str):
+        if not _client_is_live():
+            return
+        try:
+            log_lbl.push(f"[{time.strftime('%H:%M:%S')}] {s}")
+        except RuntimeError:
+            log.debug("L3 UI log skipped because client %s was deleted", client_id)
 
     def _parse_floats(text: str) -> list:
         out = []
@@ -10349,37 +10366,49 @@ def _build_level3_tab():
             log_msg(f"load failed: {type(e).__name__}: {e}")
 
     # ---------------- run ----------------
-    iv_live = {"queue": queue.SimpleQueue(), "acc": IVLiveAccumulator()}
+    rendered = {"generation": None, "last_log_seq": 0}
 
-    def _queue_iv_progress(entry_idx, n_entries, illuminated, voltage,
-                           currents, _timestamps, n_per_voltage, n_voltages):
-        iv_live["queue"].put((entry_idx, n_entries, illuminated, voltage,
-                              currents, n_per_voltage, n_voltages))
+    def _render_job_state():
+        """Render application-owned job state only while this page exists."""
+        if not _client_is_live():
+            return
+        snapshot = L3_JOB.snapshot()
+        if rendered["generation"] != snapshot.generation:
+            rendered["generation"] = snapshot.generation
+            rendered["last_log_seq"] = 0
 
-    def _drain_iv_progress():
-        latest = None
-        while True:
-            try:
-                event = iv_live["queue"].get_nowait()
-            except queue.Empty:
-                break
-            sample, point = iv_live["acc"].add(*event)
-            if sample is not None:
-                latest = sample
-            if point is not None:
-                log_msg(format_point_summary(point))
-        if latest is not None:
-            iv_live_lbl.text = format_sample_status(latest)
+        try:
+            for seq, line in snapshot.logs:
+                if seq > rendered["last_log_seq"]:
+                    log_lbl.push(line)
+                    rendered["last_log_seq"] = seq
 
-    ui.timer(0.25, _drain_iv_progress)
+            iv_live_lbl.text = snapshot.iv_status
+            entry_prog.value = snapshot.entry_progress
+            step_prog.value = snapshot.step_progress
+            if snapshot.entry_idx is None:
+                entry_lbl.text = f"entry 0 / {snapshot.n_entries}"
+            else:
+                entry_lbl.text = (
+                    f"entry {snapshot.entry_idx + 1} / {snapshot.n_entries}"
+                )
+            step_lbl.text = (
+                f"{snapshot.step_name}: "
+                f"{int(round(snapshot.step_progress * 100))}%"
+                if snapshot.step_name else f"status: {snapshot.status}"
+            )
+        except RuntimeError:
+            log.debug("L3 UI render skipped because client %s was deleted", client_id)
+
+    ui.timer(0.25, _render_job_state)
 
     def request_finish_step():
-        abort["flag"] = True
-        log_msg("Finish Step requested — stopping after current step")
+        L3_JOB.request_abort("Finish Step requested — stopping after current step")
 
     async def request_stop_now():
-        abort["flag"] = True
-        log_msg("Stop Now requested — stopping current measurement and sequence")
+        L3_JOB.request_abort(
+            "Stop Now requested — stopping current measurement and sequence"
+        )
         stop_errors = []
 
         if HUB.elec is not None:
@@ -10413,15 +10442,21 @@ def _build_level3_tab():
 
         if stop_errors:
             for msg in stop_errors:
-                log_msg(f"stop note: {msg}")
+                L3_JOB.append_log(f"stop note: {msg}")
 
-    def _on_progress(entry_idx, n_entries, step_name, done, total):
-        entry_prog.value = ((entry_idx + (done / total if total else 0)) / n_entries) if n_entries else 0
-        entry_lbl.text   = f"entry {entry_idx+1} / {n_entries}"
-        step_prog.value  = (done / total) if total else 0
-        step_lbl.text    = f"{step_name}: {done} / {total}"
+    async def _execute_job(request: L3JobRequest):
+        set_activity("L3 sequence", f"{len(request.specs)} entries")
+        try:
+            await _run_in_thread(
+                L3_JOB.run_claimed, request, HUB.instruments, HUB.config,
+            )
+        except Exception:
+            # L3Job has already persisted the failure in reconnectable state.
+            log.exception("L3 sequence failed")
+        finally:
+            clear_activity()
 
-    async def run_seq():
+    def run_seq():
         if not specs: log_msg("no entries"); return
         if HUB.elec is None: log_msg("electrometer not connected"); return
         if not run_dir.value.strip(): log_msg("run directory is empty"); return
@@ -10429,44 +10464,27 @@ def _build_level3_tab():
             timeout_s = parse_iv_timeout(iv_timeout.value)
         except ValueError as e:
             log_msg(str(e)); return
-        abort["flag"] = False
-        iv_live["queue"] = queue.SimpleQueue()
-        iv_live["acc"] = IVLiveAccumulator()
-        iv_live_lbl.text = "IV live — waiting for first sample"
-        from daq.storage import RunFile, run_filename
-        from daq.resume  import RunManifest
-        mdir = os.path.join(run_dir.value.strip(), run_id.value.strip())
-        os.makedirs(mdir, exist_ok=True)
-        steps = build_sequence_steps(specs)
-        manifest = RunManifest(mdir)
-        if manifest.exists() and resume_sw.value:
-            manifest.load()
-        else:
-            manifest.set_steps(steps); manifest.save()
-        rf = RunFile(run_filename(run_dir.value.strip(), run_id.value.strip()),
-                     config=HUB.config)
-        set_activity("L3 sequence", f"{len(specs)} entries")
-        log_msg(f"running {len(specs)} entries ({len(steps)} steps), "
-                f"IV timeout {timeout_s:g} s…")
+
+        request = L3JobRequest(
+            specs=tuple(copy.deepcopy(specs)),
+            run_dir=run_dir.value.strip(),
+            run_id=run_id.value.strip(),
+            resume=bool(resume_sw.value),
+            iv_timeout_s=timeout_s,
+        )
+        if not L3_JOB.claim(request):
+            running = L3_JOB.snapshot()
+            log_msg(f"another L3 run is active: {running.run_id}")
+            return
         try:
-            rf.open()
-            summary = await _run_in_thread(
-                _run_seq, list(specs), HUB.instruments, HUB.config,
-                run_file=rf, manifest=manifest, on_progress=_on_progress,
-                abort=abort, on_iv_progress=_queue_iv_progress,
-                iv_timeout_s=timeout_s,
+            background_tasks.create(
+                _execute_job(request),
+                name=f"l3-sequence:{L3_JOB.snapshot().generation}",
             )
-            _drain_iv_progress()
-            log_msg(f"done — {summary}")
-        except Exception as e:
-            _drain_iv_progress()
-            log_msg(f"FAIL: {type(e).__name__}: {e}")
-        finally:
-            try: rf.close()
-            except Exception: pass
-            try: await _run_in_thread(P.bias_off, HUB.elec)
-            except Exception: pass
-            clear_activity()
+        except Exception as exc:
+            # Scheduling failures are rare but must not leave a phantom run.
+            L3_JOB.fail_to_start(exc)
+            log_msg(f"FAIL: {type(exc).__name__}: {exc}")
 
     refresh_list()
 

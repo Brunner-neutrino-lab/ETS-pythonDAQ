@@ -455,6 +455,16 @@ def _ensure_hv_confirmer(instruments, specs, hv_confirmer) -> bool:
 # Runner
 # ---------------------------------------------------------------------------
 
+def _notify_observer(name, callback, *args) -> None:
+    """Deliver non-critical progress without letting observers stop DAQ."""
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        log.exception("%s callback failed; acquisition continues", name)
+
+
 def run_sequence(specs, instruments, config,
                  run_file=None, manifest=None,
                  on_progress=None, abort=None, hv_confirmer=None,
@@ -514,8 +524,10 @@ def run_sequence(specs, instruments, config,
                 sid = _step_id(idx, spec, leaf)
                 if manifest is not None and manifest.is_done(sid):
                     n_skipped += 1
-                    if on_progress:
-                        on_progress(idx, n_entries, leaf["step_name"], li + 1, total)
+                    _notify_observer(
+                        "sequence progress", on_progress,
+                        idx, n_entries, leaf["step_name"], li + 1, total,
+                    )
                     continue
 
                 illum = leaf["illuminated"]
@@ -528,10 +540,12 @@ def run_sequence(specs, instruments, config,
                         def live_cb(voltage, currents, timestamps,
                                     idx=idx, illum=illum, n_per=n_per,
                                     n_voltages=len(spec.iv_voltages)):
-                            on_iv_progress(
+                            _notify_observer(
+                                "IV progress", on_iv_progress,
                                 idx, n_entries, illum, float(voltage),
                                 list(currents), list(timestamps),
-                                int(n_per), int(n_voltages))
+                                int(n_per), int(n_voltages),
+                            )
 
                     result = _exec_iv(
                         spec, instruments, config, illum,
@@ -577,8 +591,10 @@ def run_sequence(specs, instruments, config,
                 if manifest is not None:
                     manifest.mark_done(sid, hdf5_path=path, hdf5_group=grp)
                 n_done += 1
-                if on_progress:
-                    on_progress(idx, n_entries, leaf["step_name"], li + 1, total)
+                _notify_observer(
+                    "sequence progress", on_progress,
+                    idx, n_entries, leaf["step_name"], li + 1, total,
+                )
 
         return {"n_entries": n_entries, "n_done": n_done,
                 "n_skipped": n_skipped, "aborted": aborted}
