@@ -108,8 +108,9 @@ amplitude histogram in the Data tab.
 - First hardware run: check that the VX2740 trigger rate / timestamps
   give a sensible "Hz" in the result line (the sim's are meaningless),
   and that 100 waveforms at ~60-400 Hz finish well inside the 30 s timeout.
-- Nothing committed. This branch also still carries the uncommitted
-  2026-10-01 lab book work.
+- Committed and pushed on `codex/client-independent-daq`: `aec2606` (the
+  2026-10-01 lab book work, split out of the same tree) and `edd53d1`
+  (this entry's work).
 
 ---
 
