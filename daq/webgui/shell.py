@@ -50,6 +50,7 @@ from daq import port_recovery
 from daq import ivmux as IVM
 from daq import rails as RAILS
 from daq.l3job import L3Job, L3JobRequest
+from daq import characterization as CH
 
 log = logging.getLogger("daq.webgui")
 
@@ -70,6 +71,8 @@ ACTIVITY: dict = {"name": None, "started": None, "detail": ""}
 # The Level-3 worker and its progress belong to the application, not to the
 # browser tab that launched it. New/reconnected clients render this same state.
 L3_JOB = L3Job()
+# Same for the digitizer tab's initial characterization.
+CHAR_JOB = CH.InitialCharJob()
 
 
 def set_activity(name: str, detail: str = "") -> None:
@@ -8612,6 +8615,7 @@ def _build_data_tab():
     import inspect
     import tempfile
     from pathlib import Path
+    import numpy as np
     from daq import h5browse as HB
     from daq import plotting as P
 
@@ -8920,8 +8924,68 @@ def _build_data_tab():
             sync_knobs()
             render()
 
+    def _amplitude_hist_plot(h5path):
+        """Pulse amplitudes as a histogram: the charge spectrum."""
+        ui.label("amplitude spectrum").classes("text-gray-400 text-xs mt-1")
+        hfig = ui.matplotlib(figsize=(8.5, 3.2)).classes("w-full")
+        hax = hfig.figure.add_subplot(111)
+        P.apply_dark_style(hfig.figure, hax)
+        with ui.row().classes("items-center gap-2"):
+            bins_in = ui.number(label="bins", value=200, min=10, max=5000,
+                                step=50, format="%d").classes("w-24 num")
+            lo_in = ui.number(label="min", value=None).classes("w-28 num") \
+                .tooltip("blank = data minimum")
+            hi_in = ui.number(label="max", value=None).classes("w-28 num") \
+                .tooltip("blank = 99.9th percentile, so a few large pulses "
+                         "do not squeeze the 1-3 PE peaks")
+            logy_sw = ui.switch("log counts", value=False)
+            stats = ui.label("").classes("text-gray-400 text-xs")
+        try:
+            amps, unit = HB.read_amplitudes(state["path"], h5path)
+        except Exception as e:
+            ui.notify(f"read failed: {e}", type="negative")
+            return
+        amps = amps[np.isfinite(amps)]
+
+        def draw(_=None):
+            hax.clear()
+            P.apply_dark_style(hfig.figure, hax)
+            if amps.size == 0:
+                hax.text(0.5, 0.5, "no pulses", ha="center", va="center",
+                         color="#aaa", transform=hax.transAxes)
+                stats.set_text("")
+                hfig.update()
+                return
+            lo = float(lo_in.value) if lo_in.value is not None else float(amps.min())
+            hi = (float(hi_in.value) if hi_in.value is not None
+                  else float(np.percentile(amps, 99.9)) * 1.05)
+            if hi <= lo:
+                hi = lo + 1.0
+            nb = max(10, min(5000, int(bins_in.value or 200)))
+            hax.hist(amps, bins=nb, range=(lo, hi), histtype="stepfilled",
+                     alpha=0.35, color="#58a6ff", edgecolor="#58a6ff")
+            hax.set_yscale("log" if logy_sw.value else "linear")
+            hax.set_xlabel(f"pulse amplitude ({unit})")
+            hax.set_ylabel("pulses / bin")
+            hax.set_title(h5path, fontsize=9)
+            med = float(np.median(amps))
+            hax.axvline(med, color="#f0b429", lw=0.8, ls="--")
+            n_out = int(np.count_nonzero((amps < lo) | (amps > hi)))
+            stats.set_text(f"{amps.size} pulses · median {med:.4g} {unit} · "
+                           f"bin {(hi - lo) / nb:.3g} {unit}"
+                           + (f" · {n_out} outside the range" if n_out else ""))
+            hfig.figure.tight_layout()
+            hfig.update()
+
+        for w in (bins_in, lo_in, hi_in, logy_sw):
+            w.on_value_change(draw)
+        draw()
+
     def _raw_dataset_plot(info, h5path):
         """Plot the dataset's own values (1D directly; one row of a 2D set)."""
+        if info["ndim"] == 1 and HB.is_amplitude_dataset(h5path):
+            _amplitude_hist_plot(h5path)
+            return
         ui.label("raw values").classes("text-gray-400 text-xs mt-1")
         rfig = ui.matplotlib(figsize=(8.5, 2.8)).classes("w-full")
         rax = rfig.figure.add_subplot(111)
@@ -9355,19 +9419,22 @@ def _build_digitizer_tab():
                 .classes("subtab")
             tab_spectrum  = ui.button("spectrum").props("flat dense no-caps") \
                 .classes("subtab")
+            tab_char      = ui.button("characterization").props("flat dense no-caps") \
+                .classes("subtab")
 
         # ----- Containers for each panel -----
         panel_channels  = ui.element("div").classes("dpanel is-active")
         panel_acq       = ui.element("div").classes("dpanel")
         panel_waveforms = ui.element("div").classes("dpanel")
         panel_spectrum  = ui.element("div").classes("dpanel")
+        panel_char      = ui.element("div").classes("dpanel")
 
         def _show(which: str):
             for p in (panel_channels, panel_acq,
-                      panel_waveforms, panel_spectrum):
+                      panel_waveforms, panel_spectrum, panel_char):
                 p.classes(remove="is-active")
             for b in (tab_channels, tab_acq,
-                      tab_waveforms, tab_spectrum):
+                      tab_waveforms, tab_spectrum, tab_char):
                 b.classes(remove="is-active")
             if which == "channels":
                 panel_channels.classes(add="is-active")
@@ -9381,11 +9448,15 @@ def _build_digitizer_tab():
             elif which == "spec":
                 panel_spectrum.classes(add="is-active")
                 tab_spectrum.classes(add="is-active")
+            elif which == "char":
+                panel_char.classes(add="is-active")
+                tab_char.classes(add="is-active")
 
         tab_channels.on_click(lambda: _show("channels"))
         tab_acq.on_click(lambda: _show("acq"))
         tab_waveforms.on_click(lambda: _show("wave"))
         tab_spectrum.on_click(lambda: _show("spec"))
+        tab_char.on_click(lambda: _show("char"))
 
         # ==========================================================
         # CHANNELS panel
@@ -9692,6 +9763,10 @@ def _build_digitizer_tab():
                         if ctrl is None:
                             ui.notify("not connected", type="warning",
                                       position="top", timeout=2500); return
+                        if CHAR_JOB.is_running():
+                            ui.notify("initial characterization is running",
+                                      type="warning", position="top",
+                                      timeout=3000); return
                         n = int(n_wf_n.value or 0)
                         store = bool(store_raw_sw.value)
                         tmo = float(timeout_n.value or 60)
@@ -10213,6 +10288,9 @@ def _build_digitizer_tab():
             spec_clear_btn.on_click(_spec_clear)
             _draw_spectrum()
 
+        with panel_char:
+            _build_char_panel(_chart_opts, _set_series)
+
         # ---- Periodic connect-strip refresh ----
         def _refresh_conn():
             if HUB.dig is None:
@@ -10230,6 +10308,686 @@ def _build_digitizer_tab():
 
         _refresh_conn()
         ui.timer(1.5, _refresh_conn)
+
+_CHAR_POINT_COLORS = ["#3b82f6", "#ef4444", "#10b981", "#a855f7",
+                      "#f59e0b", "#06b6d4"]
+
+
+def _build_char_panel(chart_opts, set_series):
+    """Digitizer tab, 'characterization' sub-tab.
+
+    Left: the initial-characterization form. For each MUX channel the job
+    (CHAR_JOB, so a run outlives the browser that started it) takes N
+    self-triggered waveforms at V_BD,est + each overvoltage, fits
+    A = A0 (V - V_BD) to the median amplitudes, and stores V_BD and A0 in
+    the selected channel table; at the end it posts one lab book entry.
+    Right: sample waveforms, amplitude spectra and the fit for one channel
+    of the latest run. Below: the channel table, editable by hand, which
+    the coarse-sweep generator on the L3 tab reads.
+    """
+    import numpy as _np
+
+    def _user() -> str:
+        return app.storage.user.get("display_name", "") or "anonymous"
+
+    store = app.storage.user
+    for k, v in (("char_table", None), ("char_channels", CH.DEFAULT_MUX_CHANNELS),
+                 ("char_vbd", None), ("char_ovs", "3, 4"), ("char_n", 100),
+                 ("char_thr", None), ("char_settle", 1.0), ("char_pre", 2.0),
+                 ("char_post", 10.0), ("char_timeout", 30), ("char_mux", True),
+                 ("char_lb", True)):
+        store.setdefault(k, v)
+    if store["char_table"] not in CH.list_tables():
+        tables = CH.list_tables()
+        store["char_table"] = tables[0] if tables else None
+
+    def _fld(label: str):
+        el = ui.element("div").classes("fld")
+        with el:
+            ui.html(f'<label class="fld-lbl">{label}</label>')
+        return el
+
+    with ui.element("div").style(
+            "display:grid; grid-template-columns:minmax(330px, 410px) "
+            "minmax(0, 1fr); gap:14px; align-items:start"):
+
+        # ---------------- run form ----------------
+        with ui.card().classes("card-dig"):
+            ui.html('<p class="eyebrow">Initial characterization</p>')
+            with ui.row().classes("items-end w-full no-wrap") \
+                    .style("gap:8px; margin-bottom:6px"):
+                with _fld("Channel table").style("flex:1; min-width:0"):
+                    table_sel = ui.select(CH.list_tables()) \
+                        .props("dense filled hide-bottom-space") \
+                        .bind_value(store, "char_table")
+                ui.button("new", on_click=lambda: _open_new()) \
+                    .props("flat dense").tooltip("new table for a cabling + temperature")
+            table_info = ui.html("").classes("derived")
+
+            with ui.element("div").style(
+                    "display:grid; grid-template-columns:1fr 1fr; gap:10px; "
+                    "margin-top:10px"):
+                with _fld("MUX channels").style("grid-column:1 / span 2"):
+                    with ui.row().classes("items-center no-wrap w-full").style("gap:6px"):
+                        ch_in = ui.input().props("dense filled hide-bottom-space") \
+                            .classes("grow").bind_value(store, "char_channels")
+                        ui.button("table rows", on_click=lambda: _channels_from_table()) \
+                            .props("flat dense no-caps") \
+                            .tooltip("every MUX channel in the table")
+                with _fld("V_BD estimate"):
+                    vbd_n = ui.number(step=0.05, format="%.2f") \
+                        .props('dense filled hide-bottom-space suffix="V"') \
+                        .bind_value(store, "char_vbd")
+                with _fld("Overvoltages"):
+                    ov_in = ui.input().props('dense filled hide-bottom-space suffix="V"') \
+                        .bind_value(store, "char_ovs")
+                with _fld("Waveforms / point"):
+                    n_n = ui.number(min=2, step=50, format="%d") \
+                        .props("dense filled hide-bottom-space") \
+                        .bind_value(store, "char_n")
+                with _fld("Trigger threshold"):
+                    thr_n = ui.number(min=1, step=10, format="%d") \
+                        .props('dense filled hide-bottom-space suffix="ADC"') \
+                        .bind_value(store, "char_thr")
+                with _fld("Settle after bias step"):
+                    settle_n = ui.number(min=0, step=0.5, format="%.1f") \
+                        .props('dense filled hide-bottom-space suffix="s"') \
+                        .bind_value(store, "char_settle")
+                with _fld("Timeout / point"):
+                    tmo_n = ui.number(min=1, step=5, format="%.0f") \
+                        .props('dense filled hide-bottom-space suffix="s"') \
+                        .bind_value(store, "char_timeout")
+                with _fld("Pre-trigger"):
+                    pre_n = ui.number(min=0.1, step=0.5, format="%.2f") \
+                        .props('dense filled hide-bottom-space suffix="µs"') \
+                        .bind_value(store, "char_pre")
+                with _fld("Post-trigger"):
+                    post_n = ui.number(min=0.1, step=0.5, format="%.2f") \
+                        .props('dense filled hide-bottom-space suffix="µs"') \
+                        .bind_value(store, "char_post")
+            with ui.row().classes("items-center w-full").style("gap:14px; margin-top:10px"):
+                mux_sw = ui.switch("switch IV MUX").props("dense") \
+                    .bind_value(store, "char_mux")
+                lb_sw = ui.switch("post to lab book").props("dense") \
+                    .bind_value(store, "char_lb")
+            plan_note = ui.html("").classes("derived")
+            ui.html('<div class="derived">Sets the B2987 bias and reconfigures '
+                    'the digitizer (channel, threshold, window), like an L3 '
+                    'run. Each acquisition also appears in the waveforms and '
+                    'spectrum sub-tabs.</div>')
+            with ui.row().classes("items-center w-full").style("gap:10px; margin-top:12px"):
+                run_btn = ui.button("▶ run", on_click=lambda: _start()) \
+                    .props("color=primary")
+                stop_btn = ui.button("■ stop", on_click=lambda: _stop()) \
+                    .props("color=negative dense disable")
+                status_html = ui.html('<span class="statuspill">idle</span>') \
+                    .style("margin-left:auto")
+            prog = ui.linear_progress(value=0, show_value=False).classes("w-full") \
+                .style("margin-top:8px")
+            log_box = ui.log(max_lines=300).classes("w-full") \
+                .style("height:210px; font-size:11px; margin-top:8px")
+
+        # ---------------- latest run ----------------
+        with ui.card().classes("card-dig"):
+            with ui.row().classes("items-end w-full").style("gap:12px; margin-bottom:6px"):
+                ui.html('<p class="eyebrow" style="margin:0">Latest run</p>')
+                ui.html('<div style="flex:1"></div>')
+                with _fld("Channel").style("width:190px"):
+                    res_sel = ui.select({}).props("dense filled hide-bottom-space")
+                follow_sw = ui.switch("follow", value=True).props("dense")
+            result_html = ui.html("")
+            with ui.element("div").classes("w-full").style(
+                    "display:grid; grid-template-columns:repeat(auto-fit, "
+                    "minmax(300px, 1fr)); gap:10px; margin-top:8px"):
+                wave_chart = ui.echart(chart_opts("time (µs)", "ADC above baseline")) \
+                    .classes("plotbox-dig").style("height:270px")
+                spec_chart = ui.echart(chart_opts("pulse amplitude (ADC)", "pulses")) \
+                    .classes("plotbox-dig").style("height:270px")
+                fit_chart = ui.echart(chart_opts("bias (V)", "median amplitude (ADC)")) \
+                    .classes("plotbox-dig").style("height:270px")
+            wave_chart.options["tooltip"] = {"show": False}
+            spec_chart.options["tooltip"] = {"trigger": "axis"}
+            fit_chart.options["tooltip"] = {"trigger": "item"}
+            run_note = ui.html("").classes("derived")
+
+    # ---------------- channel table ----------------
+    with ui.card().classes("card-dig w-full").style("margin-top:14px"):
+        with ui.row().classes("items-center w-full").style("gap:10px; margin-bottom:8px"):
+            ui.html('<p class="eyebrow" style="margin:0">Channel table</p>')
+            table_title = ui.html("").classes("derived").style("margin:0")
+            ui.html('<div style="flex:1"></div>')
+            add_in = ui.input(placeholder="MUX ch, e.g. 1-16,23-30") \
+                .props("dense filled hide-bottom-space").style("width:190px")
+            ui.button("add rows", on_click=lambda: _add_rows()).props("flat dense no-caps")
+            ui.button("delete ticked", on_click=lambda: _delete_rows()) \
+                .props("flat dense no-caps color=negative")
+            ui.button("export CSV", on_click=lambda: _export_csv()) \
+                .props("flat dense no-caps")
+            ui.button("import CSV", on_click=lambda: csv_dialog.open()) \
+                .props("flat dense no-caps")
+        def _fmt(nd):
+            return f"p => (p.value == null || p.value === '') ? '' : Number(p.value).toFixed({nd})"
+        grid = ui.aggrid({
+            "columnDefs": [
+                {"field": "mux_ch", "headerName": "MUX", "width": 96,
+                 "pinned": "left", "sort": "asc"},
+                {"field": "dig_ch", "headerName": "dig ch", "width": 84,
+                 "editable": True, "cellDataType": "number"},
+                {"field": "sipm", "headerName": "tile SiPM", "width": 98,
+                 "editable": True, "cellDataType": "number"},
+                {"field": "feedthrough", "headerName": "feedthrough", "width": 118,
+                 "editable": True, "cellDataType": "text"},
+                {"field": "vbd_v", "headerName": "V_BD (V)", "width": 104,
+                 "editable": True, "cellDataType": "number",
+                 ":valueFormatter": _fmt(3)},
+                {"field": "vbd_err_v", "headerName": "±", "width": 74,
+                 ":valueFormatter": _fmt(3)},
+                {"field": "a0_adc_per_v", "headerName": "A0 (ADC/V)", "width": 114,
+                 "editable": True, "cellDataType": "number",
+                 ":valueFormatter": _fmt(1)},
+                {"field": "a0_err", "headerName": "±", "width": 70,
+                 ":valueFormatter": _fmt(1)},
+                {"field": "spe3", "headerName": "SPE OV+3", "width": 100,
+                 "headerTooltip": "SPE amplitude at 3 V overvoltage (ADC) = 3 A0"},
+                {"field": "thr3", "headerName": "½SPE OV+3", "width": 106,
+                 "headerTooltip": "0.5 SPE trigger threshold at 3 V overvoltage (ADC)"},
+                {"field": "check", "headerName": "check", "minWidth": 160,
+                 "flex": 2, "tooltipField": "check"},
+                {"field": "source", "headerName": "source", "width": 190,
+                 "tooltipField": "source"},
+                {"field": "notes", "headerName": "notes", "minWidth": 140,
+                 "flex": 1, "editable": True, "cellDataType": "text"},
+            ],
+            "rowData": [],
+            "rowSelection": {"mode": "multiRow"},
+            "defaultColDef": {"resizable": True, "sortable": True},
+            "stopEditingWhenCellsLoseFocus": True,
+            "singleClickEdit": True,
+            ":getRowId": "(p) => String(p.data.mux_ch)",
+        }, auto_size_columns=False).style("height:470px")
+        ui.html('<div class="derived">Click a cell to edit; edits save at once '
+                '(the previous V_BD/A0 stays in the table file\'s history). '
+                'A run overwrites V_BD and A0 of each channel it fits. The L3 '
+                'tab builds the coarse sweep from this table. CSV export '
+                'opens in Excel; an imported CSV needs a mux_ch column and '
+                'fills only non-blank editable cells.</div>')
+
+    with ui.dialog() as csv_dialog, ui.card().classes("daq-card").style("min-width:380px"):
+        ui.label("import CSV into the channel table").classes("text-sm text-gray-200")
+        ui.label("Needs a mux_ch column; reads dig_ch, sipm, feedthrough, "
+                 "vbd_v, a0_adc_per_v and notes where the cell is not blank. "
+                 "The export has the same columns.").classes("text-gray-400 text-xs")
+        ui.upload(auto_upload=True, on_upload=lambda e: _import_csv(e)) \
+            .props('accept=".csv" flat bordered').classes("w-full")
+        with ui.row().classes("justify-end w-full"):
+            ui.button("close", on_click=csv_dialog.close).props("flat dense no-caps")
+
+    # ---------------- new-table dialog ----------------
+    with ui.dialog() as nt_dialog, ui.card().classes("daq-card").style("min-width:360px"):
+        ui.label("new channel table").classes("text-sm text-gray-200")
+        ui.label("One table per MUX cabling at one temperature, e.g. one "
+                 "quad of a tile at 165 K.").classes("text-gray-400 text-xs")
+        nt_tile = ui.input("tile", placeholder="e.g. tile1").props("dense outlined")
+        nt_quad = ui.input("quad / board", placeholder="e.g. Q1").props("dense outlined")
+        nt_temp = ui.number("temperature (K)", value=165, step=1).props("dense outlined")
+        nt_chs = ui.input("MUX channels", value=CH.DEFAULT_MUX_CHANNELS) \
+            .props("dense outlined")
+        nt_name = ui.input("table name").props("dense outlined")
+        nt_err = ui.label("").classes("text-red-400 text-xs")
+        with ui.row().classes("gap-2 justify-end w-full"):
+            ui.button("cancel", on_click=nt_dialog.close).props("flat dense no-caps")
+            ui.button("create", on_click=lambda: _create_table()) \
+                .props("color=primary dense no-caps")
+
+    def _auto_name(_=None):
+        parts = [p.strip() for p in (nt_tile.value, nt_quad.value) if p and p.strip()]
+        if nt_temp.value is not None:
+            parts.append(f"{float(nt_temp.value):g}K")
+        try:
+            nt_name.value = CH.safe_name("_".join(parts))
+        except ValueError:
+            nt_name.value = ""
+    for w in (nt_tile, nt_quad, nt_temp):
+        w.on_value_change(_auto_name)
+
+    def _open_new():
+        nt_err.set_text("")
+        _auto_name()
+        nt_dialog.open()
+
+    def _create_table():
+        try:
+            chs = CH.parse_channels(nt_chs.value)
+            table = CH.new_table(nt_name.value, tile=(nt_tile.value or "").strip(),
+                                 quad=(nt_quad.value or "").strip(),
+                                 temperature_K=(float(nt_temp.value)
+                                                if nt_temp.value is not None else None),
+                                 mux_channels=chs)
+        except Exception as e:
+            nt_err.set_text(f"{type(e).__name__}: {e}")
+            return
+        nt_dialog.close()
+        table_sel.set_options(CH.list_tables(), value=table["name"])
+        ch_in.value = _fmt_channel_list(chs)
+        log.info("characterization table %s created by %s", table["name"], _user())
+
+    # ---------------- table view ----------------
+    def _load_current():
+        name = table_sel.value
+        if not name:
+            return None
+        try:
+            return CH.load_table(name)
+        except FileNotFoundError:
+            return None
+
+    def _grid_rows(table) -> list[dict]:
+        rows = []
+        for r in table["rows"]:
+            d = CH.derived(r)
+            flags = (r.get("initial") or {}).get("flags") or []
+            rows.append({
+                "mux_ch": r["mux_ch"], "dig_ch": r.get("dig_ch"),
+                "sipm": r.get("sipm"), "feedthrough": r.get("feedthrough", ""),
+                "vbd_v": r.get("vbd_v"), "vbd_err_v": r.get("vbd_err_v"),
+                "a0_adc_per_v": r.get("a0_adc_per_v"), "a0_err": r.get("a0_err"),
+                "spe3": d["spe"], "thr3": d["thr"],
+                "check": "; ".join(flags), "source": r.get("source", ""),
+                "notes": r.get("notes", ""),
+            })
+        return rows
+
+    def _render_table():
+        table = _load_current()
+        if table is None:
+            grid.options["rowData"] = []
+            table_info.set_content("no table: press <b>new</b>")
+            table_title.set_content("")
+        else:
+            grid.options["rowData"] = _grid_rows(table)
+            n_fit = sum(1 for r in table["rows"]
+                        if r.get("vbd_v") is not None and r.get("a0_adc_per_v") is not None)
+            t = table.get("temperature_K")
+            desc = " · ".join(x for x in (
+                table.get("tile") and f"tile {html_escape(table['tile'])}",
+                table.get("quad") and f"quad {html_escape(table['quad'])}",
+                f"{t:g} K" if t is not None else "T not set") if x)
+            table_info.set_content(
+                f"{desc} · {len(table['rows'])} rows · {n_fit} with V_BD and A0")
+            table_title.set_content(f"{html_escape(table['name'])} · {desc} · "
+                                    f"updated {table.get('updated', '')}")
+        grid.update()
+        _update_plan_note()
+
+    def _on_cell(e):
+        a = e.args or {}
+        col, row = a.get("colId"), a.get("data") or {}
+        name = table_sel.value
+        if not name or col not in CH.EDITABLE_FIELDS or "mux_ch" not in row:
+            return
+        try:
+            CH.edit_row(name, int(row["mux_ch"]), _user(), **{col: a.get("newValue")})
+            log.info("char table %s: MUX %s %s = %r by %s", name, row["mux_ch"],
+                     col, a.get("newValue"), _user())
+        except Exception as ex:
+            ui.notify(f"not saved: {type(ex).__name__}: {ex}", type="negative",
+                      position="top", timeout=4000)
+        _render_table()
+    grid.on("cellValueChanged", _on_cell)
+
+    def _add_rows():
+        if not table_sel.value:
+            ui.notify("pick or create a table first", type="warning", position="top")
+            return
+        try:
+            chs = CH.parse_channels(add_in.value)
+            CH.add_rows(table_sel.value, chs)
+        except Exception as e:
+            ui.notify(f"{type(e).__name__}: {e}", type="negative", position="top")
+            return
+        add_in.value = ""
+        _render_table()
+
+    async def _delete_rows():
+        if not table_sel.value:
+            return
+        rows = await grid.get_selected_rows()
+        if not rows:
+            ui.notify("tick the rows to delete first", type="warning", position="top")
+            return
+        CH.delete_rows(table_sel.value, [r["mux_ch"] for r in rows])
+        log.info("char table %s: rows %s deleted by %s", table_sel.value,
+                 [r["mux_ch"] for r in rows], _user())
+        _render_table()
+
+    def _export_csv():
+        table = _load_current()
+        if table is None:
+            return
+        ui.download.content(CH.table_to_csv(table), f"{table['name']}.csv",
+                            "text/csv")
+
+    async def _import_csv(e):
+        if not table_sel.value:
+            ui.notify("pick or create a table first", type="warning", position="top")
+            return
+        try:
+            text = (await e.file.read()).decode("utf-8-sig")
+            n = CH.merge_csv(table_sel.value, text, _user())
+        except Exception as ex:
+            ui.notify(f"import failed: {type(ex).__name__}: {ex}",
+                      type="negative", position="top", timeout=5000)
+            return
+        e.sender.reset()
+        csv_dialog.close()
+        ui.notify(f"{n} row(s) updated from {e.file.name}", type="positive",
+                  position="top")
+        _render_table()
+
+    def _channels_from_table():
+        table = _load_current()
+        if table is not None and table["rows"]:
+            ch_in.value = _fmt_channel_list([r["mux_ch"] for r in table["rows"]])
+
+    def _on_table_change(_=None):
+        _render_table()
+        table = _load_current()
+        fitted = [r["vbd_v"] for r in (table or {}).get("rows", [])
+                  if r.get("vbd_v") is not None]
+        if fitted and vbd_n.value is None:
+            vbd_n.value = round(float(_np.mean(fitted)), 2)
+    table_sel.on_value_change(_on_table_change)
+
+    # ---------------- run ----------------
+    def _plan() -> CH.InitialPlan:
+        name = table_sel.value
+        if not name:
+            raise ValueError("pick or create a channel table first")
+        if vbd_n.value is None:
+            raise ValueError("enter a V_BD estimate")
+        if thr_n.value is None:
+            raise ValueError("enter a trigger threshold (ADC)")
+        chs = CH.parse_channels(ch_in.value)
+        if mux_sw.value:
+            n_max = int(HUB.config.ivmux_channels)
+            bad = [c for c in chs if not 1 <= c <= n_max]
+            if bad:
+                raise ValueError(f"MUX channels {bad} outside 1-{n_max}")
+        table = CH.load_table(name)
+        missing = [c for c in chs if CH.get_row(table, c) is None]
+        if missing:
+            table = CH.add_rows(name, missing)
+        pairs = []
+        for c in chs:
+            dig = CH.get_row(table, c).get("dig_ch")
+            if dig is None or not 0 <= int(dig) <= 63:
+                raise ValueError(f"MUX {c}: digitizer channel {dig!r} not in 0-63")
+            pairs.append((c, int(dig)))
+        return CH.InitialPlan(
+            table=name, channels=pairs, vbd_est_v=float(vbd_n.value),
+            ov_v=CH.parse_floats(ov_in.value), n_waveforms=int(n_n.value or 0),
+            threshold_adc=int(thr_n.value), pre_us=float(pre_n.value or 2.0),
+            post_us=float(post_n.value or 10.0),
+            settle_s=float(settle_n.value or 0), timeout_s=float(tmo_n.value or 30),
+            switch_mux=bool(mux_sw.value), temperature_K=table.get("temperature_K"),
+            user=_user())
+
+    def _update_plan_note(_=None):
+        try:
+            chs = CH.parse_channels(ch_in.value)
+            ovs = CH.parse_floats(ov_in.value)
+        except ValueError as e:
+            plan_note.set_content(f'<span style="color:var(--warn)">{html_escape(str(e))}</span>')
+            return
+        if vbd_n.value is None or not ovs:
+            plan_note.set_content(f"{len(chs)} channel(s) · enter V_BD and OVs")
+            return
+        bias = ", ".join(f"{float(vbd_n.value) + ov:.2f}" for ov in ovs)
+        per_ch = len(ovs) * (float(settle_n.value or 0) + 2.0) + 0.5
+        plan_note.set_content(
+            f"{len(chs)} channel(s) · bias {bias} V · roughly "
+            f"{len(chs) * per_ch / 60:.1f} min at a few hundred Hz trigger rate")
+    for w in (ch_in, vbd_n, ov_in, settle_n):
+        w.on_value_change(_update_plan_note)
+
+    async def _start():
+        try:
+            plan = _plan()
+        except Exception as e:
+            ui.notify(str(e), type="warning", position="top", timeout=4000)
+            return
+        if L3_JOB.is_running():
+            ui.notify("an L3 sequence is running", type="warning", position="top")
+            return
+        missing = [n for n, inst in (("B2987", HUB.elec), ("digitizer", HUB.dig))
+                   if inst is None]
+        if plan.switch_mux and HUB.ivmux is None:
+            missing.append("IV MUX")
+        if missing:
+            ui.notify("not connected: " + ", ".join(missing), type="warning",
+                      position="top", timeout=4000)
+            return
+        if _bias_lock_refuses(plan.bias_points(), "initial characterization"):
+            return
+        try:
+            claimed = CHAR_JOB.claim(plan)
+        except Exception as e:
+            ui.notify(f"{type(e).__name__}: {e}", type="negative", position="top")
+            return
+        if not claimed:
+            ui.notify("an initial characterization is already running",
+                      type="warning", position="top")
+            return
+        post = bool(lb_sw.value)
+        loop = asyncio.get_running_loop()
+
+        def on_acq(acq, n_req):
+            loop.call_soon_threadsafe(_dig_history_add, acq, "self", n_req, True)
+
+        def on_finish(job):
+            if post:
+                entry_id = CH.post_labbook(job, slowcontrol=HUB.sc)
+                if entry_id:
+                    job.labbook_id = entry_id
+                    job.log(f"lab book entry posted ({entry_id[:8]})")
+
+        async def _job():
+            set_activity("initial characterization",
+                         f"{plan.table} · {len(plan.channels)} channel(s)")
+            try:
+                await _run_in_thread(CHAR_JOB.run_claimed, HUB.instruments,
+                                     on_acquisition=on_acq, on_finish=on_finish)
+            except Exception:
+                pass      # recorded in CHAR_JOB (status, log) for every viewer
+            finally:
+                clear_activity()
+
+        background_tasks.create(_job(), name="initial-characterization")
+
+    async def _stop():
+        CHAR_JOB.request_abort()
+        ctrl = getattr(HUB.dig, "_ctrl", None) if HUB.dig is not None else None
+        if ctrl is not None:
+            try:
+                await _run_in_thread(ctrl.disarm)
+            except Exception as e:
+                log.warning("initial char stop: disarm raised %s", e)
+
+    # ---------------- latest-run plots ----------------
+    def _wave_series(r, plan):
+        dt_us = 1e6 / CH.SAMPLE_RATE_HZ
+        series = []
+        for i, p in enumerate(r["points"]):
+            color = _CHAR_POINT_COLORS[i % len(_CHAR_POINT_COLORS)]
+            for w in p["samples"]:
+                series.append({
+                    "type": "line", "name": f"{p['bias_v']:.2f} V",
+                    "showSymbol": False, "silent": True,
+                    "data": [[round(k * dt_us, 3), round(float(y), 1)]
+                             for k, y in enumerate(w)],
+                    "lineStyle": {"width": 0.8, "color": color, "opacity": 0.75},
+                    "itemStyle": {"color": color},
+                })
+        if series:
+            series[0]["markLine"] = {
+                "silent": True, "symbol": "none",
+                "data": [{"yAxis": plan.threshold_adc}],
+                "lineStyle": {"color": "#8a93a6", "type": "dotted"},
+                "label": {"formatter": "threshold", "color": "#8a93a6",
+                          "fontSize": 10, "position": "insideEndTop"}}
+        return series
+
+    def _spec_series(r, plan):
+        pts = [p for p in r["points"] if p["n"]]
+        if not pts:
+            return []
+        hi = max(float(_np.percentile(p["amplitudes"], 99.5)) for p in pts) * 1.1
+        edges = _np.linspace(0.0, max(hi, 2.0 * plan.threshold_adc), 61)
+        centers = ((edges[:-1] + edges[1:]) / 2).tolist()
+        series = []
+        for i, p in enumerate(r["points"]):
+            if not p["n"]:
+                continue
+            color = _CHAR_POINT_COLORS[i % len(_CHAR_POINT_COLORS)]
+            counts = _np.histogram(p["amplitudes"], bins=edges)[0].tolist()
+            series.append({
+                "type": "line", "step": "middle", "showSymbol": False,
+                "name": f"{p['bias_v']:.2f} V · median {p['median']:.0f}",
+                "data": [[round(x, 1), c] for x, c in zip(centers, counts)],
+                "lineStyle": {"width": 1.4, "color": color},
+                "itemStyle": {"color": color},
+                "areaStyle": {"color": color, "opacity": 0.12},
+                "markLine": {"silent": True, "symbol": "none",
+                             "data": [{"xAxis": round(p["median"], 1)}],
+                             "lineStyle": {"color": color, "type": "dashed"},
+                             "label": {"show": False}},
+            })
+        series[0]["markLine"]["data"].append({"xAxis": plan.threshold_adc})
+        return series
+
+    def _fit_series(r):
+        pts = [p for p in r["points"] if p["n"]]
+        series = [{
+            "type": "scatter", "name": "median", "symbolSize": 8,
+            "data": [[p["bias_v"], round(p["median"], 1)] for p in pts],
+            "itemStyle": {"color": "#dde3ee"},
+        }]
+        for p in pts:
+            e = p["median_err"] if _np.isfinite(p["median_err"]) else 0.0
+            series.append({
+                "type": "line", "name": "median", "showSymbol": False,
+                "silent": True, "data": [[p["bias_v"], p["median"] - e],
+                                         [p["bias_v"], p["median"] + e]],
+                "lineStyle": {"color": "#dde3ee", "width": 1}})
+        fit = r.get("fit")
+        if fit and fit["ok"]:
+            vmax = max(p["bias_v"] for p in pts) + 0.5
+            series.append({
+                "type": "line", "name": "A0 (V - V_BD)", "showSymbol": False,
+                "data": [[round(fit["vbd"], 3), 0.0],
+                         [round(vmax, 3), round(fit["a0"] * (vmax - fit["vbd"]), 1)]],
+                "lineStyle": {"color": "#ef4444", "width": 1.4},
+                "itemStyle": {"color": "#ef4444"},
+                "markLine": {"silent": True, "symbol": "none",
+                             "data": [{"xAxis": round(fit["vbd"], 3)}],
+                             "lineStyle": {"color": "#ef4444", "type": "dotted"},
+                             "label": {"formatter": "V_BD", "color": "#ef4444",
+                                       "fontSize": 10}}})
+        return series
+
+    def _result_text(r) -> str:
+        fit = r.get("fit")
+        if fit and fit["ok"]:
+            head = (f'<b>MUX {r["mux_ch"]}</b> · V_BD <b>{fit["vbd"]:.3f}</b> ± '
+                    f'{fit["vbd_err"]:.3f} V · A0 <b>{fit["a0"]:.1f}</b> ± '
+                    f'{fit["a0_err"]:.1f} ADC/V · SPE at OV+3 {3 * fit["a0"]:.0f} ADC')
+        elif fit is None:
+            head = f'<b>MUX {r["mux_ch"]}</b> · acquiring…'
+        else:
+            head = f'<b>MUX {r["mux_ch"]}</b> · no fit'
+        pts = " · ".join(
+            f'{p["bias_v"]:.2f} V: median {p["median"]:.0f} ± {p["median_err"]:.0f} '
+            f'({p["n"]} pulses / {p["n_waveforms"]} wfs'
+            + (f', {p["rate_hz"]:.0f} Hz' if _np.isfinite(p["rate_hz"]) else "")
+            + ")" for p in r["points"])
+        flags = "".join(f'<div style="color:var(--warn)">check: {html_escape(f)}</div>'
+                        for f in r["flags"])
+        return (f'<div style="font-size:13px">{head}</div>'
+                f'<div class="derived">{pts}</div>{flags}')
+
+    def _draw(snap):
+        results = snap["results"]
+        plan = snap["plan"]
+        idx = res_sel.value
+        if idx is None or not 0 <= idx < len(results):
+            for c in (wave_chart, spec_chart, fit_chart):
+                set_series(c, [])
+            result_html.set_content('<span class="derived">no run yet</span>'
+                                    if not results else "")
+            return
+        r = results[idx]
+        set_series(wave_chart, _wave_series(r, plan))
+        set_series(spec_chart, _spec_series(r, plan))
+        set_series(fit_chart, _fit_series(r))
+        result_html.set_content(_result_text(r))
+
+    seen = {"gen": None, "version": None, "log_seq": 0, "rev": None,
+            "running": None}
+
+    def _tick():
+        snap = CHAR_JOB.snapshot()
+        if snap["generation"] != seen["gen"]:
+            seen["gen"] = snap["generation"]
+            seen["log_seq"] = 0
+            log_box.clear()
+        for seq, line in snap["logs"]:
+            if seq > seen["log_seq"]:
+                log_box.push(line)
+                seen["log_seq"] = seq
+        if snap["running"] != seen["running"]:
+            seen["running"] = snap["running"]
+            if snap["running"]:
+                run_btn.props("disable")
+                stop_btn.props(remove="disable")
+            else:
+                run_btn.props(remove="disable")
+                stop_btn.props("disable")
+        if snap["version"] != seen["version"]:
+            seen["version"] = snap["version"]
+            prog.value = snap["progress"]
+            color = {"running": "var(--warn)", "done": "var(--ok)",
+                     "failed": "var(--bad)", "stopped": "var(--warn)"}.get(
+                         snap["status"], "var(--mut)")
+            status_html.set_content(f'<span class="statuspill" style="color:{color}">'
+                                    f'{snap["status"]}</span>')
+            results = snap["results"]
+            res_sel.set_options({i: f"MUX {r['mux_ch']} · dig {r['dig_ch']}"
+                                 for i, r in enumerate(results)})
+            if results and (follow_sw.value or res_sel.value is None
+                            or res_sel.value >= len(results)):
+                res_sel.value = len(results) - 1
+            _draw(snap)
+            notes = []
+            if snap["h5_path"] and snap["generation"]:
+                notes.append(f"HDF5: {CH._rel_data_path(snap['h5_path'])}")
+            if snap["labbook_id"]:
+                notes.append(f"lab book entry {snap['labbook_id'][:8]}")
+            if snap["error"]:
+                notes.append(f'<span style="color:var(--bad)">'
+                             f'{html_escape(snap["error"])}</span>')
+            run_note.set_content(" · ".join(notes))
+        if CH.revision() != seen["rev"]:
+            seen["rev"] = CH.revision()
+            tables = CH.list_tables()
+            if set(tables) != set(table_sel.options or []):
+                table_sel.set_options(tables, value=table_sel.value
+                                      if table_sel.value in tables else None)
+            _render_table()
+
+    res_sel.on_value_change(lambda _e: _draw(CHAR_JOB.snapshot()))
+    _render_table()
+    ui.timer(0.5, _tick)
+
 
 def _build_level3_tab():
     import copy
@@ -10321,6 +11079,16 @@ def _build_level3_tab():
                 b_pc_bias = ui.input(label="bias points (V, comma-sep)",
                                      value=f"{HUB.config.pulse_bias_v:.2f}").classes("w-full")
                 with ui.row().classes("gap-2 items-center"):
+                    b_pc_spe_use = ui.switch("thr follows SPE", value=False).tooltip(
+                        "trigger at (x SPE) * A0 * (bias - V_BD) at every bias "
+                        "point instead of the fixed thr (ADC)")
+                    b_pc_vbd = ui.number(label="V_BD (V)", value=None, step=0.01,
+                                         format="%.3f").classes("w-24 num")
+                    b_pc_a0  = ui.number(label="A0 (ADC/V)", value=None,
+                                         step=1).classes("w-24 num")
+                    b_pc_pe  = ui.number(label="thr (x SPE)", value=0.5, step=0.05,
+                                         format="%.2f").classes("w-24 num")
+                with ui.row().classes("gap-2 items-center"):
                     b_pc_nwf_dark  = ui.number(label="n wfm (dark)",  value=HUB.config.pulse_n_waveforms, step=100, format="%d").classes("w-32 num")
                     b_pc_nwf_illum = ui.number(label="n wfm (illum)", value=HUB.config.pulse_n_waveforms, step=100, format="%d").classes("w-32 num")
                     b_pc_store = ui.switch("store raw", value=False)
@@ -10367,6 +11135,61 @@ def _build_level3_tab():
                       on_click=lambda: (specs.clear(), refresh_list(), log_msg("cleared"))) \
                 .props("color=negative flat").classes("mt-1")
 
+    # ---------------- coarse sweep from a characterization table ----------
+    with ui.card().classes("daq-card w-full"):
+        ui.html("<h2>coarse sweep from a characterization table</h2>")
+        ui.label("Appends one dark pulse entry (no IV) per table row that has "
+                 "V_BD and A0, from the digitizer tab's characterization "
+                 "sub-tab: bias at V_BD + each overvoltage, trigger at the "
+                 "given fraction of the SPE amplitude at every bias point.") \
+            .classes("text-gray-400 text-xs")
+        with ui.row().classes("gap-2 items-end"):
+            g_table = ui.select(CH.list_tables(), label="table").classes("w-56")
+            ui.button(icon="refresh", on_click=lambda: g_table.set_options(
+                CH.list_tables(), value=g_table.value)) \
+                .props("flat dense round size=sm").tooltip("re-read the table list")
+            g_chs = ui.input(label="MUX channels (blank = all)").classes("w-44")
+            g_ovs = ui.input(label="overvoltages (V)", value="2, 3, 4, 5, 6").classes("w-40")
+            g_n = ui.number(label="n wfm / step", value=1000, min=1, step=100,
+                            format="%d").classes("w-28 num")
+            g_pe = ui.number(label="thr (x SPE)", value=0.5, min=0.05, step=0.05,
+                             format="%.2f").classes("w-24 num")
+            g_pre = ui.number(label="pre (µs)", value=HUB.config.pulse_pre_us,
+                              step=0.5).classes("w-20 num")
+            g_post = ui.number(label="post (µs)", value=HUB.config.pulse_post_us,
+                               step=0.5).classes("w-20 num")
+            g_store = ui.switch("store raw", value=True)
+            ui.button("append to list ▶", on_click=lambda: append_coarse()) \
+                .props("color=primary")
+
+    def append_coarse():
+        if not g_table.value:
+            log_msg("pick a characterization table"); return
+        try:
+            table = CH.load_table(g_table.value)
+            chs = CH.parse_channels(g_chs.value) if (g_chs.value or "").strip() else None
+            ovs = CH.parse_floats(g_ovs.value)
+            if not ovs:
+                raise ValueError("no overvoltages")
+            new, skipped = CH.coarse_specs(
+                table, ov_v=ovs, n_waveforms=int(g_n.value),
+                threshold_pe=float(g_pe.value), pre_us=float(g_pre.value),
+                post_us=float(g_post.value), store_raw=bool(g_store.value),
+                mux_channels=chs)
+        except Exception as e:
+            log_msg(f"coarse sweep: {type(e).__name__}: {e}"); return
+        specs.extend(new)
+        refresh_list()
+        log_msg(f"coarse sweep: {len(new)} entries from {table['name']} "
+                f"({len(new) * len(ovs)} bias points x {int(g_n.value)} waveforms)")
+        by_reason: dict = {}
+        for ch, why in skipped:
+            by_reason.setdefault(why, []).append(ch)
+        for why, chs_ in by_reason.items():
+            log_msg(f"skipped ({why}): MUX {_fmt_channel_list(chs_)}")
+        if new and run_id.value.strip() in ("", "run_001"):
+            run_id.value = f"{table['name']}_coarse"
+
     # ---------------- run / save / load ----------------
     with ui.card().classes("daq-card w-full"):
         ui.html("<h2>run</h2>")
@@ -10397,6 +11220,10 @@ def _build_level3_tab():
     def _collect_form() -> MeasurementSpec:
         import numpy as np
         cond = str(b_cond.value)
+        follow_spe = bool(en_pulse.value and b_pc_spe_use.value)
+        if follow_spe and (b_pc_vbd.value is None or b_pc_a0.value is None
+                           or b_pc_pe.value is None):
+            raise ValueError("'thr follows SPE' needs V_BD, A0 and thr (x SPE)")
         start, stop, step = float(b_iv_start.value), float(b_iv_stop.value), float(b_iv_step.value)
         ivv = (np.arange(start, stop + step * 0.5, step).round(6).tolist()
                if step > 0 else [start])
@@ -10417,6 +11244,9 @@ def _build_level3_tab():
             pulse_pre_us=float(b_pc_pre.value), pulse_post_us=float(b_pc_post.value),
             pulse_store_waveforms=bool(b_pc_store.value),
             n_waveforms_dark=int(b_pc_nwf_dark.value), n_waveforms_illum=int(b_pc_nwf_illum.value),
+            vbd_v=float(b_pc_vbd.value) if follow_spe else None,
+            spe_adc_per_v=float(b_pc_a0.value) if follow_spe else None,
+            pulse_threshold_pe=float(b_pc_pe.value) if follow_spe else None,
             scan_axis=str(b_scan_axis.value), scan_light=str(b_scan_light.value),
             scan_meter=str(b_scan_meter.value), scan_bias_v=float(b_scan_bias.value),
             scan_start_mm=float(b_scan_start.value), scan_stop_mm=float(b_scan_stop.value),
@@ -10450,6 +11280,10 @@ def _build_level3_tab():
         b_pc_bias.value = ", ".join(f"{v:.2f}" for v in s.pulse_bias_v)
         b_pc_nwf_dark.value, b_pc_nwf_illum.value = s.n_waveforms_dark, s.n_waveforms_illum
         b_pc_store.value = s.pulse_store_waveforms
+        b_pc_spe_use.value = s.pulse_threshold_pe is not None
+        b_pc_vbd.value, b_pc_a0.value = s.vbd_v, s.spe_adc_per_v
+        if s.pulse_threshold_pe is not None:
+            b_pc_pe.value = s.pulse_threshold_pe
         b_scan_axis.value, b_scan_light.value = s.scan_axis, s.scan_light
         b_scan_meter.value, b_scan_bias.value = s.scan_meter, s.scan_bias_v
         b_scan_start.value, b_scan_stop.value, b_scan_step.value = s.scan_start_mm, s.scan_stop_mm, s.scan_step_mm
@@ -10467,7 +11301,13 @@ def _build_level3_tab():
             parts.append(f"IV[{s.iv_voltages[0]:g}-{s.iv_voltages[-1]:g} "
                          f"{s.iv_meter}, settle {s.iv_delay_s:g}s]")
         if s.do_pulse:
-            parts.append(f"pulse[bias {','.join(f'{v:g}' for v in s.pulse_bias_v)}]")
+            if s.pulse_threshold_pe is not None:
+                thr = (f"thr {s.pulse_threshold_pe:g} SPE, V_BD {s.vbd_v:g}, "
+                       f"A0 {s.spe_adc_per_v:g}")
+            else:
+                thr = f"thr {s.pulse_threshold_adc} ADC"
+            parts.append(f"pulse[ch{s.pulse_capture_ch} bias "
+                         f"{','.join(f'{v:g}' for v in s.pulse_bias_v)}; {thr}]")
         if s.do_scan:
             parts.append(f"scan[{s.scan_axis} {s.scan_start_mm:g}..{s.scan_stop_mm:g}]")
         lbl = f"  ({s.label})" if s.label else ""
@@ -10501,7 +11341,10 @@ def _build_level3_tab():
     def update_entry():
         i = editing["i"]
         if i is None: return
-        specs[i] = _collect_form()
+        try:
+            specs[i] = _collect_form()
+        except Exception as e:
+            log_msg(f"bad form: {type(e).__name__}: {e}"); return
         editing["i"] = None
         update_btn.set_visibility(False); add_btn.set_visibility(True)
         refresh_list(); log_msg(f"updated row {i+1}")
@@ -10641,6 +11484,7 @@ def _build_level3_tab():
 
     def run_seq():
         if not specs: log_msg("no entries"); return
+        if CHAR_JOB.is_running(): log_msg("initial characterization is running"); return
         if HUB.elec is None: log_msg("electrometer not connected"); return
         if not run_dir.value.strip(): log_msg("run directory is empty"); return
         try:

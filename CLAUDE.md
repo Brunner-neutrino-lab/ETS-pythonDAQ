@@ -58,6 +58,8 @@ Key files:
 | `daq/config.py` | `ExperimentConfig` dataclass with lab defaults |
 | `daq/plotting.py` | `PLOTS` registry — every plot the GUI/bench can render |
 | `scripts/bench_test.py` | Closed-loop sweep harness (CLI: `--skip-iv`, `--only`, `--vbd`, `--no-plot`) |
+| `daq/characterization.py` | Tile initial characterization (median amplitude at 2 biases, A = A0 (V - V_BD)), per-quad channel tables, coarse-sweep L3 specs. UI: digitizer tab > characterization |
+| `docs/tile_characterization.md`, `docs/tile_characterization_workbook.xlsx` | Operator guide and the per-tile Excel workbook (cabling, initial, coarse, shift log) |
 | `data/last_vbd.json` | V_BD cache written by every successful IV |
 | `data/bench_*.h5` | Per-run HDF5 outputs |
 | `plots/*.png` | Auto-rendered plots (one per registered plot type per run) |

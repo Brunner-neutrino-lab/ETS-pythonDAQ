@@ -12,6 +12,107 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-10-02 (evening) — Tile characterization: workbook, initial char in the digitizer tab, coarse sweep from a table
+
+From the nEXO photodetector meeting: before final measurements, each
+temperature gets an *initial* characterization (per SiPM: 100 waveforms at
+OV+3 and OV+4, median amplitude, A = A0 (V - V_BD)) and a *coarse* one
+(per quad: OV+2..+6 in 1 V steps, 1000 waveforms each). Lucas asked for
+sheets to fill in, a log page, a way to enter V_BD/A0 per channel and sweep
+a quad from them, a quick analysis that posts to the lab book, and an
+amplitude histogram in the Data tab.
+
+### Changed
+- `daq/characterization.py` (new, no GUI): median + MAD error, weighted
+  line fit with propagated errors, flags, channel tables
+  (`data/characterization/<table>.json`, one per quad cabling and
+  temperature, history of replaced V_BD/A0), CSV export/merge, the
+  `run_initial` loop (bias off and MUX switch between channels, HDF5
+  `data/characterization/<table>/initial_*.h5` with every waveform),
+  `InitialCharJob` (app-owned like L3_JOB), lab book entry with a PNG per
+  channel plus a summary, `coarse_specs` for L3.
+- Digitizer tab: 5th sub-tab **characterization**: form (inputs persist
+  per browser via `app.storage.user["char_*"]`), latest-run plots
+  (waveforms, spectra, median vs V with fit), editable AG Grid of the table,
+  CSV import/export. Each acquisition also goes to `DIG_HISTORY`, so the
+  waveforms/spectrum viewers can step through it.
+- `daq/sequence.py`: `MeasurementSpec.vbd_v`, `spe_adc_per_v`,
+  `pulse_threshold_pe`; `pulse_threshold_for()` makes the trigger follow
+  pe x A0 x (V - V_BD) per bias point; the per-point HDF5 attrs record the
+  threshold used. `spec_to_dict` drops these when unset so the
+  `sequence_hash` of older sequences (checked on resume) is unchanged.
+- L3 tab: "thr follows SPE" fields in the pulse builder, and a "coarse
+  sweep from a characterization table" card that appends one entry per
+  row. L3 and the initial characterization refuse to start while the
+  other runs; so does the digitizer tab's own acquisition.
+- Data tab: a 1-D `amplitudes_v`/`amplitudes_adc` dataset shows a histogram
+  (bins, range, log counts) instead of value vs index. VX2740
+  `amplitudes_v` is converted back to ADC (x 32768, `source` attr on an
+  enclosing group). The default upper edge is the 99.9th percentile.
+- `docs/tile_characterization_workbook.xlsx`: Start here (procedure mapped
+  to the app), Connections (96 rows, Q1-Q4 x MUX 1-16,23-30), Initial char
+  (A0, V_BD, thr/SPE formulas, 3-sigma V_BD highlight), Coarse char (bias
+  and 0.5 SPE thresholds for OV 2-6), Shift log. 2605 formulas, 0 errors
+  after a LibreOffice recalc; a filled copy gave A0 289, V_BD 45.017 for
+  A1 862 / A2 1151 at 48/49 V. Generated with openpyxl installed into the
+  session scratchpad only (not in any env); the generator script was not
+  kept.
+- `docs/tile_characterization.md`: operator guide.
+
+### Decisions
+- **Median, as asked.** It stays close to the SPE peak despite the
+  crosstalk tail. The flags cover the case where it does not: a threshold
+  outside 0.3-0.7 SPE at the first point gives a suggested re-run value.
+- **A fit with V_BD > 1.5 V from the estimate is not stored in the
+  table**, because the coarse sweep biases straight from it. Found in
+  testing: the simulated ch 4 (a PMT channel in the sim) fitted V_BD
+  -603 V, and the generator built -601 V bias points. The B2987 lock
+  (|V|) would have refused the L3 run, but now the table and
+  `coarse_specs` (non-positive V_BD/A0) both refuse too.
+- One N for both points (plan says 10 at OV+4; 100 recommended, since the
+  median error goes as 1/sqrt(N)).
+- No V_BD or threshold default in the form. They are required inputs:
+  guessing a bias is not safe, and a guessed threshold invites a biased
+  median.
+
+### Observed in existing data
+- Lei's `run_002_BoardB_165K_pulse` at 49 V, threshold 1000 ADC: the
+  spectrum starts abruptly at ~1000 ADC, and the 2 PE bump is at ~2500, so
+  SPE is ~1250 ADC and the trigger sat at ~0.8 SPE, cutting the SPE peak.
+  The initial characterization exists to catch this.
+
+### Testing
+- `tests/test_characterization.py`: 18 `unittest` cases (fit and errors,
+  table edits and CSV, fake-bench run recovering known V_BD/A0, flags,
+  stop mid-channel, bias-lock refusal, job + lab book post, hash
+  stability, threshold rule, amplitude read). With `test_labbook`: 29 OK.
+- Browser: isolated copy on 127.0.0.1:8799 with the sim VX2740 (SPE set
+  to A0 (V - V_BD) per MUX channel by hooking the sim B2987's set_bias), sim
+  B2987 and sim IV MUX; lab book, tables and data root in the scratchpad;
+  headless Chrome over CDP. Checked: table creation, runs of 5, 2 and 9
+  channels, reload mid-run (state kept), stop, lab book entries and PNGs,
+  grid edits (real mouse events; a synthetic dblclick does not start AG
+  Grid editing), CSV import, L3 generator and editing a generated entry,
+  Data tab histogram on Lei's real 3.5 GB L3 file (read-only). No JS
+  exceptions. Harness and scripts in the scratchpad, not kept.
+- **Not run on hardware.**
+
+### Deployed
+- `daq-webapp` was restarted at 17:39:21 (not from this session) after the
+  last code edit (17:15), so it runs all of the above; startup clean (the
+  only error is the webcam: `/dev/video0` could not be opened). When asked
+  to restart at 17:57, nothing was redone: Lei had reconnected at 17:39:23,
+  and a second restart would only have dropped her page and instruments.
+
+### Open threads
+- First hardware run: check that the VX2740 trigger rate / timestamps
+  give a sensible "Hz" in the result line (the sim's are meaningless),
+  and that 100 waveforms at ~60-400 Hz finish well inside the 30 s timeout.
+- Nothing committed. This branch also still carries the uncommitted
+  2026-10-01 lab book work.
+
+---
+
 ## 2026-10-02 — Remote development from an offsite Windows PC
 
 Question: how to use Claude Desktop on an offsite Windows machine to develop

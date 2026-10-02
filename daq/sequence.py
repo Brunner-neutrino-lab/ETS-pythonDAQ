@@ -85,6 +85,14 @@ class MeasurementSpec:
     n_waveforms_dark:    int   = 10000
     n_waveforms_illum:   int   = 10000
 
+    # --- this SiPM's gain (from the initial characterization) ---
+    # With all three set the trigger follows the SPE amplitude:
+    # threshold = pulse_threshold_pe * spe_adc_per_v * (bias - vbd_v) at
+    # every bias point, instead of the fixed pulse_threshold_adc.
+    vbd_v:               Optional[float] = None
+    spe_adc_per_v:       Optional[float] = None   # A0, ADC counts per V of OV
+    pulse_threshold_pe:  Optional[float] = None
+
     # --- 1-D scan (runs once, in its own condition) ---
     scan_axis:        str   = "x"            # "x" | "y"
     scan_light:       str   = "vuv"          # "vuv" (ch1) | "laser" (ch2)
@@ -116,8 +124,17 @@ class SequenceFile:
 # YAML serialization
 # ---------------------------------------------------------------------------
 
+_GAIN_FIELDS = ("vbd_v", "spe_adc_per_v", "pulse_threshold_pe")
+
+
 def spec_to_dict(spec: MeasurementSpec) -> dict:
-    return dataclasses.asdict(spec)
+    # Unset gain fields are left out so a sequence written before they
+    # existed keeps its sequence_hash, which resume checks.
+    d = dataclasses.asdict(spec)
+    for k in _GAIN_FIELDS:
+        if d[k] is None:
+            del d[k]
+    return d
 
 
 def spec_from_dict(d: dict) -> MeasurementSpec:
@@ -306,6 +323,17 @@ def _exec_iv(spec, instruments, config, illuminated,
             pass
 
 
+def pulse_threshold_for(spec: MeasurementSpec, bias_v: float) -> int:
+    """Capture-channel trigger threshold (ADC) at one bias point."""
+    if (spec.pulse_threshold_pe is not None and spec.vbd_v is not None
+            and spec.spe_adc_per_v is not None):
+        thr = (spec.pulse_threshold_pe * spec.spe_adc_per_v
+               * (float(bias_v) - spec.vbd_v))
+        if thr >= 1:
+            return int(round(thr))
+    return int(spec.pulse_threshold_adc)
+
+
 def _exec_pulse(spec, instruments, config, illuminated, bias_v):
     elec = instruments.get("elec")
     dig  = instruments.get("digitizer")
@@ -316,7 +344,7 @@ def _exec_pulse(spec, instruments, config, illuminated, bias_v):
         raise RuntimeError("digitizer backend has no controller (_ctrl)")
     n = spec.n_waveforms_illum if illuminated else spec.n_waveforms_dark
     ch  = max(0, min(63, int(spec.pulse_capture_ch)))
-    thr = int(spec.pulse_threshold_adc)
+    thr = pulse_threshold_for(spec, bias_v)
     sipm_chs = [ch]
     thresholds = {ch: thr}
     if spec.pulse_aux_ch is not None and int(spec.pulse_aux_ch) != ch:
@@ -608,9 +636,12 @@ def run_sequence(specs, instruments, config,
                                    "x_mm": spec.x_mm, "y_mm": spec.y_mm,
                                    "label": spec.label,
                                    "capture_ch": spec.pulse_capture_ch,
-                                   "threshold_adc": spec.pulse_threshold_adc,
+                                   "threshold_adc": pulse_threshold_for(spec, bias_v),
                                    "aux_ch": spec.pulse_aux_ch,
-                                   "aux_thr_adc": spec.pulse_aux_thr_adc})
+                                   "aux_thr_adc": spec.pulse_aux_thr_adc,
+                                   "vbd_v": spec.vbd_v,
+                                   "spe_adc_per_v": spec.spe_adc_per_v,
+                                   "threshold_pe": spec.pulse_threshold_pe})
                     grp = (f"/seq/{idx}/{spec.sipm_id}/{spec.temperature_K:.1f}K/"
                            f"{_cond_key(illum)}/pulse/{_bias_mv(bias_v)}mV")
                 else:  # scan

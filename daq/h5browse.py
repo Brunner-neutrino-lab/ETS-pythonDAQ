@@ -308,6 +308,42 @@ def node_detail(path, h5path: str) -> dict:
         }
 
 
+_AMPLITUDE_DATASETS = ("amplitudes_adc", "amplitudes_v")
+
+
+def is_amplitude_dataset(h5path: str) -> bool:
+    """Pulse-amplitude datasets (one value per pulse) are viewed as a
+    spectrum, not against their index."""
+    return h5path.rstrip("/").rsplit("/", 1)[-1] in _AMPLITUDE_DATASETS
+
+
+def read_amplitudes(path, h5path: str) -> tuple[np.ndarray, str]:
+    """Amplitudes and their unit, in ADC counts whenever possible.
+
+    amplitudes_v from the VX2740 (``source`` attr on an enclosing group)
+    are counts / 32768 (daq.digitizer), so they convert back exactly; any
+    other amplitudes_v stay in volts.
+    """
+    from daq.digitizer import VX2740_COUNTS_PER_V
+    with h5py.File(path, "r") as f:
+        obj = f[h5path]
+        values = np.asarray(obj[...], dtype=float).ravel()
+        if h5path.rstrip("/").endswith("amplitudes_adc"):
+            return values, "ADC"
+        grp = obj.parent
+        while True:
+            src = grp.attrs.get("source")
+            if src is not None:
+                src = src.decode() if isinstance(src, bytes) else str(src)
+                if src.startswith("vx2740"):
+                    return values * VX2740_COUNTS_PER_V, "ADC"
+                break
+            if grp.name == "/":
+                break
+            grp = grp.parent
+        return values, "V"
+
+
 def read_dataset(path, h5path: str, row: int | None = None) -> np.ndarray:
     """Read a dataset for plotting. For 2D datasets, ``row`` selects a single
     row (e.g. one waveform) so we plot a 1D trace instead of 1e6 points."""
