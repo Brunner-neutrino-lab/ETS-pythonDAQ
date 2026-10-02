@@ -12,6 +12,145 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-10-02 — Remote development from an offsite Windows PC
+
+Question: how to use Claude Desktop on an offsite Windows machine to develop
+here. Lucas is on the Yale VPN, so we went with Desktop's SSH sessions.
+
+### Changed
+- Installed the Claude Code CLI with the official installer (read before
+  running): 2.1.287, launcher at `~/.local/bin/claude`. `~/.profile` already
+  puts `~/.local/bin` on PATH for login shells; no rc file was touched. It
+  shares `~/.claude/` with the VS Code extension, so it is already signed in
+  (Lucas's account, Max plan). Desktop would install it on first connect
+  anyway; having it on PATH means plain `ssh` + `claude` and Remote Control
+  work too.
+
+### Facts checked on etsdaq
+- Only interface is `enp0s31f6` 172.16.0.216/24, default route 172.16.0.1, no
+  public address. Anything that connects *in* (plain SSH, Desktop SSH sessions,
+  VS Code Remote-SSH, the webapp on :8765) needs a route to 172.16.0.x, i.e. the
+  Yale network or VPN.
+- sshd on :22 accepts keys and passwords. `~/.ssh/authorized_keys` has two
+  ed25519 keys commented `lucas.darroch@yale.edu`, but the VS Code session from
+  10.127.184.220 (VPN) logs in by password, so that client offers no authorized
+  key. Desktop's SSH dialog asks for a key file, not a password.
+
+### Options (code.claude.com docs as of today)
+- **Desktop SSH session** (chosen): Code tab -> environment dropdown -> **+ Add
+  SSH connection**, host `ets@172.16.0.216`. Desktop installs Claude Code on
+  the remote the first time it connects. Needs the inbound route above.
+- **Remote Control**: outbound HTTPS only, so it works without the VPN.
+  `claude remote-control` must stay running (tmux; server mode exits after
+  about 10 min without network). A systemd user unit like `daq-webapp` would
+  restart it. Not set up: not needed while the VPN works.
+
+### Open threads
+- Windows side, Lucas to do: install Desktop, create an SSH key and append the
+  `.pub` to `~/.ssh/authorized_keys`, add the SSH connection.
+
+---
+
+## 2026-10-01 — Lab book tab: uploads fixed, edit/delete added, pastes per browser
+
+User reported: no edit/delete on posted entries, file upload does nothing,
+clicking the tick in the uploader makes the image vanish. All three were real;
+an audit found a fourth problem (pastes going to the wrong browser).
+
+### What was wrong
+- **File upload had never worked.** `on_upload` read `e.content` / `e.name`,
+  the NiceGUI 2.x API. In the installed 3.12.1 `UploadEventArguments` has only
+  `sender`, `client`, `file`: the bytes are `await e.file.read()`, the name
+  `e.file.name`. Every upload raised `AttributeError` server-side (11 times in
+  the journal that day) while the browser widget showed 100 %, because the HTTP
+  upload itself succeeds. Only clipboard paste had ever attached anything.
+- **The tick is Quasar's remove button.** QUploader lists each finished file
+  behind a `done` icon whose click is `removeFile`; the header double-tick is
+  `removeUploadedFiles`. Not a bug in itself, but it read as "confirm".
+- **Paste queue was global and drained by every connected browser**, so with
+  two people logged in a pasted screenshot could land in the other person's
+  pending list. Lei's 14:50 post has no attachment although 7 screenshots were
+  pasted at 14:47-14:48.
+- `ui.html` sanitizes with DOMPurify by default, which strips
+  `target="_blank"`: a click on a thumbnail replaced the control page with the
+  image instead of opening a tab.
+
+### Changed
+- `daq/labbook.py`: `update()`, `delete()`, `get()`, `revision()`; paste queue
+  keyed by NiceGUI client id. Edits keep `id`, `ts`, `user` and add
+  `edited_ts` / `edited_by`. Rewrites go through a temp file + `os.replace`
+  and carry every other line over byte for byte.
+- **Nothing is destroyed.** The previous version of every edited or deleted
+  entry is appended to `labbook_history.jsonl` (gitignored, next to the
+  entries file); attachment files are never removed from disk. Undo is a
+  manual copy from the history file.
+- **InfluxDB mirror.** An edit rewrites the same point (same measurement,
+  `user` tag and timestamp, so InfluxDB overwrites it). A delete calls the
+  delete API on a 2 ms window around the entry's `ts` with predicate
+  `_measurement="labbook"`. Both are skipped when slow control is not
+  connected, and the page says so, since the copy in Influx is then stale.
+- `daq/webgui/shell.py` `_build_labbook_tab`: the form at the top now also
+  edits (an entry's "edit" button loads it there, so upload and paste work
+  while editing); pending attachments are thumbnails with a remove button;
+  the uploader's own list is emptied after each upload (`uploaded` event ->
+  `removeUploadedFiles`), which removes the tick; non-image attachments
+  render as a named link; subject and user are HTML-escaped; every open page
+  re-renders the list within 2 s of another browser's change; pastes are
+  ignored unless the lab book tab is the visible one.
+- `/labbook-paste` takes a `client_id` form field next to the file.
+- No one is restricted to their own entries: display names are self-declared,
+  so it would not mean anything. The history file records who did what.
+
+### Testing
+- `tests/test_labbook.py`: 11 `unittest` cases (edit, delete, history,
+  unparseable lines survive a rewrite, mirror calls against a fake client,
+  per-client paste queue). Run: `python -m unittest tests.test_labbook`.
+- Browser test, 54 checks, two simulated users: a second copy of the app on
+  127.0.0.1:8799 with the lab book paths patched to a scratch directory,
+  driven by headless Chrome. **playwright and selenium are not installed
+  here; `google-chrome` is, and the DevTools protocol over the `websockets`
+  package is enough** (`DOM.setFileInputFiles` for uploads, a clipboard write
+  plus `Input.dispatchKeyEvent` with `commands: ["paste"]` for a real Ctrl+V).
+  For such a copy: set `NICEGUI_STORAGE_PATH` so it does not share
+  `.nicegui/`, and stub `webcam._CAM.start`, because the status tab embeds
+  `/webcam.mjpeg` and would open `/dev/video0`. The scripts were throwaway.
+- The same page was run on a copy of the real entries and attachments: the
+  3 entries render, the duplicate deletes cleanly, an image can be added to
+  Lei's entry, older lines stay byte-identical.
+- Real InfluxDB (v2.7.10 at 172.16.0.76), no data changed: the 3 mirrored
+  points sit at exactly `int(ts * 1e9)` with the author as `user` tag, and
+  the server accepted a delete request sent through `_delete_from_influx`
+  for an empty window in 2001. An actual removal of a real point has not
+  been exercised yet; the first delete from the page reports whether the
+  Influx copy went too.
+- `tests/test_l3_client_independence.py` and
+  `tests/test_l3_pulse_failure_recovery.py` import `pytest`, which is in none
+  of the conda envs on this machine, so they cannot be run here.
+
+### Deployed
+- `daq-webapp` restarted at 15:24 on the user's instruction, after checking
+  that nothing was running: last operator action 15:06, Lei's page closed at
+  15:13, no L3 job, no file written under `data/` for 30 min. The B2987
+  output had been on since 15:02 (49 V from 15:05); the shutdown hook
+  released `elec`, `stage` and `sc`, and releasing `elec` switches the output
+  off. The instrument was not queried afterwards to confirm it.
+- After the restart the login page answers, the one open browser tab rebuilt
+  its page without an exception, `/labbook-img/` serves the real attachments
+  and an unauthenticated `/labbook-paste` gets 401. Nothing is reconnected
+  until someone presses "connect all".
+- Not committed (branch `codex/client-independent-daq`).
+
+### Open threads
+- Entries `39b7b3e7` and `9b983032` (Lei, 2026-10-01) are duplicates from the
+  re-post; delete one from the page. 14 files in `labbook_attachments/` are
+  referenced by no entry (5 from 2026-09-27, 9 from 2026-10-01), among them
+  the screenshots Lei pasted at 14:47-14:48; they can be re-uploaded through
+  "edit".
+- Unrelated, seen in the journal: at 15:06 two digitizer acquisitions failed
+  in `ctrl.arm` with `caen_felib` "invalid handle" and "Boost ASIO error:
+  read: Bad file descriptor". The VX2740 link had dropped; `dig` was not
+  among the sessions released at shutdown.
+
 ## 2026-09-29 — L3 B2987 live IV progress, settling delay, and timeout
 
 ### Changed

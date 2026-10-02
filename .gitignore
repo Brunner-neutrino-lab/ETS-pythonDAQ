@@ -77,6 +77,8 @@ plots/
 # owns these on disk.
 labbook_attachments/
 labbook_entries.jsonl
+labbook_entries.jsonl.tmp
+labbook_history.jsonl
 
 # ── Legacy archive ────────────────────────────────────────────────────────
 # Local-only snapshot of the previous xsphere-slow-control codebase.

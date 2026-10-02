@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import os
 import sys
 import time
+from html import escape as html_escape
 from typing import Callable
 
 from fastapi.responses import RedirectResponse
@@ -2701,17 +2702,57 @@ def _build_config_tab():
 # Lab book
 # ===========================================================================
 
+_LABBOOK_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+def _labbook_attachment_html(fname: str, max_h: int, max_w: int) -> str:
+    """Thumbnail for an image attachment, a filename link for anything else.
+
+    Meant for ui.html(..., sanitize=False): the sanitizer strips
+    target="_blank", and without it a click on a thumbnail replaces the
+    control page with the image.
+    """
+    f = html_escape(fname)
+    link = (f'<a href="/labbook-img/{f}" target="_blank" rel="noopener" '
+            f'title="{f}"')
+    if fname.lower().endswith(_LABBOOK_IMAGE_EXTS):
+        return (f'{link}><img src="/labbook-img/{f}" '
+                f'style="max-height:{max_h}px; max-width:{max_w}px; '
+                f'border:1px solid var(--line); border-radius:4px; '
+                f'background:#000; display:block"/></a>')
+    # save_attachment() stores files as <date>_<time>_<6 hex>_<given name>.
+    label = html_escape(fname.split("_", 3)[-1])
+    return (f'{link} style="display:inline-block; padding:.35rem .6rem; '
+            f'border:1px solid var(--line); border-radius:4px; '
+            f'color:var(--acc); font-size:.8rem; text-decoration:none">'
+            f'{label}</a>')
+
+
 def _build_labbook_tab():
-    """Free-text lab notes with optional image attachments.
+    """Free-text lab notes with optional attachments.
 
     Entries land in <repo>/labbook_entries.jsonl (source of truth) and
     are also mirrored into the slowcontrol InfluxDB (measurement
     `labbook`) when HUB.sc is connected, so notes can be overlaid
     against temperature in Grafana.
+
+    The form at the top composes a new entry and also edits a posted
+    one, so uploads and pasted screenshots work the same in both cases.
     """
-    # ---- compose new entry --------------------------------------------
-    with ui.card().classes("daq-card w-full"):
-        ui.html("<h2>new entry</h2>")
+    client_id = ui.context.client.id
+    # Attachments of the entry in the form, and the id of the posted entry
+    # the form is editing (None while it composes a new one).
+    pending: list[str] = []
+    editing = {"id": None}
+    # Revision of the entries file that entries_panel last rendered.
+    shown = {"rev": -1}
+
+    def fmt_ts(ts):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+    # ---- compose / edit form ------------------------------------------
+    with ui.card().classes("daq-card w-full labbook-compose"):
+        form_title = ui.html("<h2>new entry</h2>")
 
         subject_in = ui.input(
             label="subject (optional)",
@@ -2722,54 +2763,80 @@ def _build_labbook_tab():
             placeholder="What's the experiment doing? Anything weird?",
         ).classes("w-full").props("dense filled autogrow")
 
-        # Pending attachments collected before the user clicks 'post'.
-        pending: list[str] = []
+        @ui.refreshable
+        def pending_panel():
+            if not pending:
+                ui.label("no attachments").classes("text-xs") \
+                    .style("color:var(--mut)")
+                return
+            with ui.row().classes("gap-3 flex-wrap items-start mt-1"):
+                for fname in pending:
+                    with ui.element("div").style("position:relative"):
+                        ui.html(_labbook_attachment_html(fname, 88, 160),
+                                sanitize=False)
+                        ui.button(icon="close",
+                                  on_click=lambda f=fname: remove_pending(f)) \
+                            .props("round dense unelevated size=xs "
+                                   "color=negative") \
+                            .style("position:absolute; top:-7px; right:-7px") \
+                            .tooltip("remove this attachment")
+
+        def remove_pending(fname):
+            pending.remove(fname)
+            pending_panel.refresh()
+
         with ui.row().classes("items-center gap-2 w-full"):
-            attach_lbl = ui.label("no attachments").classes("text-xs") \
-                .style("color:var(--mut)")
+            async def on_upload(e):
+                data = await e.file.read()
+                pending.append(labbook.save_attachment(e.file.name, data))
+                pending_panel.refresh()
 
-            def on_upload(e):
-                # e.content is a BinaryIO-like stream
-                data = e.content.read()
-                fname = labbook.save_attachment(e.name, data)
-                pending.append(fname)
-                attach_lbl.text = (
-                    f"{len(pending)} attached: {', '.join(pending)}"
-                )
-
-            ui.upload(
+            uploader = ui.upload(
                 on_upload=on_upload,
                 multiple=True, auto_upload=True,
                 label="attach plots / images",
             ).props("flat color=primary").classes("w-64")
+            # Quasar keeps every finished upload listed in the widget behind
+            # a tick that is really its remove button. The thumbnails below
+            # are the list of what is attached, so empty the widget's own.
+            uploader.on("uploaded",
+                        lambda: uploader.run_method("removeUploadedFiles"),
+                        args=[])
 
             ui.html('<span class="sub" style="color:var(--mut)">'
                     '· or just Ctrl/Cmd+V to paste a screenshot</span>')
 
+        pending_panel()
+
         # Install a document-level paste listener that uploads any image
-        # found on the clipboard to /labbook-paste. The endpoint queues
-        # the filename and our 0.5 s timer below picks it up. Guarded by
-        # a window flag so multi-mount (e.g. reload) doesn't stack
-        # listeners.
-        ui.run_javascript("""
+        # found on the clipboard to /labbook-paste, tagged with this page's
+        # client id so that only this page's 0.5 s timer below picks it up.
+        # Pastes are ignored unless the lab book panel is the one on screen
+        # (Quasar only mounts the visible tab panel). Guarded by a window
+        # flag so multi-mount (e.g. reload) doesn't stack listeners.
+        ui.run_javascript("const clientId = %r;" % client_id + """
             if (!window._etsLabbookPasteInstalled) {
                 window._etsLabbookPasteInstalled = true;
                 document.addEventListener('paste', async (e) => {
                     if (!e.clipboardData) return;
-                    for (const item of e.clipboardData.items) {
-                        if (item.type && item.type.startsWith('image/')) {
-                            const blob = item.getAsFile();
-                            if (!blob) continue;
-                            const ts = new Date().toISOString().replace(/[:.]/g, '-');
-                            const ext = (item.type.split('/')[1] || 'png');
-                            const fd = new FormData();
-                            fd.append('file', blob, 'pasted_' + ts + '.' + ext);
-                            try {
-                                await fetch('/labbook-paste',
-                                            { method: 'POST', body: fd });
-                            } catch (err) {
-                                console.error('labbook paste upload failed:', err);
-                            }
+                    if (!document.querySelector('.labbook-compose')) return;
+                    // The browser empties clipboardData at this handler's
+                    // first await, so take the files out before uploading.
+                    const blobs = [...e.clipboardData.items]
+                        .filter(it => it.type && it.type.startsWith('image/'))
+                        .map(it => it.getAsFile())
+                        .filter(Boolean);
+                    for (const blob of blobs) {
+                        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+                        const ext = (blob.type.split('/')[1] || 'png');
+                        const fd = new FormData();
+                        fd.append('client_id', clientId);
+                        fd.append('file', blob, 'pasted_' + ts + '.' + ext);
+                        try {
+                            await fetch('/labbook-paste',
+                                        { method: 'POST', body: fd });
+                        } catch (err) {
+                            console.error('labbook paste upload failed:', err);
                         }
                     }
                 });
@@ -2777,16 +2844,11 @@ def _build_labbook_tab():
         """)
 
         def _drain_pasted():
-            # The queue is global: a tab whose socket is down (kept for up to
-            # reconnect_timeout) must not take another tab's paste.
-            if not ui.context.client.has_socket_connection:
-                return
-            new = labbook.pop_pasted()
+            new = labbook.pop_pasted(client_id)
             if not new:
                 return
-            for fname in new:
-                pending.append(fname)
-            attach_lbl.text = f"{len(pending)} attached: {', '.join(pending)}"
+            pending.extend(new)
+            pending_panel.refresh()
             ui.notify(f"pasted screenshot attached ({len(new)})",
                       type="positive", position="top", timeout=2000)
 
@@ -2796,38 +2858,87 @@ def _build_labbook_tab():
             mirror_lbl = ui.html('<span class="sub">'
                                  'InfluxDB mirror: off (sc not connected)</span>')
 
-            def post():
+            def set_mode(entry):
+                """Make the form edit `entry`, or compose a new entry when
+                it is None. The form's contents are left as they are."""
+                editing["id"] = entry["id"] if entry else None
+                if entry:
+                    form_title.set_content(
+                        f'<h2>editing entry · {fmt_ts(entry["ts"])} · '
+                        f'{html_escape(entry["user"])}</h2>')
+                    submit_btn.set_text("save changes")
+                    reset_btn.set_text("cancel edit")
+                else:
+                    form_title.set_content("<h2>new entry</h2>")
+                    submit_btn.set_text("post entry")
+                    reset_btn.set_text("clear")
+
+            def load_form(entry):
+                """Fill the form from a posted entry, or empty it for a new
+                one when `entry` is None."""
+                set_mode(entry)
+                subject_in.value = entry["subject"] if entry else ""
+                body_in.value = entry["body"] if entry else ""
+                pending[:] = entry["attachments"] if entry else []
+                pending_panel.refresh()
+                uploader.reset()
+
+            def submit():
                 user  = app.storage.user.get("display_name", "anonymous")
                 subj  = (subject_in.value or "").strip()
                 body  = (body_in.value or "").strip()
                 attached = list(pending)
                 if not subj and not body and not attached:
-                    ui.notify("nothing to post", type="warning",
-                              position="top", timeout=3000)
+                    ui.notify("nothing to post" if editing["id"] is None
+                              else "an entry can't be left empty; "
+                                   "delete it instead",
+                              type="warning", position="top", timeout=3000)
                     return
-                entry, mirrored = labbook.append(
-                    user, subj, body, attached, slowcontrol=HUB.sc,
-                )
-                msg = f"posted by {user}"
-                if mirrored:
-                    msg += " (also mirrored to InfluxDB)"
+                if editing["id"] is None:
+                    entry, mirrored = labbook.append(
+                        user, subj, body, attached, slowcontrol=HUB.sc,
+                    )
+                    msg = f"posted by {user}"
+                    if mirrored:
+                        msg += " (also mirrored to InfluxDB)"
+                    log.info("labbook entry %s by %s (subject=%r, "
+                             "n_attach=%d, influx=%s)",
+                             entry["id"][:8], user, subj, len(attached), mirrored)
+                else:
+                    posted = labbook.get(editing["id"])
+                    if posted and (posted["subject"], posted["body"],
+                                   posted["attachments"]) == (subj, body, attached):
+                        # Saving it anyway would mark the entry as edited.
+                        ui.notify("nothing was changed", type="info",
+                                  position="top", timeout=3000)
+                        load_form(None)
+                        return
+                    entry, mirrored = labbook.update(
+                        editing["id"], subj, body, attached,
+                        edited_by=user, slowcontrol=HUB.sc,
+                    )
+                    if entry is None:
+                        # Deleted from another browser while it was in the
+                        # form: keep the text so it can still be posted.
+                        set_mode(None)
+                        ui.notify("that entry was deleted in the meantime; "
+                                  "'post entry' will post this as a new one",
+                                  type="warning", position="top", timeout=6000)
+                        return
+                    msg = f"entry updated by {user}"
+                    msg += (" (InfluxDB copy updated too)" if mirrored
+                            else "; its InfluxDB copy was not updated")
+                    log.info("labbook entry %s edited by %s (subject=%r, "
+                             "n_attach=%d, influx=%s)",
+                             entry["id"][:8], user, subj, len(attached), mirrored)
                 ui.notify(msg, type="positive", position="top", timeout=3500)
-                log.info("labbook entry %s by %s (subject=%r, "
-                         "n_attach=%d, influx=%s)",
-                         entry["id"][:8], user, subj, len(attached), mirrored)
-                subject_in.value = ""
-                body_in.value = ""
-                pending.clear()
-                attach_lbl.text = "no attachments"
+                load_form(None)
                 entries_panel.refresh()
 
-            ui.button("post entry", on_click=post).props("color=primary")
-            ui.button("clear", on_click=lambda: (
-                setattr(subject_in, "value", ""),
-                setattr(body_in, "value", ""),
-                pending.clear(),
-                setattr(attach_lbl, "text", "no attachments"),
-            )).props("flat")
+            submit_btn = ui.button("post entry", on_click=submit) \
+                .props("color=primary")
+            reset_btn = ui.button("clear", on_click=lambda: load_form(None)) \
+                .props("flat")
 
         def _refresh_mirror_status():
             if HUB.sc is not None and getattr(HUB.sc, "_client", None) is not None:
@@ -2843,11 +2954,67 @@ def _build_labbook_tab():
                     '</span>'
                 )
         _refresh_mirror_status()
-        ui.timer(2.0, _refresh_mirror_status)
 
     # ---- past entries -------------------------------------------------
+    def start_edit(entry_id):
+        if editing["id"] is not None:
+            ui.notify("save or cancel the edit in progress first",
+                      type="warning", position="top", timeout=3000)
+            return
+        if subject_in.value or body_in.value or pending:
+            ui.notify("post or clear the draft at the top before editing "
+                      "an entry", type="warning", position="top", timeout=3000)
+            return
+        entry = labbook.get(entry_id)
+        if entry is None:
+            ui.notify("that entry no longer exists", type="warning",
+                      position="top", timeout=3000)
+            entries_panel.refresh()
+            return
+        load_form(entry)
+        ui.run_javascript("window.scrollTo({top: 0, behavior: 'smooth'})")
+
+    del_state = {"id": None}
+    with ui.dialog() as del_dialog, ui.card().classes("daq-card"):
+        del_title = ui.label("").classes("text-sm text-gray-200") \
+            .style("max-width:28rem")
+        with ui.row().classes("gap-2 justify-end w-full"):
+            ui.button("cancel", on_click=del_dialog.close).props("flat dense no-caps")
+            ui.button("delete", on_click=lambda: del_do()) \
+                .props("color=negative dense no-caps")
+
+    def open_delete(entry):
+        del_state["id"] = entry["id"]
+        what = entry.get("subject") or entry.get("body") or "(attachments only)"
+        if len(what) > 80:
+            what = what[:77] + "..."
+        del_title.set_text(
+            f'Delete the entry "{what}" posted {fmt_ts(entry["ts"])} by '
+            f'{entry["user"]}? A copy is kept in labbook_history.jsonl.')
+        del_dialog.open()
+
+    def del_do():
+        user = app.storage.user.get("display_name", "anonymous")
+        entry, removed = labbook.delete(del_state["id"], deleted_by=user,
+                                        slowcontrol=HUB.sc)
+        del_dialog.close()
+        if entry is None:
+            ui.notify("that entry was already deleted", type="warning",
+                      position="top", timeout=3000)
+        else:
+            ui.notify("entry deleted" + (
+                          " (InfluxDB copy removed too)" if removed
+                          else "; its InfluxDB copy, if any, was not removed"),
+                      type="warning", position="top", timeout=3500)
+            log.info("labbook entry %s deleted by %s (influx=%s)",
+                     entry["id"][:8], user, removed)
+        if editing["id"] == del_state["id"]:
+            load_form(None)
+        entries_panel.refresh()
+
     @ui.refreshable
     def entries_panel():
+        shown["rev"] = labbook.revision()
         entries = labbook.list_all()
         if not entries:
             ui.html('<span class="sub" style="color:var(--mut)">'
@@ -2858,19 +3025,32 @@ def _build_labbook_tab():
                 f'{len(entries)} entries · newest first</span>')
         for entry in entries:
             with ui.card().classes("daq-card w-full"):
-                ts = time.strftime("%Y-%m-%d %H:%M:%S",
-                                   time.localtime(entry["ts"]))
-                # header line: timestamp · user · subject
+                # header line: timestamp · user · subject, then the actions
                 header_html = (
-                    f'<span class="sub" style="color:var(--mut)">{ts}</span>'
-                    f' · <strong style="color:var(--acc)">{entry["user"]}</strong>'
+                    f'<span class="sub" style="color:var(--mut)">'
+                    f'{fmt_ts(entry["ts"])}</span>'
+                    f' · <strong style="color:var(--acc)">'
+                    f'{html_escape(entry["user"])}</strong>'
                 )
                 if entry.get("subject"):
                     header_html += (
                         f' · <span style="color:var(--fg)">'
-                        f'{entry["subject"]}</span>'
+                        f'{html_escape(entry["subject"])}</span>'
                     )
-                ui.html(header_html)
+                if entry.get("edited_ts"):
+                    header_html += (
+                        f' <span class="sub" style="color:var(--mut)">'
+                        f'(edited {fmt_ts(entry["edited_ts"])} by '
+                        f'{html_escape(entry["edited_by"])})</span>'
+                    )
+                with ui.row(wrap=False).classes("w-full items-start gap-1"):
+                    ui.html(header_html).classes("grow min-w-0")
+                    ui.button("edit",
+                              on_click=lambda i=entry["id"]: start_edit(i)) \
+                        .props("flat dense no-caps")
+                    ui.button("delete",
+                              on_click=lambda e=entry: open_delete(e)) \
+                        .props("flat dense no-caps color=negative")
 
                 if entry.get("body"):
                     # Preserve line breaks but escape HTML angle brackets.
@@ -2886,16 +3066,19 @@ def _build_labbook_tab():
                 if entry.get("attachments"):
                     with ui.row().classes("gap-2 flex-wrap mt-2"):
                         for a in entry["attachments"]:
-                            ui.html(
-                                f'<a href="/labbook-img/{a}" target="_blank" '
-                                f'title="{a}">'
-                                f'<img src="/labbook-img/{a}" '
-                                f'style="max-height:180px; max-width:280px; '
-                                f'border:1px solid var(--line); '
-                                f'border-radius:4px; background:#000"/></a>'
-                            )
+                            ui.html(_labbook_attachment_html(a, 180, 280),
+                                    sanitize=False)
 
     entries_panel()
+
+    def _poll_shared_state():
+        _refresh_mirror_status()
+        # Another browser posted, edited or deleted since this page last
+        # rendered the list.
+        if labbook.revision() != shown["rev"]:
+            entries_panel.refresh()
+
+    ui.timer(2.0, _poll_shared_state)
 
 
 # ===========================================================================

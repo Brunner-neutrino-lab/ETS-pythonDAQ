@@ -60,13 +60,13 @@ app.add_static_files("/labbook-img", labbook.attachments_dir())
 
 
 # Endpoint for clipboard-pasted images. A JS paste listener installed by
-# _build_labbook_tab() POSTs image blobs here; the lab book tab's poll
-# timer picks them up from labbook._paste_queue and adds them to the
-# pending attachments for the next "post entry".
-from fastapi import UploadFile, File, HTTPException  # noqa: E402 (local import keeps it adjacent to use)
+# _build_labbook_tab() POSTs image blobs here with the id of the page they
+# were pasted into; that page's poll timer picks them up from its queue in
+# labbook and adds them to the pending attachments for the next "post entry".
+from fastapi import UploadFile, File, Form, HTTPException  # noqa: E402 (local import keeps it adjacent to use)
 
 @app.post("/labbook-paste")
-async def labbook_paste(file: UploadFile = File(...)):
+async def labbook_paste(client_id: str = Form(...), file: UploadFile = File(...)):
     # Auth — same cookie/session as the @ui.page('/') login flow writes.
     # An unauthenticated paste would let anyone with the URL silently
     # upload images into the lab book, so block at the route level.
@@ -80,7 +80,7 @@ async def labbook_paste(file: UploadFile = File(...)):
         raise HTTPException(status_code=401, detail="login required")
     content = await file.read()
     fname = labbook.save_attachment(file.filename or "pasted.png", content)
-    labbook.queue_pasted(fname)
+    labbook.queue_pasted(client_id, fname)
     return {"filename": fname}
 
 
