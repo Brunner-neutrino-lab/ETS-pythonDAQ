@@ -15,12 +15,14 @@ class FakeElectrometer:
     def __init__(self):
         self.live_calls = []
         self.bias_off_calls = 0
+        self.operations = []
 
     def sweep(self, *args, **kwargs):
         raise AssertionError("L3 B2987 IV must use the live sweep path")
 
     def sweep_live(self, voltages, n_per_voltage=None, delay_s=None,
                    on_point=None, timeout_s=3600.0):
+        self.operations.append(("sweep_live",))
         self.live_calls.append({
             "voltages": list(voltages),
             "n_per_voltage": n_per_voltage,
@@ -33,7 +35,11 @@ class FakeElectrometer:
             on_point(voltage, currents, timestamps)
         return SimpleNamespace(avg_source_v=list(voltages))
 
+    def set_bias(self, voltage, settle_s=0.0):
+        self.operations.append(("set_bias", voltage, settle_s))
+
     def bias_off(self):
+        self.operations.append(("bias_off",))
         self.bias_off_calls += 1
 
 
@@ -80,6 +86,39 @@ class TestLivePrimitive(unittest.TestCase):
 
 
 class TestL3SequenceLiveIV(unittest.TestCase):
+    def test_completed_iv_holds_zero_for_one_minute_before_bias_off(self):
+        elec = FakeElectrometer()
+        spec = MeasurementSpec(
+            sipm_id=7,
+            dark=True,
+            illuminated=False,
+            do_iv=True,
+            do_pulse=False,
+            do_scan=False,
+            iv_meter="b2987",
+            iv_voltages=[45.0, 45.2],
+            iv_delay_s=0.35,
+            n_iv_samples_dark=2,
+        )
+
+        with patch.dict(sys.modules, fake_b2987_modules()):
+            run_sequence(
+                [spec],
+                {"elec": elec},
+                SimpleNamespace(stage_deenergize=True),
+                on_iv_progress=lambda *_event: None,
+                iv_timeout_s=987.0,
+            )
+
+        self.assertEqual(
+            [
+                ("sweep_live",),
+                ("set_bias", 0.0, 60.0),
+                ("bias_off",),
+            ],
+            elec.operations[:3],
+        )
+
     def test_sequence_emits_contextual_live_updates_and_records_timeout(self):
         elec = FakeElectrometer()
         run_file = RecordingRunFile()

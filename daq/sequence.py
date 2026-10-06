@@ -36,6 +36,7 @@ from .resume import Step
 log = logging.getLogger("daq.sequence")
 
 SCHEMA_VERSION = 1
+IV_POST_ZERO_HOLD_S = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -309,11 +310,25 @@ def _exec_iv(spec, instruments, config, illuminated,
             meter = instruments.get("k6485")
             if meter is None:
                 raise RuntimeError("K6485 not connected (iv_meter=k6485)")
-            return P.iv_sweep_external_meter(elec, meter, spec.iv_voltages,
-                                             n_per_voltage=n, delay_s=spec.iv_delay_s)
-        return P.iv_sweep(elec, spec.iv_voltages, n_per_voltage=n,
-                          delay_s=spec.iv_delay_s,
-                          progress_cb=progress_cb, timeout_s=timeout_s)
+            result = P.iv_sweep_external_meter(
+                elec, meter, spec.iv_voltages,
+                n_per_voltage=n, delay_s=spec.iv_delay_s,
+            )
+        else:
+            result = P.iv_sweep(
+                elec, spec.iv_voltages, n_per_voltage=n,
+                delay_s=spec.iv_delay_s,
+                progress_cb=progress_cb, timeout_s=timeout_s,
+            )
+
+        # Keep the just-measured MUX channel connected while the source is
+        # actively held at 0 V.  This gives the SiPM, cabling, MUX, and
+        # electrometer input a real discharge/recovery path before the next
+        # channel is selected.  The surrounding finally then turns the
+        # source output off.  Failed/aborted sweeps skip the hold and go
+        # straight to the safety shutdown below.
+        P.set_bias(elec, 0.0, settle_s=IV_POST_ZERO_HOLD_S)
+        return result
     finally:
         if illuminated:
             _awg_off(awg, 1)

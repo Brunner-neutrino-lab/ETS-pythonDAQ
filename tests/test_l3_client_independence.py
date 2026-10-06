@@ -25,6 +25,7 @@ class FakeElectrometer:
 
     def __init__(self):
         self.bias_off_calls = 0
+        self.bias_calls = []
 
     def sweep_live(self, voltages, n_per_voltage=None, delay_s=None,
                    on_point=None, timeout_s=3600.0):
@@ -63,6 +64,9 @@ class FakeElectrometer:
             n_per_voltage=int(n_per_voltage),
             run_timestamp=run_timestamp,
         )
+
+    def set_bias(self, voltage, settle_s=0.0):
+        self.bias_calls.append((voltage, settle_s))
 
     def bias_off(self):
         self.bias_off_calls += 1
