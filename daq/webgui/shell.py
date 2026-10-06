@@ -838,10 +838,6 @@ html, body, .nicegui-content { background:var(--bg) !important; color:var(--fg);
   background:rgba(88,166,255,.14); color:var(--acc);
   border-color:var(--acc);
 }
-.dig-panel .ch-toggle.is-pmt.is-on {
-  background:rgba(63,185,80,.14); color:var(--ok);
-  border-color:var(--ok);
-}
 .dig-panel .ch-thresh { flex:1 1 auto; min-width:0; }
 .dig-panel .ch-thresh .q-field--filled .q-field__control {
   height:26px !important; min-height:26px !important;
@@ -9335,6 +9331,21 @@ def _dig_history_rows() -> list[dict]:
 _DIG_TRACE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444",
                      "#a855f7", "#06b6d4", "#eab308", "#ec4899"]
 
+_DIGITIZER_N_CHANNELS = 64
+_DIGITIZER_SIPM_CHANNELS = frozenset(range(1, 24)) | {27}
+_DIGITIZER_DEFAULT_THRESHOLD_ADC = 1000
+
+
+def _digitizer_channel_tag(ch: int) -> str:
+    return "SiPM" if ch in _DIGITIZER_SIPM_CHANNELS else ""
+
+
+def _digitizer_initial_channel_state() -> dict:
+    return {
+        ch: {"enable": False, "threshold": _DIGITIZER_DEFAULT_THRESHOLD_ADC}
+        for ch in range(_DIGITIZER_N_CHANNELS)
+    }
+
 
 def _build_digitizer_tab():
     """CAEN VX2740 digitizer panel — Quick I/V style.
@@ -9372,24 +9383,13 @@ def _build_digitizer_tab():
         return getattr(backend, "_ctrl", None)
 
     # VX2740 constants (mirror the driver)
-    N_CHANNELS = 64
+    N_CHANNELS = _DIGITIZER_N_CHANNELS
     SAMPLE_RATE_HZ = 125e6  # MS/s
-    SIPM_CHANNELS = {0, 1, 2, 3}
-    PMT_CHANNEL = 4
-
-    def _ch_tag(ch: int) -> str:
-        if ch in SIPM_CHANNELS: return "SiPM"
-        if ch == PMT_CHANNEL: return "PMT"
-        return ""
 
     # ----- state -----
-    # Staged per-channel enable and threshold (counts). Initialised from
-    # the controller on first refresh.
-    _ch_state = {
-        ch: {"enable": ch in (SIPM_CHANNELS | {PMT_CHANNEL}),
-             "threshold": 150}
-        for ch in range(N_CHANNELS)
-    }
+    # Staged per-channel enable and threshold (counts). No channel is
+    # enabled until the operator explicitly selects it.
+    _ch_state = _digitizer_initial_channel_state()
 
     # ===== Panel scaffold =====
     with ui.element("div").classes("dig-panel w-full"):
@@ -9469,7 +9469,7 @@ def _build_digitizer_tab():
                     with ui.element("div"):
                         ui.html('<p class="eyebrow" style="margin:0 0 4px">Channels</p>')
                         ui.html('<div style="font-size:15px">'
-                                + f'{N_CHANNELS} channels · SiPM ch0–3 · PMT ch4'
+                                + f'{N_CHANNELS} channels · SiPM ch1–23, ch27'
                                 + '</div>')
                     with ui.element("div").classes("fld").style("min-width:180px"):
                         ui.html('<label class="fld-lbl">Threshold mode</label>')
@@ -9485,7 +9485,11 @@ def _build_digitizer_tab():
                     with ui.element("div").classes("fld") \
                             .style("max-width:220px"):
                         ui.html('<label class="fld-lbl">Global threshold</label>')
-                        global_th_n = ui.number(value=150, step=1, format="%d") \
+                        global_th_n = ui.number(
+                            value=_DIGITIZER_DEFAULT_THRESHOLD_ADC,
+                            step=1,
+                            format="%d",
+                        ) \
                             .props('dense filled hide-bottom-space suffix="ADC"')
 
                 # The channel table
@@ -9514,8 +9518,6 @@ def _build_digitizer_tab():
             state = _ch_state[ch]
             on = state["enable"]
             cls = "ch-toggle"
-            if ch == PMT_CHANNEL:
-                cls += " is-pmt"
             if on:
                 cls += " is-on"
             lab = ch_label_els.get(ch)
@@ -9545,13 +9547,9 @@ def _build_digitizer_tab():
                         state = _ch_state[ch]
                         with ui.element("div").classes("ch-cell"):
                             # Channel label is just the number, e.g. "ch4".
-                            # SiPM / PMT roles are still tracked internally
-                            # (PMT cell uses a different accent color), and
-                            # the tooltip still shows the role for context.
-                            tag = _ch_tag(ch)
+                            # The tooltip identifies the wired SiPM inputs.
+                            tag = _digitizer_channel_tag(ch)
                             cls = "ch-toggle"
-                            if ch == PMT_CHANNEL:
-                                cls += " is-pmt"
                             if state["enable"]:
                                 cls += " is-on"
                             label_el = ui.html(
@@ -9605,13 +9603,8 @@ def _build_digitizer_tab():
                           type="warning", position="top", timeout=2500)
                 return
             try:
-                # The 64-channel grid treats ch 4 as just another channel.
-                # Pass every enabled index (incl. PMT_CHANNEL) in
-                # sipm_channels so its data actually lands in the result —
-                # `include_pmt=True` adds ch 4 to the controller's enable
-                # list but the result loop iterates over `_sipm_channels`
-                # only, so PMT-routed channels never make it into the
-                # captured waveforms/amplitudes dicts.
+                # Every selected input is treated as a SiPM channel; there
+                # is no separately configured PMT channel in this panel.
                 enabled_chs = sorted(
                     ch for ch in range(N_CHANNELS)
                     if _ch_state[ch]["enable"]
@@ -9622,7 +9615,9 @@ def _build_digitizer_tab():
                     ctrl.configure_channels,
                     sipm_channels=enabled_chs,
                     threshold_mode=str(th_mode.value),
-                    global_threshold=int(global_th_n.value or 150),
+                    global_threshold=int(
+                        global_th_n.value or _DIGITIZER_DEFAULT_THRESHOLD_ADC
+                    ),
                     thresholds=thresholds,
                     include_pmt=False,
                 )
