@@ -20,9 +20,9 @@ Usage
     cfg = ExperimentConfig()
     sc  = SlowControl(cfg)
 
-    # Single reading
-    T_K = sc.temperature_K()
-    print(f"Current temperature: {T_K:.2f} K")
+    # Single reading of the LakeShore loop's PV
+    ch, T_K = sc.pv_reading()
+    print(f"Current temperature: {T_K:.2f} K (ch {ch})")
 
     # Wait for 165 K ± 0.5 K, stable for 60 s
     sc.wait_for_stable(target_K=165.0, tolerance_K=0.5, stable_s=60.0)
@@ -34,6 +34,13 @@ import logging
 log = logging.getLogger(__name__)
 
 _CELSIUS_TO_KELVIN = 273.15
+
+# The slow control publishes each loop's OUTMODE input here, tag channel =
+# loop number.
+_PV_INPUT_MEASUREMENT = "outinput"
+# LakeShore 336/350 OUTMODE input codes. 0 is "none"; 5-8 are the 3062
+# scanner inputs D2-D5, which the slow control has no RTD series for.
+_LAKESHORE_INPUTS = {1: "A", 2: "B", 3: "C", 4: "D"}
 
 
 class SlowControl:
@@ -115,41 +122,66 @@ class SlowControl:
             return float(value)
         return float(value) + _CELSIUS_TO_KELVIN
 
-    def temperature_K(self) -> float:
+    def pv_reading(self) -> tuple[str, float]:
         """
-        Return the most recent RTD reading in Kelvin.
+        Return (channel, temperature_K) for the process variable of LakeShore
+        control loop `influxdb_pv_loop`.
 
-        Queries the last 30 seconds for the configured measurement / field /
-        channel and returns the newest value. Raises RuntimeError if no data
-        is returned.
+        The PV channel is not configured here: it is the loop's control input
+        as published by the slow control, so changing the control sensor
+        there moves the DAQ's temperature to the new sensor. Both the input
+        and the RTD values come from the last 30 s in one query.
         """
         bucket      = self._cfg.influxdb_bucket
         org         = self._cfg.influxdb_org
         measurement = self._cfg.influxdb_rtd_measurement
         field       = self._cfg.influxdb_rtd_field
-        channel     = self._cfg.influxdb_rtd_channel
+        loop        = self._cfg.influxdb_pv_loop
 
         flux = f"""
 from(bucket: "{bucket}")
   |> range(start: -30s)
-  |> filter(fn: (r) => r["_measurement"] == "{measurement}")
-  |> filter(fn: (r) => r["_field"] == "{field}")
-  |> filter(fn: (r) => r["channel"] == "{channel}")
+  |> filter(fn: (r) =>
+       (r["_measurement"] == "{measurement}" and r["_field"] == "{field}") or
+       (r["_measurement"] == "{_PV_INPUT_MEASUREMENT}" and r["_field"] == "value"
+        and r["channel"] == "{loop}"))
   |> last()
 """
-        tables = self._api.query(flux, org=org)
-        for table in tables:
+        code = None
+        rtds: dict[str, float] = {}
+        for table in self._api.query(flux, org=org):
             for record in table.records:
                 val = record.get_value()
-                if val is not None:
-                    return self._to_kelvin(val)
+                if val is None:
+                    continue
+                if record.get_measurement() == _PV_INPUT_MEASUREMENT:
+                    code = int(val)
+                else:
+                    rtds[str(record.values.get("channel"))] = val
 
-        raise RuntimeError(
-            f"No temperature data returned for "
-            f"_measurement='{measurement}', _field='{field}', "
-            f"channel='{channel}' in bucket '{bucket}' (last 30 s). "
-            f"Check InfluxDB connection and the influxdb_rtd_* config fields."
-        )
+        if code is None:
+            raise RuntimeError(
+                f"No '{_PV_INPUT_MEASUREMENT}' for LakeShore loop {loop} in "
+                f"bucket '{bucket}' (last 30 s), so the PV channel is unknown. "
+                f"Check that the slow control is running."
+            )
+        channel = _LAKESHORE_INPUTS.get(code)
+        if channel is None:
+            raise RuntimeError(
+                f"LakeShore loop {loop} control input is {code} "
+                f"({'none' if code == 0 else 'not one of A-D'}): no RTD PV to read."
+            )
+        if channel not in rtds:
+            raise RuntimeError(
+                f"No temperature data for PV channel {channel} "
+                f"(_measurement='{measurement}', _field='{field}') in bucket "
+                f"'{bucket}' (last 30 s)."
+            )
+        return channel, self._to_kelvin(rtds[channel])
+
+    def temperature_K(self) -> float:
+        """Return the PV temperature in Kelvin (see pv_reading)."""
+        return self.pv_reading()[1]
 
     def all_rtds_K(self) -> dict[str, float]:
         """

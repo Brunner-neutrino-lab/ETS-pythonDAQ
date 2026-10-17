@@ -316,7 +316,8 @@ class InstrumentHub:
     def connect_sc(self):
         if self.sc is not None:
             try:
-                self.status["sc"] = f"OK — {self.sc.temperature_K():.2f} K"
+                ch, T = self.sc.pv_reading()
+                self.status["sc"] = f"OK — {T:.2f} K (PV ch {ch})"
             except Exception as e:
                 self.status["sc"] = f"OK — connected (no T: {type(e).__name__})"
             return
@@ -324,18 +325,14 @@ class InstrumentHub:
         c = SlowControl(self.config)
         c.connect()
         # The InfluxDB client is connected; reading temperature is a
-        # separate concern. If the configured RTD field has no recent
-        # data we still consider the connection "up" — the user can
-        # pick the right field in run_config.yaml.
+        # separate concern. If the PV has no recent data we still consider
+        # the connection "up".
         self.sc = c
         try:
-            T = self.sc.temperature_K()
-            self.status["sc"] = f"OK — {T:.2f} K"
+            ch, T = self.sc.pv_reading()
+            self.status["sc"] = f"OK — {T:.2f} K (PV ch {ch})"
         except Exception as e:
-            self.status["sc"] = (
-                f"OK — connected (no '{self.config.influxdb_rtd_field}' "
-                f"data: {type(e).__name__})"
-            )
+            self.status["sc"] = f"OK — connected (no PV: {e})"
 
     def disconnect_sc(self):
         if self.sc:

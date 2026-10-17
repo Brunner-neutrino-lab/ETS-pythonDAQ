@@ -97,7 +97,7 @@ def tile_iv_sweep(sipm_ids: list[int],
         if run_file is not None:
             ch = config.sipm_channel(sipm_id)
             x, y = config.sipm_position(sipm_id)
-            T_meas = _measured_temperature_K(instruments)
+            pv = _measured_pv(instruments)
             iv_attrs = {
                 "mux_channel":          ch,
                 "x_mm":                 x,
@@ -105,8 +105,8 @@ def tile_iv_sweep(sipm_ids: list[int],
                 "bias_v":               float(result.avg_source_v[-1]) if len(result.avg_source_v) else 0.0,
                 "temperature_K_setpoint": temperature_K,
             }
-            if T_meas is not None:
-                iv_attrs["temperature_K_measured"] = T_meas
+            if pv is not None:
+                iv_attrs["temperature_channel_measured"], iv_attrs["temperature_K_measured"] = pv
             run_file.write_iv(
                 sipm_id       = sipm_id,
                 temperature_K = temperature_K,
@@ -207,7 +207,7 @@ def tile_pulse_run(sipm_ids: list[int],
         if run_file is not None:
             ch = config.sipm_channel(sipm_id)
             x, y = config.sipm_position(sipm_id)
-            T_meas = _measured_temperature_K(instruments)
+            pv = _measured_pv(instruments)
             pulse_attrs = {
                 "mux_channel":            ch,
                 "x_mm":                   x,
@@ -215,8 +215,8 @@ def tile_pulse_run(sipm_ids: list[int],
                 "bias_v":                 bias_v if bias_v is not None else config.pulse_bias_v,
                 "temperature_K_setpoint": temperature_K,
             }
-            if T_meas is not None:
-                pulse_attrs["temperature_K_measured"] = T_meas
+            if pv is not None:
+                pulse_attrs["temperature_channel_measured"], pulse_attrs["temperature_K_measured"] = pv
             run_file.write_pulse(
                 sipm_id       = sipm_id,
                 temperature_K = temperature_K,
@@ -247,16 +247,16 @@ def tile_pulse_run(sipm_ids: list[int],
 # Internal: measured temperature helper
 # ---------------------------------------------------------------------------
 
-def _measured_temperature_K(instruments: dict) -> float | None:
+def _measured_pv(instruments: dict) -> tuple[str, float] | None:
     """
-    Read the current temperature from slowcontrol if available.
+    Read (PV channel, temperature_K) from slowcontrol if available.
     Returns None without raising if slowcontrol is absent or the query fails.
     """
     sc = instruments.get("slowcontrol")
     if sc is None:
         return None
     try:
-        return sc.temperature_K()
+        return sc.pv_reading()
     except Exception as e:
         log.debug("Could not read measured temperature: %s", e)
         return None
@@ -283,9 +283,9 @@ def _do_flux_check(last_sipm_id, temperature_K, instruments, config,
             "temperature_K_setpoint": temperature_K,
             "after_sipm_id":          last_sipm_id,
         }
-        T_meas = _measured_temperature_K(instruments)
-        if T_meas is not None:
-            flux_attrs["temperature_K_measured"] = T_meas
+        pv = _measured_pv(instruments)
+        if pv is not None:
+            flux_attrs["temperature_channel_measured"], flux_attrs["temperature_K_measured"] = pv
         run_file.write_flux(flux_a, attrs=flux_attrs)
 
     if manifest is not None:

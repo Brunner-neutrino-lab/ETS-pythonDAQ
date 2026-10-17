@@ -12,6 +12,38 @@ knowledge* that don't survive in `git log`.
 
 ---
 
+## 2026-10-17 — DAQ temperature follows the LakeShore PV
+
+Lucas: the DAQ showed LakeShore ch A; the PV is ch B, and the PV is now
+chosen in the slow control. He asked for the DAQ to follow whatever the
+PV is, not to hard-code B.
+
+- **Where the PV comes from:** the slow control publishes
+  `ets/sensors/lakeshore/outinput/1` (Influx measurement `outinput`, tag
+  `channel` = loop, field `value`) every ~5.5 s. It is the OUTMODE input
+  code: 0 none, 1 A, 2 B, 3 C, 4 D (5-8 are 3062 scanner D2-D5, no RTD
+  series). First point in Influx 2026-10-17 17:37 UTC, value 2 (B) since.
+  At the time: A 159.1, **B 165.9**, C 156.5, D 183.9 K, setpoint 165.0.
+- **Change:** `config.influxdb_rtd_channel = "A"` removed; new
+  `influxdb_pv_loop = 1`. `SlowControl.pv_reading()` -> `(channel, T_K)`
+  runs one Flux query for the loop's `outinput` plus all RTDs and returns
+  the named one; `temperature_K()` wraps it, so `wait_for_stable`, L1 read
+  buttons and HDF5 all follow the PV. Header card shows "LakeShore PV,
+  ch B"; hub status "OK — T K (PV ch B)".
+- **Decision: no fallback channel.** Missing `outinput`, code 0, or no data
+  for the named RTD raises. A silent fallback to a fixed channel is the bug
+  this replaced.
+- **HDF5:** tile.py writes `temperature_channel_measured` next to
+  `temperature_K_measured`. Files before today have no channel attr and
+  their measured T is ch A.
+- Live check: `pv_reading()` returned `('B', 165.857)`.
+- Webapp restarted 16:45 EDT to load this (and the other uncommitted
+  tree changes). The restart released elec, stage and sc; they do not
+  reconnect on their own.
+- Tests: `tests/test_slowcontrol_pv.py` (unittest, fake query API).
+  `pytest` is not installed in `ets-daq`; `test_l3_client_independence` and
+  `test_l3_pulse_failure_recovery` import it and fail to load.
+
 ## 2026-10-02 (evening) — Tile characterization: workbook, initial char in the digitizer tab, coarse sweep from a table
 
 From the nEXO photodetector meeting: before final measurements, each

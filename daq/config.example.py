@@ -175,11 +175,13 @@ class ExperimentConfig:
     influxdb_org:       str = "ets"
     influxdb_token:     str = ""     # override with env var DAQ_INFLUX_TOKEN
     influxdb_bucket:    str = "slowcontrol"
-    # RTD location: _measurement == "<rtd_measurement>" AND
-    # _field == "<rtd_field>" AND tag channel == "<rtd_channel>".
+    # RTD series: _measurement == "<rtd_measurement>" AND
+    # _field == "<rtd_field>", one per LakeShore input (tag channel A-D).
     influxdb_rtd_measurement: str = "rtd"
     influxdb_rtd_field:       str = "value"
-    influxdb_rtd_channel:     str = "A"
+    # The DAQ temperature is the PV of this LakeShore control loop. Which
+    # RTD that is comes from the slow control on every read, not from here.
+    influxdb_pv_loop:         int = 1
     # True: stored values are already in Kelvin. False: stored in Celsius,
     # add 273.15 on read.
     influxdb_rtd_in_kelvin:   bool = True

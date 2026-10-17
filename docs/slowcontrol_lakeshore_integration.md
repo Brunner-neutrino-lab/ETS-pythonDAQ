@@ -166,29 +166,40 @@ The slow control service publishes LakeShore readings to these MQTT topics:
 | `ets/sensors/lakeshore/rtd/D` | `{"value": <T_K>, "ts": ...}` |
 | `ets/sensors/lakeshore/heater/1` | `{"value": <percent>, "ts": ...}` |
 | `ets/sensors/lakeshore/setpoint/1` | `{"value": <T_K>, "ts": ...}` |
+| `ets/sensors/lakeshore/outinput/1` | `{"value": <OUTMODE input code>, "ts": ...}` |
 
-Telegraf writes these to the `slowcontrol` InfluxDB bucket.  The field used
-by the DAQ is controlled by `influxdb_rtd_field` in `ExperimentConfig`.
+Telegraf writes these to the `slowcontrol` InfluxDB bucket as measurement =
+category (`rtd`, `outinput`, ...), field `value`, tag `channel` = the RTD
+letter or the loop number.
+
+**The DAQ temperature is the PV of loop `influxdb_pv_loop` (default 1).**
+Every `temperature_K()` / `pv_reading()` reads `outinput` for that loop and
+returns the RTD it names (LakeShore input codes: 1 = A, 2 = B, 3 = C,
+4 = D). No RTD channel is configured on the DAQ side: change the control
+sensor in the slow control and the DAQ follows it. A code of 0 (no control
+input) or a missing `outinput` raises instead of falling back to a channel.
+HDF5 attrs record the channel as `temperature_channel_measured` next to
+`temperature_K_measured`.
 
 Typical config values for the DAQ:
 
 ```yaml
-influxdb_url: "http://192.168.1.10:8086"
+influxdb_url: "http://172.16.0.76:8086"
 influxdb_org: "ets"
 influxdb_bucket: "slowcontrol"
-influxdb_rtd_field: "rtd/A"      # match the MQTT channel for the control RTD
-mqtt_broker: "192.168.1.10"       # Pi address
-mqtt_port: 1883
+influxdb_rtd_measurement: "rtd"
+influxdb_rtd_field: "value"
+influxdb_pv_loop: 1
 ```
 
-> **Note:** The `influxdb_rtd_field` value must match the Telegraf tag/field
-> name as it appears in InfluxDB after ingestion.  Run a Flux query to
-> confirm:
-> ```flux
-> from(bucket: "slowcontrol")
->   |> range(start: -5m)
->   |> filter(fn: (r) => r["driver"] == "lakeshore")
-> ```
+To see what the slow control is publishing:
+
+```flux
+from(bucket: "slowcontrol")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["driver"] == "lakeshore")
+  |> last()
+```
 
 ---
 

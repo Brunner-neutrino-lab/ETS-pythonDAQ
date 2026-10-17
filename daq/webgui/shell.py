@@ -2295,13 +2295,14 @@ def _build_status_tab():
 
         # Temperature
         if HUB.sc is not None:
-            T = _reading("sc_temp_K", HUB.sc.temperature_K)
-            if isinstance(T, Exception):
+            pv = _reading("sc_temp_K", HUB.sc.pv_reading)
+            if isinstance(pv, Exception):
                 temp_val.set_content('<span class="num big">err</span>')
-                temp_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(T).__name__}</span>')
-            elif T is not _PENDING:
+                temp_sub.set_content(f'<span class="sub" style="color:var(--bad)">{type(pv).__name__}</span>')
+            elif pv is not _PENDING:
+                ch, T = pv
                 temp_val.set_content(f'<span class="num big">{T:.2f} K</span>')
-                temp_sub.set_content('<span class="sub" style="color:var(--mut)">slow-control InfluxDB</span>')
+                temp_sub.set_content(f'<span class="sub" style="color:var(--mut)">LakeShore PV, ch {ch}</span>')
         else:
             temp_val.set_content('<span class="num big">—</span>')
             temp_sub.set_content('<span class="sub" style="color:var(--mut)">connect slow control</span>')

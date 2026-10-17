@@ -39,7 +39,10 @@ influxdb_url       : str   # e.g. "http://192.168.1.10:8086"
 influxdb_org       : str
 influxdb_token     : str   # can also be set via DAQ_INFLUX_TOKEN env var
 influxdb_bucket    : str   # default "cryostat"
-influxdb_rtd_field : str   # InfluxDB field name for the control RTD, e.g. "RTD1_C"
+influxdb_rtd_measurement : str  # RTD measurement, one series per channel tag A-D
+influxdb_rtd_field : str   # field of the RTD measurement, "value"
+influxdb_pv_loop   : int   # LakeShore loop whose control input (from the
+                           # slow control's "outinput") picks the RTD read
 ```
 
 The class currently implements:
