@@ -199,6 +199,22 @@ def list_data_files(data_dir=None) -> list[dict]:
     return out
 
 
+def filter_files(files: list[dict], query: str = "",
+                 limit: int | None = None) -> tuple[list[dict], int]:
+    """The entries of ``files`` whose rel path contains ``query`` (case
+    insensitive), in the given order and cut to the first ``limit``, and how
+    many matched before the cut.
+
+    The Data tab builds its rows on the web server's event loop, on every page
+    load, so the number it renders has to stay bounded while ./data keeps
+    growing; the filter reaches the rest.
+    """
+    q = (query or "").strip().lower()
+    matched = [f for f in files if q in f["rel"].lower()]
+    shown = matched if limit is None else matched[:max(0, limit)]
+    return shown, len(matched)
+
+
 def _ds_suffix(obj: h5py.Dataset) -> str:
     shape = "x".join(str(s) for s in obj.shape) or "scalar"
     return f"[{shape} {obj.dtype}]"

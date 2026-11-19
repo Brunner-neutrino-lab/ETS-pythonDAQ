@@ -8594,6 +8594,12 @@ def _build_webcam_tab():
     wc.build_page()
 
 
+# Each Data-tab row is ~8 elements built on the event loop at every page load,
+# and nothing else runs meanwhile: unbounded, the build outlasts every open
+# tab's socket ping timeout once ./data holds a few thousand files.
+_DATA_TAB_MAX_ROWS = 200
+
+
 def _build_data_tab():
     """HDF5 data explorer.
 
@@ -8645,8 +8651,9 @@ def _build_data_tab():
                         .props("flat dense round size=sm").tooltip("new folder")
                     ui.button(icon="refresh", on_click=lambda: refresh_files()) \
                         .props("flat dense round size=sm").tooltip("refresh")
+            # Debounced: every value change re-renders the list on the loop.
             flt = ui.input(placeholder="filter by name...") \
-                .props("dense clearable").classes("w-full")
+                .props("dense clearable debounce=400").classes("w-full")
             with ui.row().classes("items-center no-wrap w-full gap-2"):
                 all_box = ui.checkbox("all", on_change=lambda e: _toggle_all(e.value)) \
                     .props("dense size=sm").tooltip("tick every file shown")
@@ -9094,15 +9101,19 @@ def _build_data_tab():
         render_file_list()
 
     def render_file_list():
-        q = (flt.value or "").strip().lower()
-        files = [f for f in state["files"] if q in f["rel"].lower()]
-        count_lbl.set_text(f"{len(files)}/{len(state['files'])}")
+        files, n_match = HB.filter_files(state["files"], flt.value,
+                                         _DATA_TAB_MAX_ROWS)
+        count_lbl.set_text(f"{n_match}/{len(state['files'])}")
         state["boxes"] = {}
         file_list.clear()
         with file_list:
             if not files:
                 ui.label("no matching .h5 files").classes(
                     "text-gray-500 text-sm")
+            elif n_match > len(files):
+                ui.label(f"newest {len(files)} of {n_match} shown; "
+                         "type in the filter to reach the rest") \
+                    .classes("text-gray-400 text-xs")
             for f in files:
                 meta = (f"{HB.human_size(f['size'])} &middot; "
                         f"{time.strftime('%m-%d %H:%M', time.localtime(f['mtime']))}")
